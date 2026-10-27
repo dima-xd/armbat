@@ -1,0 +1,16 @@
+Armbat runs 32-bit ARMv7 Android apps and games on phones that have no 32-bit support at all, which is most current 64-bit-only devices. No root required.
+
+You import an APK from your storage, launch it, and delete it when you no longer need it. Imported apps are never installed into the system; they run inside Armbat. Java code runs on the device's own ART, and native ARM32 code is translated to ARM64 on the fly by a JIT based on Dynarmic.
+
+The app downloads nothing. Every APK is a file you provide yourself, and the app works offline.
+
+Requirements:
+
+* Android 12 (API 31) or newer on arm64-v8a
+* A GPU driver with EGL and GLES 2.0 or newer, rendering is forwarded to the driver
+* "All files access" permission: the library, app data and expansion files are kept in /sdcard/armbat so a file manager can reach them
+* Only armeabi-v7a APKs are supported
+
+An APK's manifest does not belong to any installed package, so Armbat declares the permissions ARMv7-era apps commonly ask for and requests only the ones a given app actually needs, in one dialog before it starts. A permission Armbat does not declare cannot be granted to an app at all.
+
+Games need no account and no network. Apps that require Google Play services will not work.

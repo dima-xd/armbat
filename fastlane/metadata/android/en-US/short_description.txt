@@ -1,0 +1,1 @@
+Run 32-bit ARM apps on 64-bit only Android

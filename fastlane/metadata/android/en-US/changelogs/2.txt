@@ -1,0 +1,1 @@
+First F-Droid release. Runs 32-bit ARMv7 APKs on devices without a 32-bit ABI: import an archive, launch it, delete it.

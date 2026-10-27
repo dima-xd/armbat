@@ -184,6 +184,22 @@ The JIT fixes (FPSR at run boundaries, whole-register `VLD1`/`VST1`, `VADDHN`,
 and others) live as commits in `https://github.com/dima-xd/dynarmic`, pulled in as
 the `third_party/dynarmic` submodule.
 
+## Guest sysroot provenance
+
+`runtime/sysroot` is not built by Armbat. It is a submodule pinned to a commit of
+`dima-xd/bionic-sysroot`, which holds `linker`, `libc`, `libm`, `libdl`, `libc++`,
+`libstdc++` and `libz` copied byte for byte out of the official Android 7.0
+`armeabi-v7a` system image `system-images;android-24;default;armeabi-v7a`
+(package `armeabi-v7a-24_r07.zip`, SHA-1
+`3454546b4eed2d6c3dd06d47757d6da9f4176033`). The reproduction script lives at
+`runtime/sysroot/tools/fetch-sysroot.ps1`; it verifies that archive and extracts
+the files with `debugfs`. `runtime/sysroot/CHECKSUMS.txt` pins every extracted
+file. All of it is AOSP bionic under Apache-2.0; see `NOTICE`.
+
+Building these libraries from AOSP sources for `armeabi-v7a` API 24 is the
+planned next step. Until then the pinned official image is the source of truth,
+and no binary in this repository comes from anywhere else.
+
 ## License
 
 Armbat is licensed under the Apache License, Version 2.0; see `LICENSE`.
