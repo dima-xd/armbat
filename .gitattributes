@@ -1,0 +1,3 @@
+# The wrapper must stay LF and executable on every clone: CI runs it on Linux.
+gradlew text eol=lf
+*.sh text eol=lf

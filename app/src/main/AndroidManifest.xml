@@ -1,0 +1,136 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!--
+        The container process carries the permissions its guests ask for. An
+        archive cannot be installed, so the permission it declares can only be
+        held by this process; MainActivity asks for the runtime ones before the
+        guest starts. These are the ones the imported archives declare; a later
+        step derives the set from the archive itself instead of listing it here,
+        because the manifest is fixed at build time.
+    -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-permission android:name="android.permission.BLUETOOTH" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <!--
+        Location is what the map and advertising SDKs of that era ask for first;
+        without it getLastKnownLocation raises SecurityException inside a
+        half-built SDK constructor, the SDK swallows it, and the object it left
+        null crashes the process a few seconds later.
+    -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-permission android:name="android.permission.GET_ACCOUNTS" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="29" />
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+    <!--
+        The library, a game's data and its expansion files live under one folder
+        on the shared storage, so they can be filled and copied out with a file
+        manager or adb. Since Android 11 that needs all-files access; the
+        launcher asks for it through the system screen on first start.
+    -->
+    <uses-permission
+        android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
+    <!--
+        A running guest is announced as foreground work, so the process keeps
+        the importance of a running application instead of a cached one.
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <application
+        android:name=".ArmbatApp"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="@string/app_name"
+        android:localeConfig="@xml/locales_config"
+        android:allowBackup="false"
+        android:supportsRtl="true"
+        android:usesCleartextTraffic="true"
+        android:theme="@style/Theme.Armbat">
+        <!--
+            android:debuggable is deliberately absent: the platform sets it for
+            the debug build type, and a release build must not carry it. The
+            guest's log already lands in /sdcard/armbat/logs, so a release APK
+            needs no `run-as`; one built from this manifest is never debuggable.
+        -->
+
+        <!--
+            Apache HTTP was part of the framework until API 28 and is what
+            almost every SDK of that era uses; the library is still shipped as
+            an optional shared library, so the container asks for it instead of
+            letting old guests die on ClassNotFoundException.
+        -->
+        <uses-library android:name="org.apache.http.legacy" android:required="false" />
+
+        <!--
+            A guest reads its manifest meta-data through the container's
+            package, because it has none of its own, and the platform answers a
+            package without meta-data with a null Bundle. SDKs that look up a
+            key of their own then die on the lookup instead of seeing a missing
+            value. One entry keeps the bundle present; unknown keys read as null.
+        -->
+        <meta-data android:name="armbat.container" android:value="1" />
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:theme="@style/Theme.Armbat">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!--
+                An archive tapped in a file manager opens here instead of a
+                package installer: the container cannot install a 32-bit APK,
+                it adds it to its own library. The sender grants read access to
+                the content URI for the duration of this activity.
+
+                Two actions arrive here in practice: VIEW from "Open" and the
+                deprecated INSTALL_PACKAGE, which file managers still send for
+                their "Install" button.
+            -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <action android:name="android.intent.action.INSTALL_PACKAGE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="application/vnd.android.package-archive" />
+            </intent-filter>
+        </activity>
+
+        <!--
+            Holds the process in the foreground while a guest runs. The guest
+            itself never sees this: it keeps its own threads and its own window,
+            and the service only carries the process importance that a running
+            application is entitled to.
+        -->
+        <service
+            android:name=".GuestService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="application execution runtime" />
+        </service>
+    </application>
+</manifest>

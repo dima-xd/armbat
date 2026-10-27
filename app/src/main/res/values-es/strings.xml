@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="search_hint">Buscar</string>
+    <string name="empty_title">SIN APLICACIONES</string>
+    <string name="empty_hint">Añade un APK para empezar.</string>
+
+    <string name="settings">Ajustes</string>
+    <string name="language">Idioma</string>
+    <string name="language_system">Predeterminado del sistema</string>
+    <string name="apps">Apps</string>
+    <string name="about">Acerca de</string>
+    <string name="version_label">Versión</string>
+    <string name="about_description">Ejecuta aplicaciones ARM de 32 bits en Android de 64 bits.</string>
+    <string name="cancel">CANCELAR</string>
+
+    <string name="launch">INICIAR</string>
+    <string name="launching">INICIANDO…</string>
+    <string name="launch_preparing">Preparando…</string>
+    <string name="launch_loading">Cargando…</string>
+    <string name="launch_starting">Iniciando…</string>
+    <string name="launch_dex_read">Leyendo dex…</string>
+    <string name="launch_dex_rewrite">Optimizando…</string>
+    <string name="launch_dex_write">Guardando…</string>
+    <string name="launch_native">Cargando bibliotecas…</string>
+    <string name="launch_resources">Cargando recursos…</string>
+    <string name="guest_channel_name">Aplicaciones en ejecución</string>
+    <string name="guest_notification_text">Una aplicación se está ejecutando en segundo plano</string>
+    <string name="delete">ELIMINAR</string>
+
+    <string name="size">TAMAÑO</string>
+    <string name="version">VERSIÓN</string>
+    <string name="libraries">BIBLIOTECAS</string>
+    <string name="none">NINGUNA</string>
+    <string name="arm32_none_arm64">NINGUNA (SOLO ARM64)</string>
+    <string name="arm32_none_java">NINGUNA (SOLO JAVA)</string>
+
+    <string name="error_read_apk">No se pudo leer el APK</string>
+    <string name="error_already_added">Ya está en la lista</string>
+    <string name="error_already_added_detail">%1$s ya está en la biblioteca.</string>
+    <string name="ok">ACEPTAR</string>
+    <string name="error_permission">Permiso READ_PHONE_STATE denegado</string>
+    <string name="storage_access_title">Acceso a archivos</string>
+    <string name="storage_access_detail">Permite el acceso a todos los archivos para que el contenedor use /sdcard/armbat.</string>
+    <string name="error_no_activity">No hay actividad en el manifiesto</string>
+    <string name="error_no_dex">No hay classes.dex en el APK</string>
+    <string name="error_not_activity">%1$s no es una actividad</string>
+    <string name="error_activity_not_declared">%1$s no está declarada en el manifiesto</string>
+    <string name="error_no_message">sin mensaje</string>
+    <string name="error_dex_create">No se pudo crear %1$s</string>
+    <string name="error_dex_missing">Falta %1$s en el APK</string>
+    <string name="error_dex_publish">No se pudo escribir %1$s</string>
+
+    <string name="unit_mb">MB</string>
+    <string name="unit_kb">KB</string>
+
+    <plurals name="app_count">
+        <item quantity="one">%d APP</item>
+        <item quantity="other">%d APPS</item>
+    </plurals>
+    <string name="log_level">Nivel de registro</string>
+    <string name="log_level_off">Apagado</string>
+    <string name="log_level_error">Solo errores</string>
+    <string name="log_level_warn">Problemas</string>
+    <string name="log_level_info">Normal</string>
+    <string name="log_level_debug">Detallado</string>
+    <string name="log_level_trace">Todo</string>
+</resources>

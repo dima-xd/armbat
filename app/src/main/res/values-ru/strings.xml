@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="search_hint">Поиск</string>
+    <string name="empty_title">ПУСТО</string>
+    <string name="empty_hint">Добавьте APK, чтобы начать.</string>
+
+    <string name="settings">Настройки</string>
+    <string name="language">Язык</string>
+    <string name="language_system">Как в системе</string>
+    <string name="apps">Приложения</string>
+    <string name="about">О программе</string>
+    <string name="version_label">Версия</string>
+    <string name="about_description">Запускает 32-битные ARM-приложения на 64-битном Android.</string>
+    <string name="cancel">ОТМЕНА</string>
+
+    <string name="launch">ЗАПУСТИТЬ</string>
+    <string name="launching">ЗАПУСК…</string>
+    <string name="launch_preparing">Подготовка…</string>
+    <string name="launch_loading">Загрузка…</string>
+    <string name="launch_starting">Запуск…</string>
+    <string name="launch_dex_read">Чтение dex…</string>
+    <string name="launch_dex_rewrite">Оптимизация…</string>
+    <string name="launch_dex_write">Сохранение…</string>
+    <string name="launch_native">Загрузка библиотек…</string>
+    <string name="launch_resources">Загрузка ресурсов…</string>
+    <string name="guest_channel_name">Запущенные приложения</string>
+    <string name="guest_notification_text">Приложение работает в фоне</string>
+    <string name="delete">УДАЛИТЬ</string>
+
+    <string name="size">РАЗМЕР</string>
+    <string name="version">ВЕРСИЯ</string>
+    <string name="libraries">БИБЛИОТЕКИ</string>
+    <string name="none">НЕТ</string>
+    <string name="arm32_none_arm64">НЕТ (В APK ТОЛЬКО ARM64)</string>
+    <string name="arm32_none_java">НЕТ (ТОЛЬКО JAVA)</string>
+
+    <string name="error_read_apk">Не удалось прочитать APK</string>
+    <string name="error_already_added">Уже добавлено</string>
+    <string name="error_already_added_detail">%1$s уже есть в библиотеке.</string>
+    <string name="ok">ОК</string>
+    <string name="error_permission">Нет разрешения READ_PHONE_STATE</string>
+    <string name="storage_access_title">Доступ к файлам</string>
+    <string name="storage_access_detail">Разрешите доступ ко всем файлам, чтобы контейнер использовал /sdcard/armbat.</string>
+    <string name="error_no_activity">В манифесте нет Activity</string>
+    <string name="error_no_dex">В APK нет classes.dex</string>
+    <string name="error_not_activity">%1$s  не Activity</string>
+    <string name="error_activity_not_declared">%1$s не объявлена в манифесте</string>
+    <string name="error_no_message">без сообщения</string>
+    <string name="error_dex_create">Не удалось создать %1$s</string>
+    <string name="error_dex_missing">В APK нет %1$s</string>
+    <string name="error_dex_publish">Не удалось записать %1$s</string>
+
+    <string name="unit_mb">МБ</string>
+    <string name="unit_kb">КБ</string>
+
+    <plurals name="app_count">
+        <item quantity="one">%d ПРИЛОЖЕНИЕ</item>
+        <item quantity="few">%d ПРИЛОЖЕНИЯ</item>
+        <item quantity="many">%d ПРИЛОЖЕНИЙ</item>
+        <item quantity="other">%d ПРИЛОЖЕНИЯ</item>
+    </plurals>
+    <string name="log_level">Уровень лога</string>
+    <string name="log_level_off">Выкл</string>
+    <string name="log_level_error">Только ошибки</string>
+    <string name="log_level_warn">Проблемы</string>
+    <string name="log_level_info">Обычный</string>
+    <string name="log_level_debug">Подробный</string>
+    <string name="log_level_trace">Всё</string>
+</resources>

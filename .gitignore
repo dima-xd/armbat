@@ -1,0 +1,22 @@
+build/
+.cxx/
+.gradle/
+local.properties
+# Signing keys never belong in the repository: CI injects them via secrets.
+*.jks
+*.keystore
+*.iml
+.idea/
+.kotlin/
+
+/docs/
+
+
+# Guest bionic sysroot source artifacts (see runtime/sysroot)
+system-images/
+*.img
+armeabi-v7a-*.zip
+# The unpacked system image is a local cache; the sysroot repository's
+# tools/fetch-sysroot.ps1 recreates the binaries from the Android SDK.
+third_party/guest-sysroot/img24/
+third_party/guest-sysroot/extracted/

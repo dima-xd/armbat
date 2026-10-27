@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="search_hint">खोजें</string>
+    <string name="empty_title">कोई ऐप नहीं</string>
+    <string name="empty_hint">शुरू करने के लिए APK जोड़ें।</string>
+
+    <string name="settings">सेटिंग्स</string>
+    <string name="language">भाषा</string>
+    <string name="language_system">सिस्टम डिफ़ॉल्ट</string>
+    <string name="apps">ऐप्स</string>
+    <string name="about">परिचय</string>
+    <string name="version_label">संस्करण</string>
+    <string name="about_description">64-बिट Android पर 32-बिट ARM ऐप्स चलाता है।</string>
+    <string name="cancel">रद्द करें</string>
+
+    <string name="launch">चलाएँ</string>
+    <string name="launching">शुरू हो रहा है…</string>
+    <string name="launch_preparing">तैयार किया जा रहा है…</string>
+    <string name="launch_loading">लोड हो रहा है…</string>
+    <string name="launch_starting">प्रारंभ हो रहा है…</string>
+    <string name="launch_dex_read">dex पढ़ा जा रहा है…</string>
+    <string name="launch_dex_rewrite">अनुकूलित किया जा रहा है…</string>
+    <string name="launch_dex_write">सहेजा जा रहा है…</string>
+    <string name="launch_native">लाइब्रेरी लोड हो रही है…</string>
+    <string name="launch_resources">संसाधन लोड हो रहे हैं…</string>
+    <string name="guest_channel_name">चल रहे ऐप्स</string>
+    <string name="guest_notification_text">ऐप बैकग्राउंड में चल रहा है</string>
+    <string name="delete">हटाएँ</string>
+
+    <string name="size">आकार</string>
+    <string name="version">संस्करण</string>
+    <string name="libraries">लाइब्रेरी</string>
+    <string name="none">कोई नहीं</string>
+    <string name="arm32_none_arm64">कोई नहीं (केवल ARM64)</string>
+    <string name="arm32_none_java">कोई नहीं (केवल JAVA)</string>
+
+    <string name="error_read_apk">APK पढ़ा नहीं जा सका</string>
+    <string name="error_already_added">पहले से जोड़ा गया</string>
+    <string name="error_already_added_detail">%1$s पहले से लाइब्रेरी में है।</string>
+    <string name="ok">ठीक है</string>
+    <string name="error_permission">READ_PHONE_STATE अनुमति अस्वीकृत</string>
+    <string name="storage_access_title">फ़ाइलों तक पहुँच</string>
+    <string name="storage_access_detail">/sdcard/armbat इस्तेमाल करने के लिए सभी फ़ाइलों तक पहुँच दें।</string>
+    <string name="error_no_activity">मैनिफ़ेस्ट में कोई गतिविधि नहीं</string>
+    <string name="error_no_dex">APK में classes.dex नहीं है</string>
+    <string name="error_not_activity">%1$s कोई गतिविधि नहीं है</string>
+    <string name="error_activity_not_declared">%1$s मैनिफ़ेस्ट में घोषित नहीं है</string>
+    <string name="error_no_message">कोई संदेश नहीं</string>
+    <string name="error_dex_create">%1$s नहीं बनाया जा सका</string>
+    <string name="error_dex_missing">APK में %1$s नहीं है</string>
+    <string name="error_dex_publish">%1$s नहीं लिखा जा सका</string>
+
+    <string name="unit_mb">MB</string>
+    <string name="unit_kb">KB</string>
+
+    <plurals name="app_count">
+        <item quantity="one">%d ऐप</item>
+        <item quantity="other">%d ऐप्स</item>
+    </plurals>
+    <string name="log_level">लॉग स्तर</string>
+    <string name="log_level_off">बंद</string>
+    <string name="log_level_error">केवल त्रुटियाँ</string>
+    <string name="log_level_warn">समस्याएँ</string>
+    <string name="log_level_info">सामान्य</string>
+    <string name="log_level_debug">विस्तृत</string>
+    <string name="log_level_trace">सब कुछ</string>
+</resources>

@@ -1,0 +1,9 @@
+[submodule "third_party/dynarmic"]
+	path = third_party/dynarmic
+	url = https://github.com/dima-xd/dynarmic.git
+[submodule "third_party/boost"]
+	path = third_party/boost
+	url = https://github.com/Vita3K/ext-boost
+[submodule "runtime/sysroot"]
+	path = runtime/sysroot
+	url = https://github.com/dima-xd/bionic-sysroot.git

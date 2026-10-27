@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Languages the container ships with, so Android's per-app language picker can
+     offer them; without this list the system only sees the current locale. -->
+<locale-config xmlns:android="http://schemas.android.com/apk/res/android">
+    <locale android:name="en" />
+    <locale android:name="ru" />
+    <locale android:name="es" />
+    <locale android:name="zh" />
+    <locale android:name="hi" />
+</locale-config>

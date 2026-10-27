@@ -1,0 +1,82 @@
+name: Bug report
+description: Something in Armbat does not work as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. The runtime keeps a log of every run, and a log is
+        usually the difference between a guess and a fix, so please attach one
+        when you can.
+
+        Logs live in the `armbat` folder on internal storage:
+
+        ```
+        /sdcard/armbat/logs/current.log     the latest run
+        /sdcard/armbat/logs/current.1.log   the run before it
+        ```
+
+        Open that folder with any file manager, pick the run where the problem
+        happened and attach the file below. If the application crashed, the log
+        ends with a `fault:` report.
+
+  - type: input
+    id: application
+    attributes:
+      label: Application
+      description: Package name and version of the imported APK.
+      placeholder: com.mojang.minecraftpe 1.2.0.81
+    validations:
+      required: true
+
+  - type: input
+    id: armbat-build
+    attributes:
+      label: Armbat build
+      description: Commit, release date or the file name of the APK you installed.
+      placeholder: armbat-abc1234.apk
+    validations:
+      required: false
+
+  - type: input
+    id: device
+    attributes:
+      label: Device
+      description: Model, Android version.
+      placeholder: Pixel 8, Android 15
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The shortest sequence that shows the problem every time.
+      placeholder: |
+        1. Import the APK
+        2. Launch it
+        3. Tap Play
+    validations:
+      required: false
+
+  - type: textarea
+    id: log-file
+    attributes:
+      label: Log file
+      description: |
+        Optional, but the most useful part of the report. Drag and drop
+        `/sdcard/armbat/logs/current.log` (or `current.1.log` if the failure was
+        the previous launch) into this field. If the file is not accepted,
+        rename it to `current.log.txt` first.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I looked through the existing issues for the same problem.
+          required: false
+        - label: The APK is a 32-bit ARMv7 build (armeabi-v7a) and does not need Google services.
+          required: false

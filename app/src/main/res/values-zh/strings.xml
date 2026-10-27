@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="search_hint">搜索</string>
+    <string name="empty_title">没有应用</string>
+    <string name="empty_hint">添加 APK 以开始。</string>
+
+    <string name="settings">设置</string>
+    <string name="language">语言</string>
+    <string name="language_system">跟随系统</string>
+    <string name="apps">应用</string>
+    <string name="about">关于</string>
+    <string name="version_label">版本</string>
+    <string name="about_description">在 64 位 Android 上运行 32 位 ARM 应用。</string>
+    <string name="cancel">取消</string>
+
+    <string name="launch">启动</string>
+    <string name="launching">正在启动…</string>
+    <string name="launch_preparing">正在准备…</string>
+    <string name="launch_loading">正在加载…</string>
+    <string name="launch_starting">正在启动…</string>
+    <string name="launch_dex_read">正在读取 dex…</string>
+    <string name="launch_dex_rewrite">正在优化…</string>
+    <string name="launch_dex_write">正在保存…</string>
+    <string name="launch_native">正在加载库…</string>
+    <string name="launch_resources">正在加载资源…</string>
+    <string name="guest_channel_name">正在运行的应用</string>
+    <string name="guest_notification_text">应用正在后台运行</string>
+    <string name="delete">删除</string>
+
+    <string name="size">大小</string>
+    <string name="version">版本</string>
+    <string name="libraries">库</string>
+    <string name="none">无</string>
+    <string name="arm32_none_arm64">无（仅 ARM64）</string>
+    <string name="arm32_none_java">无（仅 JAVA）</string>
+
+    <string name="error_read_apk">无法读取 APK</string>
+    <string name="error_already_added">已经添加过</string>
+    <string name="error_already_added_detail">%1$s 已在应用库中。</string>
+    <string name="ok">确定</string>
+    <string name="error_permission">READ_PHONE_STATE 权限被拒绝</string>
+    <string name="storage_access_title">文件访问权限</string>
+    <string name="storage_access_detail">请允许访问所有文件，以便容器使用 /sdcard/armbat。</string>
+    <string name="error_no_activity">清单中没有 Activity</string>
+    <string name="error_no_dex">APK 中没有 classes.dex</string>
+    <string name="error_not_activity">%1$s 不是 Activity</string>
+    <string name="error_activity_not_declared">%1$s 未在清单中声明</string>
+    <string name="error_no_message">无消息</string>
+    <string name="error_dex_create">无法创建 %1$s</string>
+    <string name="error_dex_missing">APK 中缺少 %1$s</string>
+    <string name="error_dex_publish">无法写入 %1$s</string>
+
+    <string name="unit_mb">MB</string>
+    <string name="unit_kb">KB</string>
+
+    <plurals name="app_count">
+        <item quantity="other">%d 个应用</item>
+    </plurals>
+    <string name="log_level">日志级别</string>
+    <string name="log_level_off">关闭</string>
+    <string name="log_level_error">仅错误</string>
+    <string name="log_level_warn">问题</string>
+    <string name="log_level_info">正常</string>
+    <string name="log_level_debug">详细</string>
+    <string name="log_level_trace">全部</string>
+</resources>

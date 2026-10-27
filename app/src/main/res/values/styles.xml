@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The window exists before Compose draws anything, so it has to be the
+         same near-black as the shell; otherwise every launch flashes white. -->
+    <style name="Theme.Armbat" parent="@android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#0A0B0C</item>
+        <item name="android:statusBarColor">#0A0B0C</item>
+        <item name="android:navigationBarColor">#0A0B0C</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:colorAccent">#D8A657</item>
+    </style>
+</resources>

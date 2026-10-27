@@ -1,0 +1,188 @@
+name: build
+
+on:
+  push:
+    branches: [master, main]
+    # A release is cut by pushing a version tag; the workflow then builds exactly
+    # that commit and names the APK after the tag.
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # A new push to the same branch makes the previous run pointless.
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    # A tag publishes a release, and a release writes to the repo.
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Dynarmic, boost and the guest bionic sysroot are submodules: the
+          # native build cannot be configured without them.
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Version
+        # The version lives in app/build.gradle.kts only, so the artifact is named
+        # from the source of truth rather than from a second copy in the workflow.
+        run: |
+          version_name=$(sed -n 's/.*versionName *= *"\([^"]*\)".*/\1/p' app/build.gradle.kts | head -n 1)
+          version_code=$(sed -n 's/.*versionCode *= *\([0-9]\+\).*/\1/p' app/build.gradle.kts | head -n 1)
+          if [ -z "$version_name" ] || [ -z "$version_code" ]; then
+            echo "::error::cannot read versionName/versionCode from app/build.gradle.kts"
+            exit 1
+          fi
+          echo "ANDROID_VERSION_NAME=$version_name" >> "$GITHUB_ENV"
+          echo "ANDROID_VERSION_CODE=$version_code" >> "$GITHUB_ENV"
+          echo "version: $version_name ($version_code)"
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$GITHUB_REF_NAME" != "v$version_name" ]; then
+            echo "::warning::tag $GITHUB_REF_NAME does not match versionName $version_name"
+          fi
+
+      - name: JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Android cmdline tools
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+
+      - name: SDK components
+        # Versions are pinned to app/build.gradle.kts; installing them explicitly
+        # keeps CI independent of whatever the runner image ships.
+        run: |
+          sdkmanager --install \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "ndk;29.0.13113456" \
+            "cmake;3.31.6"
+
+      - name: Gradle cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle.kts', 'gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Signing key
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEYSTORE_ALIAS: ${{ secrets.KEYSTORE_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -n "$ANDROID_KEYSTORE_BASE64" ]; then
+            mkdir -p build/apk
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 -d > build/apk/upload-keystore.jks
+            {
+              echo "ANDROID_KEYSTORE=$GITHUB_WORKSPACE/build/apk/upload-keystore.jks"
+              echo "KEYSTORE_PASSWORD=$KEYSTORE_PASSWORD"
+              echo "KEYSTORE_ALIAS=$KEYSTORE_ALIAS"
+              echo "KEY_PASSWORD=$KEY_PASSWORD"
+            } >> "$GITHUB_ENV"
+            echo "signing: upload keystore from secrets"
+          else
+            echo "signing: no keystore in secrets, the APK will be unsigned"
+          fi
+
+      - name: Unit tests
+        run: ./gradlew --no-daemon :app:testDebugUnitTest
+
+      - name: Build release APK
+        run: ./gradlew --no-daemon :app:assembleRelease
+
+      - name: Stage artifact
+        run: |
+          mkdir -p out
+          apk=$(ls app/build/outputs/apk/release/app-release*.apk | head -n 1)
+          name="armbat-${ANDROID_VERSION_NAME}-${ANDROID_VERSION_CODE}"
+          case "$apk" in
+            *unsigned*) name="${name}-unsigned" ;;
+          esac
+          # Two commits can carry the same version, so a build that is not a
+          # release keeps the commit in its name.
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+            name="${name}-g${GITHUB_SHA::7}"
+          fi
+          cp "$apk" "out/$name.apk"
+          echo "ARM_BAT_ARTIFACT=$name" >> "$GITHUB_ENV"
+          {
+            echo "### Armbat ${ANDROID_VERSION_NAME} (${ANDROID_VERSION_CODE})"
+            echo
+            echo "- file: \`${name}.apk\`"
+            echo "- size: $(du -h --apparent-size "out/$name.apk" | cut -f1)"
+            echo "- sha256: \`$(sha256sum "out/$name.apk" | cut -d' ' -f1)\`"
+          } | tee out/release-notes.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARM_BAT_ARTIFACT }}
+          path: out/*.apk
+          # Downloading an artifact always yields a zip, and the APK is already
+          # compressed: storing it is faster than deflating it twice.
+          compression-level: 0
+          retention-days: 90
+          if-no-files-found: error
+
+      - name: Release
+        # An artifact can only be downloaded as a zip. A tag is what people
+        # install by hand, so it gets the bare APK as a release asset.
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          apk="out/${ARM_BAT_ARTIFACT}.apk"
+          if gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" "$apk" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" "$apk" \
+              --title "Armbat ${ANDROID_VERSION_NAME}" \
+              --notes-file out/release-notes.md
+          fi
+
+      - name: Nightly release
+        # Same reason as above: a branch build keeps its history in the artifact,
+        # and gets one direct .apk link that always points at the newest build.
+        # A pre-release tag keeps it out of releases/latest, which stays the last
+        # version tag.
+        if: github.event_name == 'push' && github.ref_type == 'branch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp "out/${ARM_BAT_ARTIFACT}.apk" out/armbat-latest.apk
+          {
+            echo "Automatic build of ${GITHUB_SHA::7}."
+            echo
+            echo "- version: ${ANDROID_VERSION_NAME} (${ANDROID_VERSION_CODE})"
+            echo "- size: $(du -h --apparent-size out/armbat-latest.apk | cut -f1)"
+            echo "- sha256: \`$(sha256sum out/armbat-latest.apk | cut -d' ' -f1)\`"
+            echo
+            echo "Saved as \`${ARM_BAT_ARTIFACT}.apk\` inside the build artifact."
+          } > out/nightly-notes.md
+          if gh release view nightly > /dev/null 2>&1; then
+            gh release upload nightly out/armbat-latest.apk --clobber
+            gh release edit nightly --notes-file out/nightly-notes.md
+          else
+            gh release create nightly out/armbat-latest.apk \
+              --title "Armbat nightly" \
+              --prerelease \
+              --notes-file out/nightly-notes.md
+          fi
