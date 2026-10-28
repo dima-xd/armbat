@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The launcher shows two entries when both builds are installed; the name
+         is the only thing that tells them apart at a glance. -->
+    <string name="app_name">Armbat Debug</string>
+</resources>

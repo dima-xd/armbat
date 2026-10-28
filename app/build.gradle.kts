@@ -75,6 +75,12 @@ android {
             isMinifyEnabled = false
             signingConfig = signingConfigs.findByName("release")
         }
+        // A debug build installs beside the release one instead of replacing it:
+        // its own package means its own data directory and its own library, so a
+        // guest imported for testing never touches the real library.
+        debug {
+            applicationIdSuffix = ".debug"
+        }
     }
 
     packaging {
