@@ -7,6 +7,7 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
 
@@ -54,11 +55,34 @@ class GuestService : Service() {
         } else {
             startForeground(ID, notification)
         }
+        // A network game finds its peers through group-addressed frames, and the
+        // Wi-Fi chipset drops those while no multicast lock is held: the guest
+        // binds its port and broadcasts, and nothing ever comes back. The lock
+        // follows the guest's lifetime, not the activity's.
+        if (multicast == null) {
+            val wifi = applicationContext.getSystemService(WifiManager::class.java)
+            multicast = wifi?.createMulticastLock("armbat-lan")?.apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        }
         // A guest cannot be resumed after the process is gone: restarting the
         // service alone would leave a notification for an application that is
         // no longer running.
         return START_NOT_STICKY
     }
+
+    override fun onDestroy() {
+        multicast?.let { lock ->
+            if (lock.isHeld) {
+                lock.release()
+            }
+        }
+        multicast = null
+        super.onDestroy()
+    }
+
+    private var multicast: WifiManager.MulticastLock? = null
 
     companion object {
         private const val CHANNEL = "guest"

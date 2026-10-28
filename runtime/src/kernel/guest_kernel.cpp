@@ -6,6 +6,7 @@
 #include <chrono>
 #include <climits>
 #include <csignal>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -18,10 +19,14 @@
 #include "armbat/log.h"
 #include <fcntl.h>
 #include <linux/futex.h>
+#include <net/if.h>
+#include <netdb.h>
+#include <netinet/in.h>
 #include <poll.h>
 #include <sched.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/ioctl.h>
 #include <sys/random.h>
 #include <sys/resource.h>
 #include <sys/select.h>
@@ -32,6 +37,7 @@
 #include <sys/sysinfo.h>
 #include <sys/time.h>
 #include <sys/timerfd.h>
+#include <sys/uio.h>
 #include <sys/un.h>
 #include <sys/utsname.h>
 #include <unistd.h>
@@ -66,6 +72,10 @@ constexpr std::uint32_t kArmNrSetTls = kArmNrBase + 5;
 constexpr std::uint32_t kArmNrGetTls = kArmNrBase + 6;
 // Armbat's own handshake with the bionic boot program.
 constexpr std::uint32_t kArmbatBootReady = kArmNrBase + 0x100;
+// A name lookup the guest cannot make itself: bionic asks netd, and a container
+// has none. The guest's libarmbat_net.so carries the question out through this
+// trap and receives the addresses packed by the host's resolver.
+constexpr std::uint32_t kArmbatResolve = kArmNrBase + 0x101;
 
 // ARM uses the asm-generic syscall table, so these numbers are stable.
 enum SyscallNumber : std::uint32_t {
@@ -193,6 +203,12 @@ enum SyscallNumber : std::uint32_t {
     kSysSendto = 290,
     kSysRecv = 291,
     kSysRecvfrom = 292,
+    // An engine's network layer builds an iovec for everything it writes, and
+    // bionic's own interface enumeration reads netlink replies through msghdr.
+    // Without them the guest never learns its own address, which is the first
+    // thing a LAN game asks for.
+    kSysSendmsg = 296,
+    kSysRecvmsg = 297,
     kSysShutdown = 293,
     kSysSetsockopt = 294,
     kSysGetsockopt = 295,
@@ -260,6 +276,132 @@ struct GuestEpollEvent {
 };
 
 static_assert(sizeof(GuestEpollEvent) == 16, "32-bit epoll_event must be 16 bytes");
+
+// The guest's 32-bit struct msghdr: every pointer is 32 bits and every length is
+// a 32-bit size_t, so the structure cannot be handed to the host as it stands.
+struct GuestMsghdr {
+    std::uint32_t name;
+    std::uint32_t name_length;
+    std::uint32_t iov;
+    std::uint32_t iov_length;
+    std::uint32_t control;
+    std::uint32_t control_length;
+    std::uint32_t flags;
+};
+
+static_assert(sizeof(GuestMsghdr) == 28, "32-bit msghdr must be 28 bytes");
+
+// Ancillary data framing differs between the two ABIs: the guest's cmsghdr is
+// three words with a 4-byte aligned payload, the host's is a 64-bit length, two
+// ints and an 8-byte aligned payload. The payload itself (SO_TIMESTAMP,
+// IP_PKTINFO) is byte-identical, so only the framing is rebuilt.
+constexpr std::size_t kGuestCmsgHeader = 12;
+constexpr std::size_t kHostCmsgHeader = 16;
+// A message with more segments than this is not a game's write path but a broken
+// length; refusing keeps the allocation bounded.
+constexpr std::uint32_t kMaxIoVecs = 1024;
+
+std::size_t AlignUp(std::size_t value, std::size_t alignment) {
+    return (value + alignment - 1) & ~(alignment - 1);
+}
+
+bool TranslateGuestIoVecs(GuestArena& arena, std::uint32_t iov, std::uint32_t count,
+                          std::vector<iovec>& host) {
+    host.clear();
+    if (count == 0) {
+        return true;
+    }
+    if (count > kMaxIoVecs || !arena.IsMapped(iov, count * sizeof(GuestIoVec))) {
+        return false;
+    }
+    host.resize(count);
+    for (std::uint32_t index = 0; index < count; ++index) {
+        GuestIoVec guest{};
+        std::memcpy(&guest, arena.Ptr(iov + index * sizeof(GuestIoVec)), sizeof(guest));
+        if (guest.length != 0 && !arena.IsMapped(guest.base, guest.length)) {
+            host.clear();
+            return false;
+        }
+        host[index].iov_base = guest.length != 0 ? arena.Ptr(guest.base) : nullptr;
+        host[index].iov_len = guest.length;
+    }
+    return true;
+}
+
+bool BuildHostControl(GuestArena& arena, std::uint32_t control, std::uint32_t length,
+                      std::vector<char>& host) {
+    host.clear();
+    if (control == 0 || length == 0) {
+        return true;
+    }
+    if (!arena.IsMapped(control, length)) {
+        return false;
+    }
+    const char* guest = reinterpret_cast<const char*>(arena.Ptr(control));
+    std::size_t offset = 0;
+    while (offset + kGuestCmsgHeader <= length) {
+        std::uint32_t guest_length = 0;
+        std::int32_t level = 0;
+        std::int32_t type = 0;
+        std::memcpy(&guest_length, guest + offset, sizeof(guest_length));
+        if (guest_length < kGuestCmsgHeader || offset + guest_length > length) {
+            break;
+        }
+        std::memcpy(&level, guest + offset + 4, sizeof(level));
+        std::memcpy(&type, guest + offset + 8, sizeof(type));
+        const std::size_t data_length = guest_length - kGuestCmsgHeader;
+        const std::size_t start = AlignUp(host.size(), 8);
+        host.resize(start + kHostCmsgHeader + data_length);
+        auto* header = reinterpret_cast<cmsghdr*>(host.data() + start);
+        header->cmsg_len = kHostCmsgHeader + data_length;
+        header->cmsg_level = level;
+        header->cmsg_type = type;
+        std::memcpy(host.data() + start + kHostCmsgHeader, guest + offset + kGuestCmsgHeader,
+                    data_length);
+        offset += AlignUp(guest_length, 4);
+    }
+    return true;
+}
+
+// Turns the host's ancillary data back into the guest's framing. Returns the
+// number of bytes written into the guest buffer; a short buffer is the guest's
+// MSG_CTRUNC, never a fault.
+std::uint32_t BuildGuestControl(GuestArena& arena, const void* control, std::size_t length,
+                                std::uint32_t destination, std::uint32_t capacity, bool* truncated) {
+    *truncated = false;
+    if (control == nullptr || length < kHostCmsgHeader || destination == 0 || capacity == 0) {
+        return 0;
+    }
+    const char* host = static_cast<const char*>(control);
+    char* guest = reinterpret_cast<char*>(arena.Ptr(destination));
+    std::size_t offset = 0;
+    std::size_t written = 0;
+    while (offset + kHostCmsgHeader <= length) {
+        const auto* header = reinterpret_cast<const cmsghdr*>(host + offset);
+        if (header->cmsg_len < kHostCmsgHeader || offset + header->cmsg_len > length) {
+            break;
+        }
+        const std::size_t data_length = header->cmsg_len - kHostCmsgHeader;
+        const std::size_t start = AlignUp(written, 4);
+        const std::size_t needed = start + kGuestCmsgHeader + data_length;
+        if (needed > capacity) {
+            *truncated = true;
+            break;
+        }
+        std::uint32_t guest_length = static_cast<std::uint32_t>(kGuestCmsgHeader + data_length);
+        std::int32_t level = header->cmsg_level;
+        std::int32_t type = header->cmsg_type;
+        std::memcpy(guest + start, &guest_length, sizeof(guest_length));
+        std::memcpy(guest + start + 4, &level, sizeof(level));
+        std::memcpy(guest + start + 8, &type, sizeof(type));
+        std::memcpy(guest + start + kGuestCmsgHeader, host + offset + kHostCmsgHeader,
+                    data_length);
+        written = needed;
+        offset += AlignUp(static_cast<std::size_t>(header->cmsg_len), 8);
+    }
+    return static_cast<std::uint32_t>(written);
+}
+
 
 // The machine whose thread is inside a syscall right now. Handlers that act on
 // thread state (clone, TLS, cache flush) must use this one, not the machine the
@@ -568,6 +710,67 @@ std::int32_t GuestKernel::DispatchPrivate(std::uint32_t number, const std::uint3
         }
         t_halt_requested = true;
         return 0;
+    case kArmbatResolve: {
+        // The answer is packed as a count followed by one entry per address:
+        // family, length, and the raw address. The guest shim turns it into
+        // addrinfo with the guest's own allocator.
+        constexpr std::size_t kEntries = 8;
+        constexpr std::size_t kEntryMax = 8 + 16;
+        std::string name;
+        if (!ReadString(args[0], name) || name.empty()) {
+            return -EINVAL;
+        }
+        if (args[2] < 4 || !arena_.IsMapped(args[1], args[2])) {
+            return -EFAULT;
+        }
+        addrinfo hints{};
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        addrinfo* found = nullptr;
+        if (::getaddrinfo(name.c_str(), nullptr, &hints, &found) != 0 || found == nullptr) {
+            return -EHOSTUNREACH;
+        }
+        std::vector<std::uint8_t> packed(4, 0);
+        std::uint32_t count = 0;
+        for (const addrinfo* node = found;
+             node != nullptr && count < kEntries;
+             node = node->ai_next) {
+            if (node->ai_addr == nullptr) {
+                continue;
+            }
+            const bool ipv4 = node->ai_family == AF_INET;
+            if (!ipv4 && node->ai_family != AF_INET6) {
+                continue;
+            }
+            std::uint8_t bytes[16] = {};
+            if (ipv4) {
+                std::memcpy(bytes, &reinterpret_cast<const sockaddr_in*>(node->ai_addr)->sin_addr,
+                            sizeof(in_addr));
+            } else {
+                std::memcpy(bytes,
+                            &reinterpret_cast<const sockaddr_in6*>(node->ai_addr)->sin6_addr,
+                            sizeof(in6_addr));
+            }
+            const std::uint32_t length = ipv4 ? sizeof(in_addr) : sizeof(in6_addr);
+            const std::size_t start = packed.size();
+            packed.resize(start + kEntryMax, 0);
+            const std::uint32_t family = static_cast<std::uint32_t>(node->ai_family);
+            std::memcpy(packed.data() + start, &family, sizeof(family));
+            std::memcpy(packed.data() + start + 4, &length, sizeof(length));
+            std::memcpy(packed.data() + start + 8, bytes, length);
+            ++count;
+        }
+        ::freeaddrinfo(found);
+        if (count == 0) {
+            return -EHOSTUNREACH;
+        }
+        std::memcpy(packed.data(), &count, sizeof(count));
+        if (packed.size() > args[2]) {
+            return -ENOSPC;
+        }
+        std::memcpy(arena_.Ptr(args[1]), packed.data(), packed.size());
+        return static_cast<std::int32_t>(packed.size());
+    }
     default:
         last_unimplemented_ = number;
         return -ENOSYS;
@@ -1627,6 +1830,14 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
         if (sending) {
             peer_length = static_cast<socklen_t>(
                 std::min<std::uint32_t>(args[5], sizeof(sockaddr_storage)));
+            // A netlink request goes out unaddressed: the family is already in
+            // the header, and the kernel routes it to itself. Treating the empty
+            // address as a fault left getifaddrs() with no answer at all.
+            if (address == 0 && peer_length == 0) {
+                const ssize_t result =
+                    ::sendto(fd, arena_.Ptr(buffer), length, flags, nullptr, 0);
+                return result < 0 ? -errno : static_cast<std::int32_t>(result);
+            }
             if (peer_length < 2 || !arena_.IsMapped(address, peer_length)) {
                 return -EFAULT;
             }
@@ -1657,6 +1868,85 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
             std::memcpy(arena_.Ptr(address), &peer, peer_length);
             std::memcpy(arena_.Ptr(length_address), &peer_length, sizeof(peer_length));
         }
+        return static_cast<std::int32_t>(result);
+    }
+
+    case kSysSendmsg:
+    case kSysRecvmsg: {
+        const bool sending = number == kSysSendmsg;
+        const int fd = static_cast<int>(args[0]);
+        const std::uint32_t message_address = args[1];
+        const int flags = static_cast<int>(args[2]);
+        if (!arena_.IsMapped(message_address, sizeof(GuestMsghdr))) {
+            return -EFAULT;
+        }
+        GuestMsghdr guest{};
+        std::memcpy(&guest, arena_.Ptr(message_address), sizeof(guest));
+
+        std::vector<iovec> iov;
+        if (!TranslateGuestIoVecs(arena_, guest.iov, guest.iov_length, iov)) {
+            return -EFAULT;
+        }
+        // On a send the address is the peer; on a receive it is the buffer the
+        // peer is copied into. The guest's copy is read only when sending, and
+        // only its capacity matters when receiving.
+        sockaddr_storage address{};
+        socklen_t address_length = 0;
+        if (guest.name != 0 && guest.name_length != 0) {
+            address_length =
+                static_cast<socklen_t>(std::min<std::uint32_t>(guest.name_length, sizeof(address)));
+            if (!arena_.IsMapped(guest.name, address_length)) {
+                return -EFAULT;
+            }
+            if (sending) {
+                std::memcpy(&address, arena_.Ptr(guest.name), address_length);
+            }
+        }
+        std::vector<char> control;
+        if (!BuildHostControl(arena_, guest.control, guest.control_length, control)) {
+            return -EFAULT;
+        }
+
+        msghdr host{};
+        host.msg_name = guest.name != 0 ? &address : nullptr;
+        host.msg_namelen = address_length;
+        host.msg_iov = iov.empty() ? nullptr : iov.data();
+        host.msg_iovlen = iov.size();
+        host.msg_control = control.empty() ? nullptr : control.data();
+        host.msg_controllen = control.size();
+        host.msg_flags = 0;
+
+        const ssize_t result = sending ? ::sendmsg(fd, &host, flags) : ::recvmsg(fd, &host, flags);
+        if (result < 0) {
+            return -errno;
+        }
+        if (sending) {
+            return static_cast<std::int32_t>(result);
+        }
+
+        std::uint32_t guest_flags = static_cast<std::uint32_t>(host.msg_flags);
+        if (guest.name != 0) {
+            const socklen_t copied = static_cast<socklen_t>(
+                std::min<std::size_t>(host.msg_namelen, guest.name_length));
+            if (copied != 0) {
+                std::memcpy(arena_.Ptr(guest.name), &address, copied);
+            }
+            std::memcpy(arena_.Ptr(message_address + offsetof(GuestMsghdr, name_length)), &copied,
+                        sizeof(copied));
+        }
+        if (guest.control != 0 && guest.control_length != 0) {
+            bool truncated = false;
+            const std::uint32_t written =
+                BuildGuestControl(arena_, host.msg_control, host.msg_controllen, guest.control,
+                                  guest.control_length, &truncated);
+            std::memcpy(arena_.Ptr(message_address + offsetof(GuestMsghdr, control_length)),
+                        &written, sizeof(written));
+            if (truncated) {
+                guest_flags |= MSG_CTRUNC;
+            }
+        }
+        std::memcpy(arena_.Ptr(message_address + offsetof(GuestMsghdr, flags)), &guest_flags,
+                    sizeof(guest_flags));
         return static_cast<std::int32_t>(result);
     }
 
@@ -1955,8 +2245,63 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
         return result;
     }
 
-    case kSysIoctl:
-        return -ENOTTY;
+    case kSysIoctl: {
+        const int fd = static_cast<int>(args[0]);
+        const std::uint32_t request = args[1];
+        const std::uint32_t argument = args[2];
+        // What a socket asks its driver: how many bytes are waiting, whether it
+        // is non-blocking, and the addresses of the interfaces it can broadcast
+        // on. A LAN game asks all three before it opens its world to other
+        // players, and the guest's struct ifreq is 32 bytes where the host's is
+        // 40 -- the name comes first and the union starts at 16 on both.
+        constexpr std::uint32_t kFionread = 0x541B;
+        constexpr std::uint32_t kFionbio = 0x5421;
+        constexpr std::uint32_t kSiocgifaddr = 0x8915;
+        constexpr std::uint32_t kSiocgifbrdaddr = 0x8919;
+        constexpr std::uint32_t kSiocgifnetmask = 0x891B;
+        constexpr std::uint32_t kSiocgifmtu = 0x8921;
+        constexpr std::uint32_t kSiocgifhwaddr = 0x8927;
+        constexpr std::uint32_t kSiocgifindex = 0x8933;
+        constexpr std::uint32_t kSiocgiflags = 0x8913;
+        constexpr std::uint32_t kGuestIfreqSize = 32;
+        switch (request) {
+        case kFionread:
+        case kFionbio: {
+            if (!arena_.IsMapped(argument, sizeof(int))) {
+                return -EFAULT;
+            }
+            int value = 0;
+            std::memcpy(&value, arena_.Ptr(argument), sizeof(value));
+            if (::ioctl(fd, static_cast<unsigned long>(request), &value) != 0) {
+                return -errno;
+            }
+            std::memcpy(arena_.Ptr(argument), &value, sizeof(value));
+            return 0;
+        }
+        case kSiocgifaddr:
+        case kSiocgifbrdaddr:
+        case kSiocgifnetmask:
+        case kSiocgifmtu:
+        case kSiocgifhwaddr:
+        case kSiocgifindex:
+        case kSiocgiflags: {
+            if (!arena_.IsMapped(argument, kGuestIfreqSize)) {
+                return -EFAULT;
+            }
+            ifreq host{};
+            std::memcpy(host.ifr_name, arena_.Ptr(argument), IFNAMSIZ);
+            host.ifr_name[IFNAMSIZ - 1] = '\0';
+            if (::ioctl(fd, static_cast<unsigned long>(request), &host) != 0) {
+                return -errno;
+            }
+            std::memcpy(arena_.Ptr(argument + IFNAMSIZ),
+                        reinterpret_cast<const char*>(&host) + IFNAMSIZ, 16);
+            return 0;
+        }
+        default:
+            return -ENOTTY;
+        }
+    }
 
     case kSysFtruncate: {
         const std::uint64_t length = Split64(args[1], args[2]);

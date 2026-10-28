@@ -235,6 +235,21 @@ armbat_embed_binary("${_guest_unwind_so}" "${_guest_unwind_header}"
 
 add_custom_target(guest_unwind DEPENDS "${_guest_unwind_header}")
 
+# --- Guest resolver shim -----------------------------------------------------
+# bionic resolves a hostname through netd, and the container has no netd. The
+# shim exports getaddrinfo() and asks the container instead (one private trap),
+# which makes a server address a player typed work the way it does on a device.
+set(_guest_net_so "${_guest_lib_dir}/libarmbat_net.so")
+armbat_guest_module("${_guest_net_so}" "libarmbat_net.so"
+    "${PROJECT_SOURCE_DIR}/runtime/guest/net.c"
+    "${CMAKE_C_COMPILER}" "${ARMBAT_GUEST_LINKED_FLAGS}")
+
+set(_guest_net_header "${CMAKE_BINARY_DIR}/generated/guest_net.h")
+armbat_embed_binary("${_guest_net_so}" "${_guest_net_header}" guest_net kNet)
+
+add_custom_target(guest_net DEPENDS "${_guest_net_header}")
+add_dependencies(armbat_core guest_net)
+
 # --- Guest bionic sysroot ----------------------------------------------------
 # The guest runs the real Android userland: the linker from the ARMv7 system
 # image plus the libc/libm/libdl family it loads. The files are pinned copies

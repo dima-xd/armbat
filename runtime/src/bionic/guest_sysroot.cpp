@@ -14,6 +14,7 @@
 #include "armbat/log.h"
 
 #include "guest_boot.h"
+#include "guest_net.h"
 #include "shim_libandroid.h"
 #include "shim_libegl.h"
 #include "shim_libglesv1.h"
@@ -59,6 +60,10 @@ const Image kImages[] = {
      shims::kJnigraphicsSize},
     {"liblog.so", "/system/lib/liblog.so", shims::kLogImage, shims::kLogSize},
     {"libOpenSLES.so", "/system/lib/libOpenSLES.so", shims::kOpenslesImage, shims::kOpenslesSize},
+    // Not part of the platform image: the container's answer to a name lookup,
+    // mapped before the application so its getaddrinfo() is the one that wins.
+    {"libarmbat_net.so", "/system/lib/libarmbat_net.so", guest_net::kNetImage,
+     guest_net::kNetSize},
 };
 
 bool FileSize(const std::string& path, std::uint32_t* size) {

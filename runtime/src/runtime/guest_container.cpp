@@ -1299,6 +1299,17 @@ std::string GuestContainer::LoadApk(const std::string& apk_path, const std::stri
     };
     launch_stamp("booted");
 
+    // The guest's own resolver asks netd, which a container does not have, so
+    // the shim goes into the global symbol group before any application library
+    // is mapped: the application's getaddrinfo() then finds it first, and a
+    // server address a player typed resolves like it does on a phone. A missing
+    // shim is not fatal -- it costs name lookups only.
+    if (impl_->bionic->Dlopen("/system/lib/libarmbat_net.so", 0x102 /*RTLD_NOW|RTLD_GLOBAL*/) ==
+        0) {
+        ARMBAT_LOG_WARN("Armbat", "resolve shim not loaded: %s",
+                        impl_->bionic->LastError().c_str());
+    }
+
     std::vector<GuestApk::ExtractedNative> extracted;
     std::string extract_error;
     if (!apk.ExtractNativeLibraries(impl_->app_lib_dir, &extracted, &extract_error)) {
