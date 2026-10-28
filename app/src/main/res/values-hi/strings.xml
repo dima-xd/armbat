@@ -64,4 +64,7 @@
     <string name="log_level_info">सामान्य</string>
     <string name="log_level_debug">विस्तृत</string>
     <string name="log_level_trace">सब कुछ</string>
+    <string name="widescreen">वाइडस्क्रीन</string>
+    <string name="widescreen_on">चालू — पूरी स्क्रीन भरता है</string>
+    <string name="widescreen_off">बंद — ऐप की मूल स्क्रीन रहती है</string>
 </resources>

@@ -66,4 +66,8 @@
     <string name="log_level_info">Normal</string>
     <string name="log_level_debug">Detailed</string>
     <string name="log_level_trace">Everything</string>
+
+    <string name="widescreen">Widescreen</string>
+    <string name="widescreen_on">On — fills the whole screen</string>
+    <string name="widescreen_off">Off — keeps the screen the app was made for</string>
 </resources>

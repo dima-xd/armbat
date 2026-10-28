@@ -514,13 +514,30 @@ class GuestLauncher(private val host: Activity) {
      */
     private class GuestFrame(
         context: Context,
-        private val virtualWidth: Int,
-        private val virtualHeight: Int,
+        private var virtualWidth: Int,
+        private var virtualHeight: Int,
         private val guest: Activity,
     ) : FrameLayout(context) {
         private var factor = 1f
         private var shiftX = 0f
         private var shiftY = 0f
+
+        /**
+         * Gives the guest the canvas of a new shape, after the window rotated.
+         *
+         * The decor was laid out at the old size, so it is measured again at
+         * the new one: the guest's own views then re-layout for the screen they
+         * now describe, and the picture fills the window instead of sitting in
+         * a letterbox.
+         */
+        fun resize(width: Int, height: Int) {
+            virtualWidth = width
+            virtualHeight = height
+            val child = getChildAt(0) ?: return
+            child.layoutParams = FrameLayout.LayoutParams(width, height)
+            requestLayout()
+            fit()
+        }
 
         fun fit() {
             if (width == 0 || height == 0) {
@@ -646,8 +663,8 @@ class GuestLauncher(private val host: Activity) {
         val context: GuestContext,
         val application: Application,
         val screen: VirtualScreen,
-        val virtualWidth: Int,
-        val virtualHeight: Int,
+        var virtualWidth: Int,
+        var virtualHeight: Int,
     ) {
         /** The archive's activities, bottom first; the last one is on screen. */
         val stack = ArrayDeque<Hosted>()
@@ -1597,6 +1614,74 @@ class GuestLauncher(private val host: Activity) {
         hosted.resumed = true
     }
 
+    /**
+     * The window the guest draws into changed its shape.
+     *
+     * An archive that does not pin an orientation follows the phone -- osu!droid
+     * asks for landscape from the onCreate of its menu activity -- and the
+     * platform turns this activity with it. The guest's canvas was built for the
+     * old shape, so the picture would be a small rectangle in the middle of the
+     * window: the canvas is swapped for the new one and the archive is told
+     * about the change, as it is told on the device.
+     */
+    fun onConfigurationChanged(config: Configuration) {
+        val session = session ?: return
+        val landscape = config.orientation == Configuration.ORIENTATION_LANDSCAPE
+        if (landscape == session.virtualWidth > session.virtualHeight) {
+            return
+        }
+        // Queued: the platform is still walking its own configuration change,
+        // and the activities below are torn down and built again.
+        val copy = Configuration(config)
+        host.window.decorView.post { rotate(copy) }
+    }
+
+    /** Gives the guest the canvas of the window's new shape (see above). */
+    private fun rotate(config: Configuration) {
+        val session = session ?: return
+        val landscape = config.orientation == Configuration.ORIENTATION_LANDSCAPE
+        if (landscape == session.virtualWidth > session.virtualHeight) {
+            return
+        }
+        val (width, height) = virtualSize(session.prepared.targetSdk, landscape)
+        ArmbatLog.i(TAG, "guest screen rotated: ${width}x$height")
+        val densityDpi = session.prepared.densityDpi
+        val metrics = android.util.DisplayMetrics()
+        metrics.setTo(session.prepared.resources.displayMetrics)
+        metrics.widthPixels = width
+        metrics.heightPixels = height
+        // The configuration the archive resolves its resources against has to
+        // describe the canvas, not the panel: an archive with a landscape
+        // layout folder has to see the folder its screen now matches.
+        val updated = Configuration(config)
+        updated.densityDpi = densityDpi
+        updated.screenWidthDp = width * 160 / densityDpi
+        updated.screenHeightDp = height * 160 / densityDpi
+        updated.smallestScreenWidthDp = min(updated.screenWidthDp, updated.screenHeightDp)
+        runCatching { session.prepared.resources.updateConfiguration(updated, metrics) }
+            .onFailure { ArmbatLog.w(TAG, "guest configuration: $it") }
+        session.prepared.resources.displayMetrics.widthPixels = width
+        session.prepared.resources.displayMetrics.heightPixels = height
+        session.virtualWidth = width
+        session.virtualHeight = height
+        runCatching {
+            session.screen.display.resize(width, height, densityDpi)
+            session.screen.texture.setDefaultBufferSize(width, height)
+        }
+        // A renderer usually reads the surface once and follows it afterwards,
+        // and an activity is told about the new configuration the way the
+        // platform tells one that declares it handles the change: the window
+        // hands it to the decor, and the view tree lays itself out again on the
+        // canvas it now has. Tearing the activities down instead would rebuild
+        // an engine in the middle of a session, which is the platform's answer
+        // only for an activity that never asked to be kept.
+        for (entry in session.stack) {
+            entry.frame.resize(width, height)
+            runCatching { entry.activity.onConfigurationChanged(config) }
+                .onFailure { ArmbatLog.w(TAG, "guest configuration ${entry.info.name}: $it") }
+        }
+    }
+
     fun destroy() {
         // No guest, no requests: an activity an archive asks for while its
         // session is being torn down would otherwise be built on a released
@@ -1684,7 +1769,7 @@ class GuestLauncher(private val host: Activity) {
             method.invoke(activity, hasFocus)
             ArmbatLog.i(TAG, "window focus: $hasFocus delivered")
         } catch (error: Throwable) {
-            ArmbatLog.i(TAG, "window focus: $hasFocus failed: $error")
+            ArmbatLog.i(TAG, "window focus: $hasFocus failed: ${error.cause ?: error}")
         }
     }
 
@@ -1694,8 +1779,13 @@ class GuestLauncher(private val host: Activity) {
      * Games of the Android 2.x/4.x era were laid out for a 480x800 "normal"
      * phone or a 720p panel, and draw their interface in display pixels; later
      * ones expect a modern 1080p screen. The guest is given that size and the
-     * picture is then scaled to the real display, keeping the original
-     * proportions instead of stretching the interface to a 19.5:9 panel.
+     * picture is then scaled to the real display.
+     *
+     * In widescreen the short side keeps that size and the long one follows the
+     * panel: these games scale their width and their height independently and
+     * only lay out along the short side, so on a 19.5:9 phone the same
+     * interface simply has more room, and the picture fills the display the way
+     * it does when the application is installed on the device.
      */
     private fun virtualSize(targetSdk: Int, landscape: Boolean): Pair<Int, Int> {
         val (width, height) = when {
@@ -1703,7 +1793,15 @@ class GuestLauncher(private val host: Activity) {
             targetSdk <= android.os.Build.VERSION_CODES.LOLLIPOP_MR1 -> 720 to 1280
             else -> 1080 to 1920
         }
-        return if (landscape) height to width else width to height
+        if (!GuestScreen.widescreen(host)) {
+            return if (landscape) height to width else width to height
+        }
+        val panel = host.resources.displayMetrics
+        val ratio = maxOf(panel.widthPixels, panel.heightPixels).toFloat() /
+            minOf(panel.widthPixels, panel.heightPixels)
+        val short = minOf(width, height)
+        val long = (short * ratio).toInt()
+        return if (landscape) long to short else short to long
     }
 
     /**
@@ -1726,8 +1824,10 @@ class GuestLauncher(private val host: Activity) {
      * The manifest's screenOrientation uses the same numbers as the platform's
      * requestedOrientation, so the container passes the value through unchanged;
      * this only answers the question the virtual screen has to know. An archive
-     * that follows the device (unspecified, sensor, full sensor) follows the
-     * window the container already has.
+     * that follows the device (unspecified, sensor, full sensor) gets the way
+     * the phone is held: the display's rotation, not this activity's
+     * configuration, which still describes the window the previous archive left
+     * behind while the platform turns it back.
      */
     private fun wantsLandscape(screenOrientation: Int): Boolean = when (screenOrientation) {
         ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE,
@@ -1742,8 +1842,18 @@ class GuestLauncher(private val host: Activity) {
         ActivityInfo.SCREEN_ORIENTATION_USER_PORTRAIT,
         -> false
 
-        else -> host.resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+        else -> heldLandscape()
     }
+
+    /** Whether the phone itself is held sideways, whatever the window still says. */
+    private fun heldLandscape(): Boolean = runCatching {
+        when (host.display?.rotation) {
+            Surface.ROTATION_90, Surface.ROTATION_270 -> true
+            Surface.ROTATION_0, Surface.ROTATION_180 -> false
+            else -> null
+        }
+    }.getOrNull()
+        ?: (host.resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE)
 
     private fun createVirtualDisplay(width: Int, height: Int, densityDpi: Int): VirtualScreen {
         val manager = host.getSystemService(DisplayManager::class.java)

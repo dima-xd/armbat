@@ -64,4 +64,8 @@
     <string name="log_level_info">Normal</string>
     <string name="log_level_debug">Detallado</string>
     <string name="log_level_trace">Todo</string>
+
+    <string name="widescreen">Pantalla ancha</string>
+    <string name="widescreen_on">Activado: ocupa toda la pantalla</string>
+    <string name="widescreen_off">Desactivado: mantiene la pantalla original</string>
 </resources>

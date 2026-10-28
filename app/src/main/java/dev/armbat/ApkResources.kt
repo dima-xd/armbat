@@ -90,7 +90,19 @@ object ApkResources {
                 sizeClass
         }
         @Suppress("DEPRECATION")
-        Resources(assets, metrics, configuration)
+        val resources = Resources(assets, metrics, configuration)
+        if (screen != null) {
+            // The constructor builds the table against the default display's
+            // adjustment: it keeps the density written above but replaces the
+            // pixel size with the panel's, so the archive laid itself out for
+            // 1272x2772 while drawing on a 480x800 surface -- every screen and
+            // sprite of an old game came out stretched and cut at the bottom.
+            // getDisplayMetrics() is the live object the archive reads, so the
+            // virtual size is written back once the table exists.
+            resources.displayMetrics.widthPixels = screen.width
+            resources.displayMetrics.heightPixels = screen.height
+        }
+        resources
     }.getOrNull()
 
     /** The virtual screen a guest draws into, in its own pixels and density. */

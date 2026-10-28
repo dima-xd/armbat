@@ -63,4 +63,8 @@
     <string name="log_level_info">正常</string>
     <string name="log_level_debug">详细</string>
     <string name="log_level_trace">全部</string>
+
+    <string name="widescreen">宽屏</string>
+    <string name="widescreen_on">开 — 占满整个屏幕</string>
+    <string name="widescreen_off">关 — 保留应用原本的屏幕</string>
 </resources>

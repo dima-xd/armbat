@@ -66,4 +66,8 @@
     <string name="log_level_info">Обычный</string>
     <string name="log_level_debug">Подробный</string>
     <string name="log_level_trace">Всё</string>
+
+    <string name="widescreen">Широкий экран</string>
+    <string name="widescreen_on">Вкл. — на весь экран</string>
+    <string name="widescreen_off">Выкл. — экран, под который сделано приложение</string>
 </resources>

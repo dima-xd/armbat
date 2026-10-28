@@ -640,9 +640,11 @@ private fun languageName(tag: String): String = when (tag) {
 fun SettingsScreen(
     localeTag: String,
     logLevel: Int,
+    widescreen: Boolean,
     version: String,
     onLocale: (String) -> Unit,
     onLogLevel: (Int) -> Unit,
+    onWidescreen: (Boolean) -> Unit,
     onAbout: () -> Unit,
 ) {
     var languageOpen by remember { mutableStateOf(false) }
@@ -665,6 +667,15 @@ fun SettingsScreen(
                     title = stringResource(R.string.log_level),
                     summary = stringResource(logLevelLabel(logLevel)),
                     onClick = { logLevelOpen = true },
+                )
+                HoloDivider()
+                ToggleRow(
+                    title = stringResource(R.string.widescreen),
+                    summary = stringResource(
+                        if (widescreen) R.string.widescreen_on else R.string.widescreen_off,
+                    ),
+                    checked = widescreen,
+                    onToggle = { onWidescreen(!widescreen) },
                 )
                 HoloDivider()
                 SettingsRow(
@@ -729,6 +740,43 @@ private fun SettingsRow(title: String, summary: String, onClick: () -> Unit) {
         }
         Spacer(Modifier.width(12.dp))
         Chevron()
+    }
+}
+
+/**
+ * A settings entry that is a value of its own rather than a menu: the whole row
+ * is the switch, and the square on the right says what the value is.
+ */
+@Composable
+private fun ToggleRow(
+    title: String,
+    summary: String,
+    checked: Boolean,
+    onToggle: () -> Unit,
+) {
+    Row(
+        Modifier
+            .fillMaxWidth()
+            .height(68.dp)
+            .clickable(onClick = onToggle)
+            .padding(horizontal = 16.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text(title, color = HoloText, fontSize = 16.sp)
+            Spacer(Modifier.height(2.dp))
+            Text(summary, color = HoloDim, fontSize = 13.sp)
+        }
+        Spacer(Modifier.width(12.dp))
+        Box(
+            Modifier
+                .size(18.dp)
+                .border(1.dp, if (checked) HoloBlue else HoloRule),
+        ) {
+            if (checked) {
+                Box(Modifier.fillMaxSize().padding(4.dp).background(HoloBlue))
+            }
+        }
     }
 }
 

@@ -3,6 +3,7 @@ package dev.armbat
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.content.res.Configuration
 import android.net.Uri
 import android.os.Bundle
 import android.view.KeyEvent
@@ -179,6 +180,16 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
+     * The window was rotated. The guest's canvas is the shape of the window it
+     * draws into, so it has to follow; the shell's own layout follows on its
+     * own.
+     */
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        guest.onConfigurationChanged(newConfig)
+    }
+
+    /**
      * A back key from a keyboard or a remote reaches the activity this way
      * rather than through the dispatcher. It is the archive's back all the
      * same, so it is offered to the guest first and never treated as the
@@ -268,6 +279,7 @@ class MainActivity : ComponentActivity() {
         var waitingForPermission by remember { mutableStateOf<ApkInfo?>(null) }
         var localeTag by remember { mutableStateOf(AppLocale.current(context)) }
         var logLevel by remember { mutableStateOf(ArmbatLog.level()) }
+        var widescreen by remember { mutableStateOf(GuestScreen.widescreen(context)) }
         val version = remember(context) {
             runCatching {
                 context.packageManager.getPackageInfo(context.packageName, 0).versionName
@@ -496,6 +508,7 @@ class MainActivity : ComponentActivity() {
                         Screen.Settings -> SettingsScreen(
                             localeTag = localeTag,
                             logLevel = logLevel,
+                            widescreen = widescreen,
                             version = version,
                             onLocale = { tag ->
                                 localeTag = tag
@@ -504,6 +517,10 @@ class MainActivity : ComponentActivity() {
                             onLogLevel = { level ->
                                 logLevel = level
                                 ArmbatLog.setLevel(level)
+                            },
+                            onWidescreen = { on ->
+                                widescreen = on
+                                GuestScreen.setWidescreen(this@MainActivity, on)
                             },
                             onAbout = { screen = Screen.About },
                         )
