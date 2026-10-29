@@ -1573,6 +1573,64 @@ void RegisterGlesFunctions(HleRegistry& registry) {
         }
         function(call.Arg(0), static_cast<int>(call.Arg(1)), pointer);
     });
+    // OES_matrix_palette, the skinning path of every GLES1 engine of that era.
+    // The Adreno GLES1 driver implements it, but the two pointer setters take
+    // guest addresses, so they need the same rebasing as the plain vertex array.
+    // Serving them as unknown imports is worse than useless: the array-enabled
+    // enum goes through glEnableClientState untouched, so the driver believes
+    // the matrix-index array is live while its pointer was never set, and the
+    // next draw dereferences it inside the driver and kills the host.
+    registry.Add("glMatrixIndexPointerOES", [state](HleCall& call) {
+        static const auto function =
+            Gl1<void (*)(int, unsigned int, int, const void*)>("glMatrixIndexPointerOES");
+        if (function == nullptr) {
+            return;
+        }
+        std::uint32_t buffer = 0;
+        {
+            const std::lock_guard lock(state->mutex);
+            buffer = state->array_buffer;
+        }
+        bool ok = true;
+        void* pointer =
+            OffsetOrPointer(call, call.Arg(3), buffer, 1, "glMatrixIndexPointerOES", &ok);
+        if (!ok) {
+            return;
+        }
+        function(static_cast<int>(call.Arg(0)), call.Arg(1), static_cast<int>(call.Arg(2)),
+                 pointer);
+    });
+    registry.Add("glWeightPointerOES", [state](HleCall& call) {
+        static const auto function =
+            Gl1<void (*)(int, unsigned int, int, const void*)>("glWeightPointerOES");
+        if (function == nullptr) {
+            return;
+        }
+        std::uint32_t buffer = 0;
+        {
+            const std::lock_guard lock(state->mutex);
+            buffer = state->array_buffer;
+        }
+        bool ok = true;
+        void* pointer = OffsetOrPointer(call, call.Arg(3), buffer, 1, "glWeightPointerOES", &ok);
+        if (!ok) {
+            return;
+        }
+        function(static_cast<int>(call.Arg(0)), call.Arg(1), static_cast<int>(call.Arg(2)),
+                 pointer);
+    });
+    registry.Add("glCurrentPaletteMatrixOES", [](HleCall& call) {
+        static const auto function = Gl1<void (*)(unsigned int)>("glCurrentPaletteMatrixOES");
+        if (function != nullptr) {
+            function(call.Arg(0));
+        }
+    });
+    registry.Add("glLoadPaletteFromModelViewMatrixOES", [](HleCall&) {
+        static const auto function = Gl1<void (*)()>("glLoadPaletteFromModelViewMatrixOES");
+        if (function != nullptr) {
+            function();
+        }
+    });
     registry.Add("glMatrixMode", [](HleCall& call) {
         static const auto function = Gl1<void (*)(unsigned int)>("glMatrixMode");
         if (function != nullptr) {
