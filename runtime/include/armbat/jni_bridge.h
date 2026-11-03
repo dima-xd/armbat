@@ -48,6 +48,12 @@ public:
     JNIEnv* HostEnvironment() const;
     jobject ResolveGuestObject(std::uint32_t handle) const;
 
+    // A handle the guest keeps for the life of the process, handed over outside
+    // any call: ANativeActivity.clazz is exactly one, because the platform
+    // keeps a global reference to the activity and the archive calls back into
+    // it from every thread long after the handover.
+    std::uint32_t KeepObject(JNIEnv* env, jobject object);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

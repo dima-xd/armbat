@@ -124,6 +124,7 @@ enum SyscallNumber : std::uint32_t {
     kSysRtSigreturn = 173,
     kSysRtSigaction = 174,
     kSysRtSigprocmask = 175,
+    kSysRtSigsuspend = 179,
     kSysPread64 = 180,
     kSysPwrite64 = 181,
     kSysGetcwd = 183,
@@ -1631,6 +1632,29 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
             std::memset(arena_.Ptr(old_set), 0, size);
         }
         return 0;
+    }
+
+    case kSysRtSigsuspend: {
+        // A thread suspends here until a signal arrives, and libmono's Boehm
+        // collector is the caller that matters: it stops a thread this way and
+        // resumes it with a signal, then waits for the acknowledgement. Answering
+        // ENOSYS made the thread come back as if it had already been resumed, so
+        // the collection it belonged to could never be finished and the whole
+        // guest stopped on the first allocation burst after a level started.
+        //
+        // The mask is not emulated: the container tracks its own pending set, and
+        // delivery happens at the safe point the returned EINTR leads to, which is
+        // where the guest handler expects to run.
+        A32Machine& suspended = CallingMachine(machine_);
+        // Read the ticket before looking at the pending set: a signal queued in
+        // between bumps the ticket, so the wait returns instead of sleeping
+        // through it.
+        const std::uint32_t ticket = suspended.SignalTicket();
+        if (suspended.HasPendingSignal()) {
+            return -EINTR;
+        }
+        suspended.WaitForSignal(ticket);
+        return -EINTR;
     }
 
     case kSysRtSigreturn:

@@ -2,13 +2,16 @@
 
 #include "armbat/log.h"
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <bit>
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
@@ -129,8 +132,17 @@ constexpr std::uint32_t kAssetDirCell = 512;
 std::vector<AssetDir> g_asset_dirs;
 
 // ---- looper ---------------------------------------------------------------
+//
+// A looper belongs to the thread that prepared it, and only that thread polls
+// the sources registered on it. The single global list this replaces let every
+// thread see every source: with the input queue among them, several threads
+// woke on one touch and raced for the event, so the engine's input thread lost
+// touches to whichever thread reached AInputQueue_getEvent first. A wake was
+// worse still -- it answered the caller's own ident (1, which is Unity's
+// LOOPER_ID_INPUT) instead of ALOOPER_POLL_WAKE (-1), so every wait another
+// thread cut short looked like a touch that had already been consumed.
 
-struct LooperRegistration {
+struct LooperSource {
     std::uint32_t fd = 0;
     std::uint32_t ident = 0;
     std::uint32_t events = 0;
@@ -138,7 +150,119 @@ struct LooperRegistration {
     std::uint32_t data = 0;
 };
 
-std::vector<LooperRegistration> g_loopers;
+struct Looper {
+    std::uint32_t handle = 0;
+    int wake_read = -1;
+    int wake_write = -1;
+    // One thread waits on the sources and another may attach or detach while it
+    // does, so the list is guarded; the wait itself copies it and unlocks.
+    std::mutex mutex;
+    std::vector<LooperSource> sources;
+};
+
+struct LooperTable {
+    std::mutex mutex;
+    std::unordered_map<std::uint32_t, std::unique_ptr<Looper>> by_handle;
+    std::uint32_t next_handle = 1;
+};
+
+LooperTable& Loopers() {
+    // Deliberately leaked: loopers outlive every other static in the container
+    // and a thread may still poll one while the process is unwinding.
+    static LooperTable* table = new LooperTable();
+    return *table;
+}
+
+// The looper of the calling thread, or null before ALooper_prepare.
+thread_local Looper* g_thread_looper = nullptr;
+
+// android/looper.h: the answers ALooper_pollOnce and ALooper_pollAll return.
+// A loop that switches on these must not mistake a wake for an event: Unity
+// reads 1 as LOOPER_ID_INPUT.
+constexpr std::int32_t kLooperWake = -1;
+constexpr std::int32_t kLooperCallback = -2;
+constexpr std::int32_t kLooperTimeout = -3;
+constexpr std::int32_t kLooperError = -4;
+
+Looper* LooperForHandle(std::uint32_t handle) {
+    if (handle == 0) {
+        return g_thread_looper;
+    }
+    LooperTable& table = Loopers();
+    const std::lock_guard lock(table.mutex);
+    const auto it = table.by_handle.find(handle);
+    return it == table.by_handle.end() ? nullptr : it->second.get();
+}
+
+Looper* CreateThreadLooper() {
+    LooperTable& table = Loopers();
+    std::uint32_t handle = 0;
+    {
+        const std::lock_guard lock(table.mutex);
+        handle = table.next_handle++;
+        auto looper = std::make_unique<Looper>();
+        looper->handle = handle;
+        // The wake pipe is a source of the looper the way it is on a device: a
+        // thread asleep in poll() has to leave the wait the moment another
+        // thread wakes it, not when its timeout runs out.
+        int fds[2] = {-1, -1};
+        if (::pipe(fds) == 0) {
+            looper->wake_read = fds[0];
+            looper->wake_write = fds[1];
+            for (const int fd : fds) {
+                const int flags = ::fcntl(fd, F_GETFL, 0);
+                if (flags >= 0) {
+                    ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+                }
+            }
+        }
+        table.by_handle.emplace(handle, std::move(looper));
+    }
+    g_thread_looper = LooperForHandle(handle);
+    return g_thread_looper;
+}
+
+// One descriptor is one source: re-attaching the same queue replaces the entry
+// instead of handing one descriptor to two wakes.
+void LooperAddSource(Looper& looper, const LooperSource& source) {
+    const std::lock_guard lock(looper.mutex);
+    for (LooperSource& existing : looper.sources) {
+        if (existing.fd == source.fd) {
+            existing = source;
+            return;
+        }
+    }
+    looper.sources.push_back(source);
+}
+
+bool LooperRemoveSource(Looper& looper, std::uint32_t fd) {
+    const std::lock_guard lock(looper.mutex);
+    const auto end = std::remove_if(looper.sources.begin(), looper.sources.end(),
+                                    [fd](const LooperSource& source) {
+                                        return source.fd == fd;
+                                    });
+    if (end == looper.sources.end()) {
+        return false;
+    }
+    looper.sources.erase(end, looper.sources.end());
+    return true;
+}
+
+// The three out parameters a wait fills in. They describe the source that
+// fired, and a loop that dispatches through the cookie reads them instead of
+// switching on the ident.
+void WritePollResult(HleCall& call, std::int32_t fd, std::int32_t events,
+                     std::uint32_t data) {
+    if (call.Arg(1) != 0) {
+        call.CopyOut(call.Arg(1), &fd, sizeof(fd));
+    }
+    if (call.Arg(2) != 0) {
+        call.CopyOut(call.Arg(2), &events, sizeof(events));
+    }
+    if (call.Arg(3) != 0) {
+        call.CopyOut(call.Arg(3), &data, sizeof(data));
+    }
+}
 
 // ---- input -----------------------------------------------------------------
 //
@@ -160,8 +284,12 @@ struct GuestInputEvent {
     std::int32_t scan_code;
     std::int32_t pointer_count;
     std::int32_t reserved;
+    // The platform reports both in nanoseconds since boot; the host event
+    // carries milliseconds, so the reader scales them.
+    std::int64_t down_time;
+    std::int64_t event_time;
 };
-static_assert(sizeof(GuestInputEvent) == 48, "the guest layout is 32-bit");
+static_assert(sizeof(GuestInputEvent) == 64, "the guest layout is 32-bit");
 
 struct GuestInputPointer {
     std::int32_t id;
@@ -173,8 +301,9 @@ struct GuestInputPointer {
     float size;
     float touch_major;
     float touch_minor;
+    std::int32_t tool_type;
 };
-static_assert(sizeof(GuestInputPointer) == 36, "the guest layout is 32-bit");
+static_assert(sizeof(GuestInputPointer) == 40, "the guest layout is 32-bit");
 
 constexpr std::uint32_t kInputPointers = 16;
 constexpr std::uint32_t kInputEventBytes =
@@ -190,6 +319,84 @@ struct InputSlot {
 
 std::vector<InputSlot> g_input_slots;
 std::mutex g_input_mutex;
+
+// One wait on this thread's looper. ALOOPER_POLL_CALLBACK means "a source ran,
+// the wait is not over": ALooper_pollAll drains those and only then answers.
+std::int32_t PollLooperOnce(HleCall& call, std::int32_t timeout) {
+    Looper* looper = g_thread_looper;
+    if (looper == nullptr) {
+        looper = CreateThreadLooper();
+    }
+    if (looper == nullptr) {
+        call.Return(static_cast<std::uint32_t>(kLooperError));
+        return kLooperError;
+    }
+    // The wait and the dispatch read one copy of the source list, so a source
+    // attached or detached while this thread is asleep cannot shift the index
+    // that names the descriptor which fired.
+    std::vector<LooperSource> sources;
+    {
+        const std::lock_guard lock(looper->mutex);
+        sources = looper->sources;
+    }
+    std::vector<struct pollfd> fds;
+    fds.reserve(sources.size() + 1);
+    fds.push_back(pollfd{looper->wake_read, POLLIN, 0});
+    for (const LooperSource& source : sources) {
+        fds.push_back(pollfd{static_cast<int>(source.fd), static_cast<short>(source.events), 0});
+    }
+    const int ready = ::poll(fds.data(), fds.size(), timeout);
+    if (ready < 0) {
+        if (errno == EINTR) {
+            // The container's wakeup signal interrupted the wait because a
+            // guest signal is queued on this thread; the handler runs at the
+            // next safe point. That is how a parked thread is reached at all,
+            // so it cannot be reported as a looper failure: the platform
+            // answers ALOOPER_POLL_WAKE for an interrupted wait, and a loop
+            // that treats an error as fatal would stop reading the queue for
+            // the rest of the session.
+            WritePollResult(call, -1, 0, 0);
+            call.Return(static_cast<std::uint32_t>(kLooperWake));
+            return kLooperWake;
+        }
+        call.Return(static_cast<std::uint32_t>(kLooperError));
+        return kLooperError;
+    }
+    if (ready == 0) {
+        call.Return(static_cast<std::uint32_t>(kLooperTimeout));
+        return kLooperTimeout;
+    }
+    if (fds[0].revents != 0) {
+        char buffer[64];
+        while (::read(looper->wake_read, buffer, sizeof(buffer)) > 0) {
+        }
+        WritePollResult(call, -1, 0, 0);
+        call.Return(static_cast<std::uint32_t>(kLooperWake));
+        return kLooperWake;
+    }
+    for (std::size_t i = 1; i < fds.size(); ++i) {
+        if (fds[i].revents == 0) {
+            continue;
+        }
+        // The callback may add or remove sources, so the entry comes from the
+        // copy this wait polled and the set is rebuilt by the next wait.
+        const LooperSource source = sources[i - 1];
+        if (source.callback != 0) {
+            const std::uint32_t fd = source.fd;
+            const std::uint32_t revents = static_cast<std::uint32_t>(fds[i].revents);
+            const std::uint32_t data = source.data;
+            call.Machine().CallNested(source.callback, {fd, revents, data});
+            call.Return(static_cast<std::uint32_t>(kLooperCallback));
+            return kLooperCallback;
+        }
+        WritePollResult(call, static_cast<std::int32_t>(source.fd),
+                        static_cast<std::int32_t>(fds[i].revents), source.data);
+        call.Return(source.ident);
+        return static_cast<std::int32_t>(source.ident);
+    }
+    call.Return(static_cast<std::uint32_t>(kLooperTimeout));
+    return kLooperTimeout;
+}
 
 std::uint32_t StoreInputEvent(HleRegistry& registry, const InputEvent& event) {
     const std::lock_guard lock(g_input_mutex);
@@ -229,6 +436,8 @@ std::uint32_t StoreInputEvent(HleRegistry& registry, const InputEvent& event) {
     header.scan_code = event.scan_code;
     header.pointer_count = static_cast<std::int32_t>(std::min<std::size_t>(
         event.pointers.size(), kInputPointers));
+    header.down_time = event.down_time;
+    header.event_time = event.event_time;
     std::memcpy(memory, &header, sizeof(header));
     for (std::uint32_t index = 0; index < kInputPointers; ++index) {
         GuestInputPointer pointer{};
@@ -243,6 +452,7 @@ std::uint32_t StoreInputEvent(HleRegistry& registry, const InputEvent& event) {
             pointer.size = source.size;
             pointer.touch_major = source.touch_major;
             pointer.touch_minor = source.touch_minor;
+            pointer.tool_type = source.tool_type;
         }
         std::memcpy(memory + sizeof(header) + index * sizeof(pointer), &pointer, sizeof(pointer));
     }
@@ -323,6 +533,13 @@ void SetGuestApk(GuestApk* apk) { g_apk = apk; }
 
 void RegisterAndroidFunctions(HleRegistry& registry) {
     // ---- AAssetManager ----------------------------------------------------
+    //
+    // The archive turns the Java AssetManager into the handle it keeps for the
+    // life of the process. The container reads assets straight out of the APK
+    // and never looks at the handle, so any non-null value is the honest
+    // answer -- and null is not a failure an archive can recover from: Wwise
+    // aborts its whole sound engine when the AssetManager cannot be set.
+    registry.Add("AAssetManager_fromJava", [](HleCall& call) { call.Return(1); });
     registry.Add("AAssetManager_open", [](HleCall& call) {
         std::string name;
         call.ReadCString(call.Arg(1), name, 4096);
@@ -589,81 +806,60 @@ void RegisterAndroidFunctions(HleRegistry& registry) {
 
     // ---- looper -----------------------------------------------------------
     registry.Add("ALooper_prepare", [](HleCall& call) {
-        call.Return(1);
+        if (g_thread_looper == nullptr) {
+            CreateThreadLooper();
+        }
+        call.Return(g_thread_looper != nullptr ? g_thread_looper->handle : 0u);
+    });
+    registry.Add("ALooper_forThread", [](HleCall& call) {
+        call.Return(g_thread_looper != nullptr ? g_thread_looper->handle : 0u);
+    });
+    registry.Add("ALooper_acquire", [](HleCall&) {});
+    registry.Add("ALooper_release", [](HleCall&) {});
+    // A wake belongs to one looper: the byte goes into that looper's pipe and
+    // its own poll answers ALOOPER_POLL_WAKE, which is what the platform
+    // promises. Answering an ident instead turns every cut-short wait into a
+    // phantom event that drains somebody else's queue.
+    registry.Add("ALooper_wake", [](HleCall& call) {
+        Looper* looper = LooperForHandle(call.Arg(0));
+        if (looper == nullptr || looper->wake_write < 0) {
+            return;
+        }
+        const char byte = 1;
+        // A full pipe already carries a wake the reader has not taken yet.
+        const ssize_t written = ::write(looper->wake_write, &byte, 1);
+        (void)written;
     });
     registry.Add("ALooper_addFd", [](HleCall& call) {
-        LooperRegistration entry{call.Arg(1), call.Arg(2), call.Arg(3), call.Arg(4), call.Arg(5)};
-        g_loopers.push_back(entry);
+        Looper* looper = LooperForHandle(call.Arg(0));
+        if (looper == nullptr) {
+            call.Return(static_cast<std::uint32_t>(-1));
+            return;
+        }
+        const LooperSource source{call.Arg(1), call.Arg(2), call.Arg(3), call.Arg(4),
+                                  call.Arg(5)};
+        LooperAddSource(*looper, source);
         ARMBAT_LOG_INFO("Armbat",
                             "looper: addFd fd=%d ident=%d events=0x%x callback=0x%08x data=0x%08x",
-                            static_cast<int>(entry.fd), static_cast<int>(entry.ident),
-                            static_cast<unsigned>(entry.events), entry.callback, entry.data);
+                            static_cast<int>(source.fd), static_cast<int>(source.ident),
+                            static_cast<unsigned>(source.events), source.callback, source.data);
         call.Return(1);
     });
+    registry.Add("ALooper_removeFd", [](HleCall& call) {
+        Looper* looper = LooperForHandle(call.Arg(0));
+        const bool removed = looper != nullptr && LooperRemoveSource(*looper, call.Arg(1));
+        call.Return(removed ? 1u : static_cast<std::uint32_t>(-1));
+    });
+    registry.Add("ALooper_pollOnce", [](HleCall& call) {
+        call.Return(static_cast<std::uint32_t>(
+            PollLooperOnce(call, static_cast<std::int32_t>(call.Arg(0)))));
+    });
     registry.Add("ALooper_pollAll", [](HleCall& call) {
-        if (g_loopers.empty()) {
-            const std::int32_t timeout = static_cast<std::int32_t>(call.Arg(0));
-            if (timeout > 0) {
-                ::usleep(static_cast<useconds_t>(timeout) * 1000);
-            }
-            // ALOOPER_POLL_TIMEOUT: nothing arrived, which is what an empty
-            // source list can honestly say. A wake here would make a loop that
-            // treats it as an event run its frame twice per wait.
-            call.Return(static_cast<std::uint32_t>(-3));
-            return;
+        std::int32_t result = PollLooperOnce(call, static_cast<std::int32_t>(call.Arg(0)));
+        while (result == kLooperCallback) {
+            result = PollLooperOnce(call, 0);
         }
-        std::vector<struct pollfd> fds;
-        for (const LooperRegistration& entry : g_loopers) {
-            fds.push_back(pollfd{static_cast<int>(entry.fd), static_cast<short>(entry.events), 0});
-        }
-        const std::int32_t timeout = static_cast<std::int32_t>(call.Arg(0));
-        const int ready = ::poll(fds.data(), fds.size(), timeout);
-        if (ready <= 0) {
-            // ALOOPER_POLL_TIMEOUT; negative means "nothing happened".
-            call.Return(static_cast<std::uint32_t>(-3));
-            return;
-        }
-        for (std::size_t i = 0; i < fds.size(); ++i) {
-            if (fds[i].revents == 0) {
-                continue;
-            }
-            const LooperRegistration entry = g_loopers[i];
-            // A poll wake happens once per frame and per source, so this is a
-            // development aid, not a log: the first few say the looper works.
-            static std::atomic<unsigned> reported{0};
-            if (reported.fetch_add(1, std::memory_order_relaxed) < 8) {
-                ARMBAT_LOG_INFO("Armbat",
-                                    "looper: fd=%d ident=%d revents=0x%x ready for the guest",
-                                    static_cast<int>(entry.fd), static_cast<int>(entry.ident),
-                                    static_cast<unsigned>(fds[i].revents));
-            }
-            if (entry.callback != 0) {
-                call.Machine().CallNested(entry.callback,
-                                          {entry.fd, static_cast<std::uint32_t>(fds[i].revents),
-                                           entry.data});
-            } else {
-                // The caller learns which source fired from the three out
-                // parameters: the fd, the events, and the cookie it registered
-                // with ALooper_addFd. Applications that dispatch through the
-                // cookie loop forever without it.
-                const std::uint32_t out_fd = call.Arg(1);
-                const std::uint32_t out_events = call.Arg(2);
-                const std::uint32_t out_data = call.Arg(3);
-                if (out_fd != 0) {
-                    call.CopyOut(out_fd, &entry.fd, sizeof(entry.fd));
-                }
-                if (out_events != 0) {
-                    const std::int32_t events = fds[i].revents;
-                    call.CopyOut(out_events, &events, sizeof(events));
-                }
-                if (out_data != 0) {
-                    call.CopyOut(out_data, &entry.data, sizeof(entry.data));
-                }
-            }
-            call.Return(entry.ident);
-            return;
-        }
-        call.Return(static_cast<std::uint32_t>(-3));
+        call.Return(static_cast<std::uint32_t>(result));
     });
 
     // ---- input ------------------------------------------------------------
@@ -677,23 +873,49 @@ void RegisterAndroidFunctions(HleRegistry& registry) {
         if (fd < 0) {
             return;
         }
-        LooperRegistration entry{static_cast<std::uint32_t>(fd), call.Arg(2),
-                                 static_cast<std::uint32_t>(POLLIN), call.Arg(3), call.Arg(4)};
-        g_loopers.push_back(entry);
+        // The queue goes on the looper the caller names, exactly as on a device.
+        Looper* looper = LooperForHandle(call.Arg(1));
+        if (looper == nullptr) {
+            looper = g_thread_looper != nullptr ? g_thread_looper : CreateThreadLooper();
+        }
+        if (looper == nullptr) {
+            return;
+        }
+        // A queue has one consumer: the platform attaches it to one looper, and
+        // a later attach moves it instead of leaving two readers behind. Two
+        // readers split one gesture between them -- one takes the down, the
+        // other the move -- and an archive waiting for the rest of that gesture
+        // then waits for a touch that was already delivered to somebody else.
+        const LooperSource source{static_cast<std::uint32_t>(fd), call.Arg(2),
+                                  static_cast<std::uint32_t>(POLLIN), call.Arg(3), call.Arg(4)};
+        {
+            const std::lock_guard lock(Loopers().mutex);
+            for (auto& entry : Loopers().by_handle) {
+                if (entry.second.get() != looper) {
+                    LooperRemoveSource(*entry.second, static_cast<std::uint32_t>(fd));
+                }
+            }
+            LooperAddSource(*looper, source);
+        }
         ARMBAT_LOG_INFO("Armbat",
-                            "input: attachLooper ident=%d callback=0x%08x data=0x%08x",
-                            static_cast<int>(entry.ident), entry.callback, entry.data);
+                            "input: attachLooper looper=%u ident=%d callback=0x%08x data=0x%08x",
+                            static_cast<unsigned>(looper->handle),
+                            static_cast<int>(source.ident), source.callback, source.data);
     });
     registry.Add("AInputQueue_detachLooper", [](HleCall&) {
         const int fd = GuestInputQueue::Instance().ReadFd();
         if (fd < 0) {
             return;
         }
-        const auto end = std::remove_if(g_loopers.begin(), g_loopers.end(),
-                                        [fd](const LooperRegistration& entry) {
-                                            return entry.fd == static_cast<std::uint32_t>(fd);
-                                        });
-        g_loopers.erase(end, g_loopers.end());
+        {
+            // One queue, one owner: the descriptor leaves every looper it was
+            // attached to, so a re-attach cannot leave a stale reader behind.
+            LooperTable& table = Loopers();
+            const std::lock_guard lock(table.mutex);
+            for (auto& entry : table.by_handle) {
+                LooperRemoveSource(*entry.second, static_cast<std::uint32_t>(fd));
+            }
+        }
         GuestInputQueue::Instance().Detach(fd);
     });
     registry.Add("AInputQueue_getEvent", [&registry](HleCall& call) {
@@ -752,6 +974,101 @@ void RegisterAndroidFunctions(HleRegistry& registry) {
     add_motion_float("AMotionEvent_getY", &GuestInputPointer::y);
     add_motion_float("AMotionEvent_getRawX", &GuestInputPointer::raw_x);
     add_motion_float("AMotionEvent_getRawY", &GuestInputPointer::raw_y);
+    add_motion_float("AMotionEvent_getPressure", &GuestInputPointer::pressure);
+    add_motion_float("AMotionEvent_getSize", &GuestInputPointer::size);
+    add_motion_float("AMotionEvent_getTouchMajor", &GuestInputPointer::touch_major);
+    add_motion_float("AMotionEvent_getTouchMinor", &GuestInputPointer::touch_minor);
+    add_motion_float("AMotionEvent_getToolMajor", &GuestInputPointer::touch_major);
+    add_motion_float("AMotionEvent_getToolMinor", &GuestInputPointer::touch_minor);
+    registry.Add("AMotionEvent_getToolType", [](HleCall& call) {
+        const GuestInputPointer* pointer = InputPointerAt(call, call.Arg(0), call.Arg(1));
+        call.Return(pointer != nullptr ? static_cast<std::uint32_t>(pointer->tool_type) : 0u);
+    });
+    // The container queues complete events: the host's historical samples are
+    // already part of the move stream, so no event carries history of its own.
+    registry.Add("AMotionEvent_getHistorySize", [](HleCall& call) { call.Return(0); });
+    // Nanoseconds since boot, which is what the platform answers. The host's
+    // events carry milliseconds, and a zero here made every frame look
+    // simultaneous to a game that measures the time between two events.
+    const auto add_motion_time = [](std::int64_t GuestInputEvent::*field) {
+        return [field](HleCall& call) {
+            const GuestInputEvent* event = MotionEventAt(call, call.Arg(0));
+            const std::int64_t nanos = event != nullptr ? event->*field * 1000000 : 0;
+            call.ReturnPair(static_cast<std::uint32_t>(nanos & 0xffffffffu),
+                            static_cast<std::uint32_t>(nanos >> 32));
+        };
+    };
+    registry.Add("AMotionEvent_getEventTime",
+                 add_motion_time(&GuestInputEvent::event_time));
+    registry.Add("AMotionEvent_getDownTime",
+                 add_motion_time(&GuestInputEvent::down_time));
+    // The platform keeps a short history of samples inside one move event; this
+    // container queues one sample per event, so the history size is zero. An
+    // archive that asks for a historical sample anyway (index 0 is the one a
+    // batch-less stream implies) must get the sample the event carries, not a
+    // zero: a zero coordinate puts the touch in the corner of the screen and
+    // every hit test misses.
+    const auto add_historical_float = [&registry](const char* name,
+                                                  float GuestInputPointer::*field) {
+        registry.Add(name, [field](HleCall& call) {
+            const GuestInputPointer* pointer = InputPointerAt(call, call.Arg(0), call.Arg(1));
+            ReturnFloat(call, pointer != nullptr ? pointer->*field : 0.0f);
+        });
+    };
+    add_historical_float("AMotionEvent_getHistoricalX", &GuestInputPointer::x);
+    add_historical_float("AMotionEvent_getHistoricalY", &GuestInputPointer::y);
+    add_historical_float("AMotionEvent_getHistoricalRawX", &GuestInputPointer::raw_x);
+    add_historical_float("AMotionEvent_getHistoricalRawY", &GuestInputPointer::raw_y);
+    add_historical_float("AMotionEvent_getHistoricalPressure", &GuestInputPointer::pressure);
+    add_historical_float("AMotionEvent_getHistoricalSize", &GuestInputPointer::size);
+    registry.Add("AMotionEvent_getHistoricalEventTime",
+                 add_motion_time(&GuestInputEvent::event_time));
+    registry.Add("AMotionEvent_getMetaState", [](HleCall& call) {
+        const GuestInputEvent* event = MotionEventAt(call, call.Arg(0));
+        call.Return(event != nullptr ? static_cast<std::uint32_t>(event->meta_state) : 0u);
+    });
+    registry.Add("AMotionEvent_getFlags", [](HleCall& call) {
+        const GuestInputEvent* event = MotionEventAt(call, call.Arg(0));
+        call.Return(event != nullptr ? static_cast<std::uint32_t>(event->flags) : 0u);
+    });
+    registry.Add("AMotionEvent_getEdgeFlags", [](HleCall& call) {
+        const GuestInputEvent* event = MotionEventAt(call, call.Arg(0));
+        call.Return(event != nullptr ? static_cast<std::uint32_t>(event->edge_flags) : 0u);
+    });
+    // The action index is the high byte of the packed action; an event that
+    // names no pointer answers index 0, as the platform does.
+    registry.Add("AMotionEvent_getActionIndex", [](HleCall& call) {
+        const GuestInputEvent* event = MotionEventAt(call, call.Arg(0));
+        call.Return(event != nullptr
+                        ? static_cast<std::uint32_t>((event->action >> 8) & 0xff)
+                        : 0u);
+    });
+    registry.Add("AMotionEvent_findPointerIndex", [](HleCall& call) {
+        const GuestInputEvent* event = MotionEventAt(call, call.Arg(0));
+        const auto wanted = static_cast<std::int32_t>(call.Arg(1));
+        if (event != nullptr) {
+            for (std::uint32_t index = 0; index < static_cast<std::uint32_t>(event->pointer_count);
+                 ++index) {
+                const GuestInputPointer* pointer = InputPointerAt(call, call.Arg(0), index);
+                if (pointer != nullptr && pointer->id == wanted) {
+                    call.Return(index);
+                    return;
+                }
+            }
+        }
+        call.Return(static_cast<std::uint32_t>(-1));
+    });
+    // The guest's window covers the whole virtual screen, so no event is ever
+    // offset from it; only the precision is the identity of the units.
+    for (const char* name : {"AMotionEvent_getXOffset", "AMotionEvent_getYOffset"}) {
+        registry.Add(name, [](HleCall& call) { ReturnFloat(call, 0.0f); });
+    }
+    for (const char* name : {"AMotionEvent_getXPrecision", "AMotionEvent_getYPrecision"}) {
+        registry.Add(name, [](HleCall& call) { ReturnFloat(call, 1.0f); });
+    }
+    // AMOTION_EVENT_ORIENTATION_0: the touch surface is upright, which is what
+    // the guest's virtual screen is, whatever the device's rotation.
+    registry.Add("AMotionEvent_getOrientation", [](HleCall& call) { call.Return(0); });
     registry.Add("AMotionEvent_getAxisValue", [](HleCall& call) {
         const GuestInputPointer* pointer = InputPointerAt(call, call.Arg(0), call.Arg(2));
         if (pointer == nullptr) {

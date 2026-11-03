@@ -76,6 +76,12 @@ public:
     void SetGuestStorage(const std::string& data_root, const std::string& obb_root,
                          const std::string& package_name);
 
+    // The activity object the archive calls back into. ANativeActivity.clazz is
+    // a global reference the platform makes before onCreate, and an archive that
+    // forwards its own input to the Java side (Unity with
+    // ForwardNativeEventsToDalvik) reads it on every touch.
+    void SetActivityObject(std::uint32_t handle);
+
     // Delivers one ANativeActivity callback. `has_argument` says whether the
     // callback takes a second parameter (a window, an input queue, a rect).
     std::string NotifyNative(int index, std::uint32_t argument, bool has_argument);
@@ -83,6 +89,11 @@ public:
     // The host window behind the guest's surface: registered, then announced to
     // the archive as onNativeWindowCreated. Null announces its destruction.
     std::string SetNativeWindow(void* window);
+
+    // The queue the archive reads its touches from. The platform hands it over
+    // when the activity's window becomes active, not when a view is created:
+    // an archive is free to install its own surface and never touch ours.
+    std::string SetNativeInputQueue();
 
     // "libminecraftpe.so+0x12345 in SomeSymbol", for crash reports.
     std::string DescribeAddress(std::uint32_t address) const;

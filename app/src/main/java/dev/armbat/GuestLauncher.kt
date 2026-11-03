@@ -178,12 +178,67 @@ class GuestLauncher(private val host: Activity) {
          * its own permission screen. The container cannot run at all without
          * all files access, which is strictly more than those permissions ever
          * gave, so the guest is answered from that grant.
+         *
+         * The answer has to be the same in every form the archive can ask it
+         * in. The context returns "denied" from the container's own uid for a
+         * permission the container does not declare, so an archive that asks
+         * `checkCallingOrSelfPermission` (Unity's player does, before it starts
+         * its engine) is told "denied" for storage while `checkPermission`
+         * says "granted", and it then walks a runtime-permission path that a
+         * current platform no longer supports.
          */
-        override fun checkPermission(permission: String, pid: Int, uid: Int): Int {
-            if (permission in LEGACY_STORAGE && GuestStorage.isAvailable()) {
-                return android.content.pm.PackageManager.PERMISSION_GRANTED
+        private fun grantedByAllFiles(permission: String): Boolean =
+            GuestStorage.isAvailable() && permission in STORAGE_FROM_ALL_FILES
+
+        override fun checkPermission(permission: String, pid: Int, uid: Int): Int =
+            if (grantedByAllFiles(permission)) {
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+            } else {
+                super.checkPermission(permission, pid, uid)
             }
-            return super.checkPermission(permission, pid, uid)
+
+        override fun checkCallingPermission(permission: String): Int =
+            if (grantedByAllFiles(permission)) {
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+            } else {
+                super.checkCallingPermission(permission)
+            }
+
+        override fun checkCallingOrSelfPermission(permission: String): Int =
+            if (grantedByAllFiles(permission)) {
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+            } else {
+                super.checkCallingOrSelfPermission(permission)
+            }
+
+        override fun checkSelfPermission(permission: String): Int =
+            if (grantedByAllFiles(permission)) {
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+            } else {
+                super.checkSelfPermission(permission)
+            }
+
+        override fun enforcePermission(
+            permission: String,
+            pid: Int,
+            uid: Int,
+            message: String?,
+        ) {
+            if (!grantedByAllFiles(permission)) {
+                super.enforcePermission(permission, pid, uid, message)
+            }
+        }
+
+        override fun enforceCallingPermission(permission: String, message: String?) {
+            if (!grantedByAllFiles(permission)) {
+                super.enforceCallingPermission(permission, message)
+            }
+        }
+
+        override fun enforceCallingOrSelfPermission(permission: String, message: String?) {
+            if (!grantedByAllFiles(permission)) {
+                super.enforceCallingOrSelfPermission(permission, message)
+            }
         }
 
         /**
@@ -564,12 +619,8 @@ class GuestLauncher(private val host: Activity) {
         private var forwarding = false
 
         override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
-            // The guest's decor is laid out at the virtual size and scaled up, so
-            // the framework converts window coordinates into the guest's own
-            // pixels on the way down -- for every pointer at once, and without
-            // touching the pointer ids, the action index, the pressure or the
-            // event time that a native activity reads. The event is therefore
-            // dispatched exactly as it arrived.
+            // This frame is the guest's window: the one place an event enters
+            // the archive, already in the archive's own pixels.
             if (ev.actionMasked == MotionEvent.ACTION_DOWN) {
                 forwarding = false
                 val x = (ev.x - shiftX) / factor
@@ -579,29 +630,24 @@ class GuestLauncher(private val host: Activity) {
                     // begun there must not reach it.
                     return false
                 }
-            }
-            if (super.dispatchTouchEvent(ev)) {
-                return true
-            }
-            // Only a gesture this frame started belongs to the activity: a view
-            // tree that consumed the down is not offered the rest of it.
-            if (ev.actionMasked != MotionEvent.ACTION_DOWN && !forwarding) {
+            } else if (!forwarding) {
+                // Only a gesture this frame started belongs to the activity: a
+                // view tree that consumed the down is not offered the rest of it.
                 return false
             }
-            // Nothing in the guest's view tree wanted the event. An activity is
-            // also allowed to read input in dispatchTouchEvent itself (DroidHen's
-            // games route every touch to the engine there), and that override is
-            // never reached by a decor view transplanted into another window. The
-            // unconsumed event is offered to the activity in its own pixels; the
-            // activity dispatches to the same decor again, which has just
-            // declined it, so this cannot double-handle a gesture.
             val scaled = MotionEvent.obtain(ev)
             val matrix = android.graphics.Matrix()
             matrix.setScale(1f / factor, 1f / factor)
             matrix.postTranslate(-shiftX / factor, -shiftY / factor)
             scaled.transform(matrix)
             val handled = try {
-                guest.dispatchTouchEvent(scaled)
+                // A window whose activity took the input queue reads touches
+                // there and nowhere else; the platform stops dispatching such a
+                // queue to the Java view tree, and the activity reaches Java
+                // only with the event it dispatches back itself. An activity
+                // that took no queue is an ordinary Java window: the event goes
+                // to it and it hands the event to its views.
+                GuestNatives.touch(scaled) || guest.dispatchTouchEvent(scaled)
             } finally {
                 scaled.recycle()
             }
@@ -1295,6 +1341,11 @@ class GuestLauncher(private val host: Activity) {
         frame.setOnApplyWindowInsetsListener { _, _ -> android.view.WindowInsets.CONSUMED }
         stage(LaunchStage.READY)
         host.setContentView(frame)
+        // With the window on screen the activity gets the queue its window
+        // reads touches from, which is the moment the platform reports it: the
+        // queue belongs to the window and arrives once the window exists, not
+        // when the archive happens to create a surface of its own.
+        GuestNatives.inputQueue()
         androidx.core.view.WindowCompat.setDecorFitsSystemWindows(host.window, false)
         val bars = androidx.core.view.WindowCompat.getInsetsController(host.window, frame)
         bars.hide(androidx.core.view.WindowInsetsCompat.Type.systemBars())
@@ -1943,7 +1994,7 @@ class GuestLauncher(private val host: Activity) {
      * request is only noise and is skipped while that access is held.
      */
     private fun satisfiedWithoutAsking(): Set<String> =
-        if (GuestStorage.isAvailable()) LEGACY_STORAGE else emptySet()
+        if (GuestStorage.isAvailable()) STORAGE_FROM_ALL_FILES else emptySet()
 
     private fun launchableActivity(apkPath: String): android.content.pm.ActivityInfo? {
         @Suppress("DEPRECATION")
@@ -2156,12 +2207,15 @@ class GuestLauncher(private val host: Activity) {
         // engine advances its simulation once per presented frame and counts on
         // sixty of them a second.
         const val GUEST_FRAME_RATE = 60f
-        // The storage permissions of the Android 4 era. The platform no longer
-        // grants them to any application, whatever the user answers, while the
-        // container itself runs from all files access.
-        val LEGACY_STORAGE = setOf(
+        // The storage permissions of the Android 4 era, plus the media location
+        // one that arrived with scoped storage, which all files access strictly
+        // subsumes: the container itself runs from all files access and the
+        // platform no longer grants any of these to any application, whatever
+        // the user answers.
+        val STORAGE_FROM_ALL_FILES = setOf(
             "android.permission.READ_EXTERNAL_STORAGE",
             "android.permission.WRITE_EXTERNAL_STORAGE",
+            "android.permission.ACCESS_MEDIA_LOCATION",
         )
         // The densities the platform recognises. A virtual screen takes the one
         // nearest its reference, so a guest sees a real device's configuration.

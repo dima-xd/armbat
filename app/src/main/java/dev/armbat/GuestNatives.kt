@@ -59,11 +59,29 @@ internal object GuestNatives {
     external fun windowDestroyed()
 
     /**
+     * The window is active: the archive gets onInputQueueCreated, the way the
+     * platform hands a native activity the queue it reads its touches from.
+     * Delivered once, whatever view the archive installs.
+     */
+    external fun inputQueue()
+
+    /**
      * One touch in the archive's own window pixels. A native activity reads
      * input through AInputQueue, not through the view it drew on, so the event
      * is queued there for the archive's own loop to pick up.
+     *
+     * Answers true when the archive is reading that queue: from then on the
+     * touch belongs to it, exactly as on a device, and the Java view tree must
+     * not also receive it.
      */
-    external fun touch(event: MotionEvent)
+    external fun touch(event: MotionEvent): Boolean
+
+    /**
+     * The archive's own activity object, handed over before onCreate so the
+     * native side reaches it through ANativeActivity.clazz, the way the
+     * platform does it.
+     */
+    external fun activity(activity: Any)
 
     /** Forwards one android.app.Activity lifecycle step to the archive. */
     external fun lifecycle(event: Int)

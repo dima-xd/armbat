@@ -23,6 +23,9 @@ struct InputPointer {
     float size = 0.0f;
     float touch_major = 0.0f;
     float touch_minor = 0.0f;
+    // AMOTION_EVENT_TOOL_TYPE_*, straight from the host event: a finger and a
+    // stylus are told apart by the archive, and a mouse click is not a touch.
+    std::int32_t tool_type = 1;
 };
 
 // A platform input event, in the shape the AInputEvent family answers.
@@ -58,8 +61,10 @@ class GuestInputQueue {
 public:
     static GuestInputQueue& Instance();
 
-    // Platform side: queue an event and wake the guest.
-    void Push(InputEvent event);
+    // Platform side: queue an event and wake the guest. Answers false when the
+    // archive has not taken the queue, in which case the event is not the
+    // queue's to keep.
+    bool Push(InputEvent event);
 
     // Guest side: the next event, or false when none is waiting.
     bool Pop(InputEvent* event);

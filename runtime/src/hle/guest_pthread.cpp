@@ -1093,8 +1093,7 @@ std::string GuestStackFramesForTid(std::uint32_t tid, std::uint32_t sp, std::uin
     return std::string();
 }
 
-std::vector<std::string> GuestThreadLocations() {
-    const std::lock_guard lock(g_live_mutex);
+std::vector<std::string> GuestThreadLocations() {    const std::lock_guard lock(g_live_mutex);
     std::vector<std::string> out;
     out.reserve(g_live.size() + 1);
     unsigned parked = 0;

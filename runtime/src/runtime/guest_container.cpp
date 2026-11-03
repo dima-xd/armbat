@@ -920,6 +920,9 @@ struct GuestContainer::Impl {
     std::vector<std::shared_ptr<A32Machine>> attached;
 
     std::uint32_t native_activity = 0;
+    // The guest's reference to the activity object, once the stand-in activity
+    // has named itself: ANativeActivity.clazz.
+    std::uint32_t activity_object = 0;
     std::uint32_t native_window = 0;
     std::uint32_t native_callbacks = 0;
     // The AInputQueue the archive was handed; the container's own object, only
@@ -1079,12 +1082,19 @@ std::string GuestContainer::SetNativeWindow(void* window) {
     // it does so once the window has been accepted -- exactly the order the
     // platform uses on a device, where the queue arrives with the focused
     // window and never during onCreate.
-    if (impl_->native_input_queue != 0 && !impl_->native_input_sent) {
-        impl_->native_input_sent = true;
-        report += NotifyNative(11, impl_->native_input_queue, true);    // input queue created
-    }
+    report += SetNativeInputQueue();
     return report;
 }
+
+std::string GuestContainer::SetNativeInputQueue() {
+    if (impl_->native_input_queue == 0 || impl_->native_input_sent) {
+        return std::string();
+    }
+    impl_->native_input_sent = true;
+    return NotifyNative(11, impl_->native_input_queue, true);   // input queue created
+}
+
+void GuestContainer::SetActivityObject(std::uint32_t handle) { impl_->activity_object = handle; }
 
 std::string GuestContainer::StartNativeActivity(const std::string& data_path) {
     std::string report;
@@ -1159,7 +1169,7 @@ std::string GuestContainer::StartNativeActivity(const std::string& data_path) {
     write_word(activity + 0, callbacks);
     write_word(activity + 4, impl_->jni->GuestVm());
     write_word(activity + 8, impl_->jni->GuestEnv());
-    write_word(activity + 12, 0);  // clazz
+    write_word(activity + 12, impl_->activity_object);  // clazz
     write_word(activity + 16, internal_path);
     write_word(activity + 20, external_path);
     write_word(activity + 24, 24);  // sdkVersion
@@ -1170,7 +1180,8 @@ std::string GuestContainer::StartNativeActivity(const std::string& data_path) {
     ARMBAT_LOG_INFO("Armbat",
                         "native activity struct: callbacks=0x%08x vm=0x%08x env=0x%08x clazz=0x%08x "
                         "sdk=%d instance=0x%08x assets=0x%08x",
-                        callbacks, impl_->jni->GuestVm(), impl_->jni->GuestEnv(), 0, 24, 0, 1);
+                        callbacks, impl_->jni->GuestVm(), impl_->jni->GuestEnv(),
+                        impl_->activity_object, 24, 0, 1);
 
     impl_->native_activity = activity;
     impl_->native_callbacks = callbacks;

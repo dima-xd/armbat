@@ -91,6 +91,15 @@ public:
     // Clears and returns the lowest queued signal, or 0 when none is pending.
     std::uint32_t TakePendingSignal();
 
+    // True while at least one guest signal is queued on this machine.
+    bool HasPendingSignal() const;
+
+    // Monotonic counter that RequestSignal bumps. A thread that suspends on a
+    // signal reads it first and then sleeps on it: a signal queued between the
+    // two cannot be missed, which is what a collector's resume protocol needs.
+    std::uint32_t SignalTicket() const;
+    void WaitForSignal(std::uint32_t ticket);
+
     // The function RunJit and the SVC entry call when a signal is pending. It
     // runs on the owning thread at a point where the register file is complete.
     using SafePointHandler = std::function<void(A32Machine&)>;

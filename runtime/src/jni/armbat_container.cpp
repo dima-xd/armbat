@@ -31,6 +31,11 @@ std::unique_ptr<armbat::GuestContainer> g_container;
 // finger must not wait for it.
 std::atomic<bool> g_input_live{false};
 
+// The first touch of a launch: a report then says whether the window received
+// one at all and in which pixels the archive sees it, which is the first thing
+// to check when a title ignores the screen.
+std::atomic<bool> g_first_touch{true};
+
 // A zygote child's standard streams go to /dev/null, so guest printf output is
 // only visible in logcat if we copy it there ourselves. The sink is installed
 // here rather than in the launch path because every guest write goes through it.
@@ -149,7 +154,22 @@ Java_dev_armbat_GuestNatives_registerNatives(JNIEnv* env, jobject /*self*/, jobj
     return env->NewStringUTF(text.c_str());
 }
 
-// Called by the container's stand-in for android.app.NativeActivity once the// guest's Java part has reached onCreate. This is where the archive's own
+// The archive's Java activity, handed over before onCreate. ANativeActivity.clazz
+// is a global reference the platform makes before it calls the native entry
+// point, and an archive that forwards its input to the Java side reads it on
+// every touch: Unity's forwardMotionEventToDalvik looks mUnityPlayer up through
+// it and drops the event when the field cannot be reached.
+extern "C" JNIEXPORT void JNICALL
+Java_dev_armbat_GuestNatives_activity(JNIEnv* env, jobject /*self*/, jobject activity) {
+    const std::lock_guard lock(g_mutex);
+    if (g_container == nullptr || !g_container->Started() || activity == nullptr) {
+        return;
+    }
+    g_container->SetActivityObject(g_container->Jni().KeepObject(env, activity));
+}
+
+// Called by the container's stand-in for android.app.NativeActivity once the
+// guest's Java part has reached onCreate. This is where the archive's own
 // ANativeActivity_onCreate will run, under the JIT, with the surface and the
 // asset manager the container hands it.
 extern "C" JNIEXPORT void JNICALL
@@ -198,6 +218,20 @@ Java_dev_armbat_GuestNatives_windowDestroyed(JNIEnv*, jobject /*self*/) {
     LogLines(g_container->SetNativeWindow(nullptr));
 }
 
+// A native activity reads its touches from the window's input queue, and the
+// platform hands that queue over when the window becomes active -- whatever
+// view the archive chose to put in it. The stand-in for android.app.NativeActivity
+// has no window callbacks of its own for an archive that installs its own
+// surface, so the queue is delivered on its own, once.
+extern "C" JNIEXPORT void JNICALL
+Java_dev_armbat_GuestNatives_inputQueue(JNIEnv*, jobject /*self*/) {
+    const std::lock_guard lock(g_mutex);
+    if (g_container == nullptr || !g_container->Started()) {
+        return;
+    }
+    LogLines(g_container->SetNativeInputQueue());
+}
+
 namespace {
 
 // MotionEvent's accessors, looked up once. Touches arrive up to 120 times a
@@ -212,6 +246,7 @@ struct MotionAccessors {
     jmethodID raw_y = nullptr;
     jmethodID pressure = nullptr;
     jmethodID size = nullptr;
+    jmethodID tool_type = nullptr;
     jmethodID source = nullptr;
     jmethodID device_id = nullptr;
     jmethodID meta_state = nullptr;
@@ -239,6 +274,7 @@ const MotionAccessors& Accessors(JNIEnv* env, jobject event) {
     accessors.raw_y = env->GetMethodID(type, "getRawY", "(I)F");
     accessors.pressure = env->GetMethodID(type, "getPressure", "(I)F");
     accessors.size = env->GetMethodID(type, "getSize", "(I)F");
+    accessors.tool_type = env->GetMethodID(type, "getToolType", "(I)I");
     accessors.source = env->GetMethodID(type, "getSource", "()I");
     accessors.device_id = env->GetMethodID(type, "getDeviceId", "()I");
     accessors.meta_state = env->GetMethodID(type, "getMetaState", "()I");
@@ -260,15 +296,22 @@ const MotionAccessors& Accessors(JNIEnv* env, jobject event) {
 // through AInputQueue, never through the view it drew on, so the event is
 // queued there and the archive's own loop picks it up -- the same path the
 // platform gives a native activity on a device.
-extern "C" JNIEXPORT void JNICALL
+//
+// Answers true when the event went to the queue. An archive that has not taken
+// the queue is an ordinary Java window: the frame then offers the event to its
+// activity, which dispatches it to the views.
+extern "C" JNIEXPORT jboolean JNICALL
 Java_dev_armbat_GuestNatives_touch(JNIEnv* env, jobject /*self*/, jobject event) {
     if (event == nullptr || !g_input_live.load(std::memory_order_relaxed)) {
-        return;
+        return JNI_FALSE;
+    }
+    if (armbat::GuestInputQueue::Instance().ReadFd() < 0) {
+        return JNI_FALSE;
     }
     const MotionAccessors& methods = Accessors(env, event);
     if (methods.action == nullptr || methods.x == nullptr || methods.raw_x == nullptr ||
         methods.pointer_count == nullptr) {
-        return;
+        return JNI_FALSE;
     }
     armbat::InputEvent input;
     input.type = 2;  // AINPUT_EVENT_TYPE_MOTION
@@ -295,16 +338,29 @@ Java_dev_armbat_GuestNatives_touch(JNIEnv* env, jobject /*self*/, jobject event)
         pointer.raw_y = pointer.y;
         pointer.pressure = env->CallFloatMethod(event, methods.pressure, index);
         pointer.size = env->CallFloatMethod(event, methods.size, index);
+        if (methods.tool_type != nullptr) {
+            pointer.tool_type = env->CallIntMethod(event, methods.tool_type, index);
+        }
         input.pointers.push_back(pointer);
     }
     if (env->ExceptionCheck()) {
         env->ExceptionClear();
-        return;
+        return JNI_FALSE;
     }
     if (input.pointers.empty()) {
-        return;
+        return JNI_FALSE;
     }
-    armbat::GuestInputQueue::Instance().Push(std::move(input));
+    if (g_first_touch.exchange(false, std::memory_order_relaxed)) {
+        ARMBAT_LOG_INFO("Armbat", "input: first touch action=%d pointers=%d x=%.1f y=%.1f",
+                        static_cast<int>(input.action),
+                        static_cast<int>(input.pointers.size()), input.pointers[0].x,
+                        input.pointers[0].y);
+    }
+    // The archive took the queue and reads it on its own thread; the event is
+    // now the queue's, and the Java view tree is not offered it again. The
+    // archive reaches Java with the copy it dispatches itself, which is what
+    // the platform does for a window that took its input queue.
+    return armbat::GuestInputQueue::Instance().Push(std::move(input)) ? JNI_TRUE : JNI_FALSE;
 }
 
 // Android's activity lifecycle, forwarded to the archive's callbacks in the

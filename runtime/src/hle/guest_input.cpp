@@ -17,10 +17,16 @@ GuestInputQueue& GuestInputQueue::Instance() {
     return queue;
 }
 
-void GuestInputQueue::Push(InputEvent event) {
+bool GuestInputQueue::Push(InputEvent event) {
     const std::lock_guard lock(mutex_);
+    if (read_fd_ < 0) {
+        // No window of the archive is reading the queue: the touch belongs to
+        // the activity, which dispatches it to its own views instead.
+        return false;
+    }
     pending_.push_back(std::move(event));
     Wake();
+    return true;
 }
 
 bool GuestInputQueue::Pop(InputEvent* event) {

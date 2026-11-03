@@ -2,11 +2,9 @@ package android.app;
 
 import android.os.Bundle;
 import android.util.Log;
-import android.view.MotionEvent;
 import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
-import android.view.View;
 
 /**
  * The container's android.app.NativeActivity.
@@ -35,18 +33,6 @@ public class NativeActivity extends Activity {
         surface = view;
         setContentView(view);
 
-        // A native activity consumes its input through AInputQueue; the view it
-        // drew on is not the consumer. The touches are taken here, already
-        // translated into the archive's own pixels by the container's frame, and
-        // queued for the archive's native loop.
-        view.setOnTouchListener(new View.OnTouchListener() {
-            @Override
-            public boolean onTouch(View target, MotionEvent event) {
-                touch(event);
-                return true;
-            }
-        });
-
         view.getHolder().addCallback(new SurfaceHolder.Callback() {
             @Override
             public void surfaceCreated(SurfaceHolder holder) {
@@ -65,7 +51,9 @@ public class NativeActivity extends Activity {
 
         // The native side starts before the window exists, exactly as in the
         // platform class: the engine sets itself up here and waits for the
-        // surface before it draws anything.
+        // surface before it draws anything. The activity object goes first:
+        // ANativeActivity.clazz is part of the struct onCreate receives.
+        call("activity", Object.class, this);
         call("create", Surface.class, null);
     }
 
@@ -120,23 +108,6 @@ public class NativeActivity extends Activity {
             nativeInstance = instance;
         }
         return instance;
-    }
-
-    // A touch arrives up to 120 times a second; the lookup cannot repeat.
-    private static java.lang.reflect.Method touchMethod;
-
-    private static void touch(MotionEvent event) {
-        try {
-            java.lang.reflect.Method method = touchMethod;
-            if (method == null) {
-                Object instance = natives();
-                method = instance.getClass().getMethod("touch", MotionEvent.class);
-                touchMethod = method;
-            }
-            method.invoke(natives(), event);
-        } catch (Throwable error) {
-            Log.e(TAG, "guest touch failed", error);
-        }
     }
 
     private static void send(int event) {

@@ -10,6 +10,9 @@
 #include <android/log.h>
 
 #include "armbat/log.h"
+#include <climits>
+#include <linux/futex.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #include <functional>
 #include <optional>
@@ -300,45 +303,6 @@ public:
                             words[0], words[1], words[2], words[3], words[4], words[5]);
     }
 
-    void DumpFaultBlock(const char* label, std::uint32_t addr, std::size_t length) {
-        if (!arena_.IsMapped(addr, length)) {
-            ARMBAT_LOG_ERROR("Armbat", "fault %s 0x%08x unmapped", label,
-                                addr);
-            return;
-        }
-        const auto* bytes = reinterpret_cast<const std::uint8_t*>(arena_.Ptr(addr));
-        std::string hex;
-        std::string text;
-        char pair[4];
-        for (std::size_t i = 0; i < length; ++i) {
-            std::snprintf(pair, sizeof(pair), "%02x", bytes[i]);
-            hex += pair;
-            text += (bytes[i] >= 0x20 && bytes[i] < 0x7f) ? static_cast<char>(bytes[i]) : '.';
-        }
-        ARMBAT_LOG_ERROR("Armbat", "fault %s 0x%08x %s | %s", label, addr,
-                            hex.c_str(), text.c_str());
-    }
-
-    void DumpFaultStrings(const std::uint32_t regs[16]) {
-        DumpFaultBlock("r4", regs[4], 0x38);
-        std::uint32_t size = 0;
-        if (arena_.IsMapped(regs[4] + 8, 4)) {
-            std::memcpy(&size, arena_.Ptr(regs[4] + 8), 4);
-        }
-        // std::string lives at wrapper+8: length at +8, inline bytes or a heap
-        // pointer at +12 depending on the short-string threshold.
-        if (size > 0 && size < 256) {
-            std::uint32_t data = regs[4] + 12;
-            if (size > 24 && arena_.IsMapped(regs[4] + 12, 4)) {
-                std::memcpy(&data, arena_.Ptr(regs[4] + 12), 4);
-            }
-            DumpFaultBlock("name", data, size);
-        }
-        if (regs[2] > 0 && regs[2] < 256) {
-            DumpFaultBlock("str", regs[1], regs[2]);
-        }
-    }
-
     std::optional<std::uint32_t> MemoryReadCode(VAddr addr) override {
         if (jit_ != nullptr) {
             recent_pcs_[recent_count_ & (kRecentPcs - 1)] = addr;
@@ -386,6 +350,16 @@ public:
         if (svc_handlers != nullptr) {
             for (auto& handler : *svc_handlers) {
                 if (handler && handler(svc, *machine)) {
+                    // A blocking syscall is where a parked thread learns it was
+                    // signalled. On a device the handler runs on the way out of
+                    // the syscall and only then does the caller see EINTR, so
+                    // both happen together. Deferring the handler to the next
+                    // SVC splits them: libmono's suspend loop re-entered
+                    // sigsuspend before its restart flag was set and slept
+                    // forever, waiting for a signal that had already arrived.
+                    if (machine != nullptr) {
+                        machine->RunSafePoint();
+                    }
                     return;
                 }
             }
@@ -538,7 +512,6 @@ private:
             // blocks, but not the frame chain and not the calls that led here,
             // which are exactly what names the caller of the bad pointer.
             if (jit_ != nullptr) {
-                DumpFaultStrings(regs);
                 DumpGuestTrace(pc, regs[14], regs[13], regs[11]);
                 DumpRecentBlocks();
                 DumpRecentCalls();
@@ -725,6 +698,9 @@ struct A32Machine::Impl {
     Dynarmic::A32::Jit* base_jit = nullptr;
     // Signals queued by other threads, one bit per signal number.
     std::atomic<std::uint64_t> pending_signals{0};
+    // Bumped by RequestSignal and waited on by rt_sigsuspend, so a thread that
+    // suspends on a signal is resumed by the sender rather than by a timeout.
+    std::atomic<std::uint32_t> signal_ticket{0};
     A32Machine::SafePointHandler safe_point_handler;
     // Thread currently running this machine, so a machine that is busy can be
     // attributed instead of guessed at.
@@ -931,10 +907,36 @@ void A32Machine::RequestSignal(std::uint32_t signal) {
         return;
     }
     impl_->pending_signals.fetch_or(1ull << (signal - 1), std::memory_order_release);
+    // A collector suspends a thread, and the thread may be sitting in
+    // rt_sigsuspend waiting to be resumed. Bumping the ticket before the host
+    // signal is sent is what makes that wait return: the hook below wakes the
+    // futex it sleeps on, and the signal is delivered at its next safe point.
+    impl_->signal_ticket.fetch_add(1, std::memory_order_release);
+    ::syscall(SYS_futex, &impl_->signal_ticket, FUTEX_WAKE, INT_MAX, nullptr, nullptr, 0);
     // The halt flag is atomic inside dynarmic; it is read where a block hands
     // control back to the dispatcher, which is a safe point.
     if (impl_->base_jit != nullptr) {
         impl_->base_jit->HaltExecution(HaltReason::UserDefined2);
+    }
+}
+
+bool A32Machine::HasPendingSignal() const {
+    return impl_->pending_signals.load(std::memory_order_acquire) != 0;
+}
+
+std::uint32_t A32Machine::SignalTicket() const {
+    return impl_->signal_ticket.load(std::memory_order_acquire);
+}
+
+void A32Machine::WaitForSignal(std::uint32_t ticket) {
+    // Spurious returns are expected -- the host signal that interrupts the wait
+    // is not the guest's signal -- so the loop only ends when the ticket moved.
+    for (;;) {
+        const std::uint32_t current = impl_->signal_ticket.load(std::memory_order_acquire);
+        if (current != ticket) {
+            return;
+        }
+        ::syscall(SYS_futex, &impl_->signal_ticket, FUTEX_WAIT, current, nullptr, nullptr, 0);
     }
 }
 
