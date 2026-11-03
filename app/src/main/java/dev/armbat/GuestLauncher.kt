@@ -871,7 +871,8 @@ class GuestLauncher(private val host: Activity) {
         // initializers run: they call System.loadLibrary and then straight
         // into native code. The two data roots are the guest's folders on the
         // shared storage; the runtime answers /data/data/<package> and
-        // /sdcard/Android/{data,obb}/<package> from them.
+        // /sdcard/Android/{data,obb}/<package> from them, and /sdcard in general
+        // from the container's own folder, which is the root its Java half sees.
         GuestNatives.loadArchive(
             apkPath,
             host.codeCacheDir.absolutePath,
@@ -879,6 +880,7 @@ class GuestLauncher(private val host: Activity) {
             GuestStorage.dataDir(archivePackage).absolutePath,
             GuestStorage.obbDir(archivePackage).absolutePath,
             archivePackage,
+            GuestStorage.root().absolutePath,
         )
         // From here the process belongs to this guest world; a second launch
         // cannot build another one (see worldLoaded).

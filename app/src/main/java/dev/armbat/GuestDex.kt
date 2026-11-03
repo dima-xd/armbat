@@ -391,8 +391,14 @@ object GuestDex {
     }
 
     private fun rules(packageName: String, data: String, obb: String): List<Pair<String, String>> {
-        val external = GuestStorage.root().parentFile?.absolutePath ?: "/storage/emulated/0"
+        // Every spelling of the shared storage root names the container's folder:
+        // the same path the framework's answer is redirected to (GuestEnvironment),
+        // so a literal and a composed path reach the same files. A path already
+        // inside the folder is matched first and left alone, or it would end up
+        // nested inside itself.
+        val external = GuestStorage.root().absolutePath
         return listOf(
+            external to external,
             "/storage/emulated/0/Android/data/$packageName" to data,
             "/mnt/sdcard/Android/data/$packageName" to data,
             "/sdcard/Android/data/$packageName" to data,
@@ -401,6 +407,8 @@ object GuestDex {
             "/storage/emulated/0/Android/obb/$packageName" to obb,
             "/mnt/sdcard/Android/obb/$packageName" to obb,
             "/sdcard/Android/obb/$packageName" to obb,
+            "/storage/emulated/0" to external,
+            "/storage/self/primary" to external,
             "/storage/sdcard0" to external,
             "/storage/sdcard" to external,
             "/mnt/sdcard" to external,

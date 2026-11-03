@@ -70,11 +70,12 @@ public:
     std::string StartNativeActivity(const std::string& data_path);
 
     // The guest's own folders on the shared storage: the stand-ins for
-    // /data/data/<package> and /sdcard/Android/obb/<package>, plus the package
-    // the archive was built as. Set before LoadApk; both the kernel's path
-    // mapper and the native activity's paths are built from them.
+    // /data/data/<package> and /sdcard/Android/obb/<package>, the package the
+    // archive was built as, and the folder the guest sees as its /sdcard. Set
+    // before LoadApk; both the kernel's path mapper and the native activity's
+    // paths are built from them.
     void SetGuestStorage(const std::string& data_root, const std::string& obb_root,
-                         const std::string& package_name);
+                         const std::string& package_name, const std::string& shared_root);
 
     // The activity object the archive calls back into. ANativeActivity.clazz is
     // a global reference the platform makes before onCreate, and an archive that

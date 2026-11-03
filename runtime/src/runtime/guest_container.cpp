@@ -737,9 +737,15 @@ struct GuestContainer::Impl {
             "/data/data/" + std::filesystem::path(app_dir).filename().string() + "/";
         const std::string guest_package = package_name;
         const std::string guest_obb_root = obb_root;
+        // The folder the guest's own /sdcard names, and the same path with the
+        // separator the prefix tests need.
+        const std::string guest_shared_root = shared_root;
+        const std::string host_shared_dir =
+            guest_shared_root.empty() ? std::string() : guest_shared_root + "/";
         kernel->SetPathMapper([this, host_data_dir, data_alias, cache_dir, cpu_info_path,
-                               cpu_topology_path, guest_package,
-                               guest_obb_root](const std::string& path) -> std::string {
+                               cpu_topology_path, guest_package, guest_obb_root,
+                               guest_shared_root,
+                               host_shared_dir](const std::string& path) -> std::string {
             // A library name resolved through the guest's class loader lands in
             // the container's stand-in directory, whose files are 64-bit: a
             // guest that resolves a name itself and hands the path to its own
@@ -794,34 +800,44 @@ struct GuestContainer::Impl {
                            (slash == std::string::npos ? std::string() : rest.substr(slash));
                 }
             }
-            // A guest sees the device's shared storage, not the container's
-            // folder names. The two Android/<kind>/<package> trees belong to the
-            // one application that is running, so they land in the guest's own
-            // folders there; everything else is the device's shared storage.
-            // Games that hardcode /sdcard/... reach the files the user put in
-            // place instead of an empty directory of the platform's own.
-            if (path == "/sdcard") {
-                return "/storage/emulated/0";
-            }
-            for (const std::string_view shared :
-                 {"/sdcard/", "/storage/emulated/0/", "/storage/self/primary/"}) {
-                if (path.compare(0, shared.size(), shared) != 0) {
-                    continue;
+            // A guest's shared storage is the container's own folder inside the
+            // device's: that is the root its Java half is told it has (see
+            // GuestEnvironment), and its native half names the same files
+            // through /sdcard, so both spellings have to end up in one tree. The
+            // two Android/<kind>/<package> trees belong to the one application
+            // that is running, so they land in its own folders there.
+            //
+            // A path that already points inside the tree is left alone: the
+            // framework hands its Java half absolute host paths, and mapping
+            // those again would nest the guest's tree inside itself.
+            if (!guest_shared_root.empty()) {
+                if (path == guest_shared_root ||
+                    path.compare(0, host_shared_dir.size(), host_shared_dir) == 0) {
+                    return path;
                 }
-                const std::string rest = path.substr(shared.size());
-                if (!guest_package.empty()) {
-                    for (const auto& [prefix, root] :
-                         {std::pair{"Android/data/" + guest_package, data_root},
-                          std::pair{"Android/obb/" + guest_package, guest_obb_root}}) {
-                        if (root.empty() || rest.compare(0, prefix.size(), prefix) != 0) {
-                            continue;
-                        }
-                        if (rest.size() == prefix.size() || rest[prefix.size()] == '/') {
-                            return root + rest.substr(prefix.size());
+                if (path == "/sdcard") {
+                    return guest_shared_root;
+                }
+                for (const std::string_view shared :
+                     {"/sdcard/", "/storage/emulated/0/", "/storage/self/primary/"}) {
+                    if (path.compare(0, shared.size(), shared) != 0) {
+                        continue;
+                    }
+                    const std::string rest = path.substr(shared.size());
+                    if (!guest_package.empty()) {
+                        for (const auto& [prefix, root] :
+                             {std::pair{"Android/data/" + guest_package, data_root},
+                              std::pair{"Android/obb/" + guest_package, guest_obb_root}}) {
+                            if (root.empty() || rest.compare(0, prefix.size(), prefix) != 0) {
+                                continue;
+                            }
+                            if (rest.size() == prefix.size() || rest[prefix.size()] == '/') {
+                                return root + rest.substr(prefix.size());
+                            }
                         }
                     }
+                    return guest_shared_root + "/" + rest;
                 }
-                return "/storage/emulated/0/" + rest;
             }
             return path;
         });
@@ -941,6 +957,9 @@ struct GuestContainer::Impl {
     // was built as: the two halves of the path mapping for expansion files.
     std::string obb_root;
     std::string package_name;
+    // The folder the guest sees as the root of its shared storage, i.e. what
+    // /sdcard names: the container's tree under the device's shared storage.
+    std::string shared_root;
     bool ready = false;
 };
 
@@ -970,10 +989,12 @@ bool GuestContainer::Started() const {
 }
 
 void GuestContainer::SetGuestStorage(const std::string& data_root, const std::string& obb_root,
-                                     const std::string& package_name) {
+                                     const std::string& package_name,
+                                     const std::string& shared_root) {
     impl_->data_root = data_root;
     impl_->obb_root = obb_root;
     impl_->package_name = package_name;
+    impl_->shared_root = shared_root;
 }
 
 A32Machine& GuestContainer::Machine() { return *impl_->machine; }

@@ -76,7 +76,8 @@ std::string StringOf(JNIEnv* env, jstring value) {
 // second copy and run its initializers again.
 std::string EnsureLoaded(const std::string& apk, const std::string& cache,
                          std::uint32_t target_sdk, const std::string& data_root,
-                         const std::string& obb_root, const std::string& package_name) {
+                         const std::string& obb_root, const std::string& package_name,
+                         const std::string& shared_root) {
     if (g_container && apk == g_loaded) {
         return g_last_report;
     }
@@ -85,7 +86,7 @@ std::string EnsureLoaded(const std::string& apk, const std::string& cache,
     }
     // Before Start: the kernel's path mapper and the native activity's paths are
     // built from these, and neither is rebuilt once the guest is up.
-    g_container->SetGuestStorage(data_root, obb_root, package_name);
+    g_container->SetGuestStorage(data_root, obb_root, package_name, shared_root);
     std::string error;
     std::string text;
     try {
@@ -108,7 +109,8 @@ std::string EnsureLoaded(const std::string& apk, const std::string& cache,
 extern "C" JNIEXPORT jstring JNICALL
 Java_dev_armbat_GuestNatives_loadArchive(JNIEnv* env, jobject /*self*/, jstring apk_path,
                                          jstring cache_dir, jint target_sdk, jstring data_root,
-                                         jstring obb_root, jstring package_name) {
+                                         jstring obb_root, jstring package_name,
+                                         jstring shared_root) {
     const std::string apk = StringOf(env, apk_path);
     const std::string cache = StringOf(env, cache_dir);
     if (apk.empty()) {
@@ -122,7 +124,8 @@ Java_dev_armbat_GuestNatives_loadArchive(JNIEnv* env, jobject /*self*/, jstring 
     g_cache = cache;
     const std::string text = EnsureLoaded(
         apk, cache, static_cast<std::uint32_t>(target_sdk < 0 ? 0 : target_sdk),
-        StringOf(env, data_root), StringOf(env, obb_root), StringOf(env, package_name));
+        StringOf(env, data_root), StringOf(env, obb_root), StringOf(env, package_name),
+        StringOf(env, shared_root));
     return env->NewStringUTF(text.c_str());
 }
 

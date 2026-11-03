@@ -27,7 +27,8 @@ internal object GuestNatives {
      *
      * dataRoot and obbRoot are the guest's folders on the shared storage, the
      * stand-ins for /data/data/<package> and /sdcard/Android/obb/<package>;
-     * packageName is the name the archive was built with.
+     * packageName is the name the archive was built with, and sharedRoot is the
+     * folder the guest's own /sdcard names.
      */
     external fun loadArchive(
         apkPath: String,
@@ -36,6 +37,7 @@ internal object GuestNatives {
         dataRoot: String,
         obbRoot: String,
         packageName: String,
+        sharedRoot: String,
     ): String
 
     /**
