@@ -41,8 +41,8 @@ body:
     id: armbat-build
     attributes:
       label: Armbat build
-      description: Version, commit, release date or the file name of the APK you installed.
-      placeholder: armbat-0.1.2-3.apk
+      description: Version if it's a release, or commit hash if it's a nightly build.
+      placeholder: 0.1.2
     validations:
       required: true
 
