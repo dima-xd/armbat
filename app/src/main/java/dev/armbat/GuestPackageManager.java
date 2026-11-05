@@ -73,6 +73,14 @@ final class GuestPackageManager extends PackageManager {
             if ((flags & PackageManager.GET_META_DATA) != 0 && archive.metaData != null) {
                 copy.metaData = new Bundle(archive.metaData);
             }
+            // The presentation fields and the source path are the archive's
+            // resource table and the archive's file. Copying them onto a query
+            // about another package makes the platform resolve that package's
+            // ids against the archive: a colour of one table then shows up as
+            // the application name of another.
+            if (!archive.packageName.equals(info.packageName)) {
+                return copy;
+            }
             copy.labelRes = archive.labelRes;
             copy.nonLocalizedLabel = archive.nonLocalizedLabel;
             copy.icon = archive.icon;

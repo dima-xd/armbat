@@ -247,6 +247,12 @@ class GuestLauncher(private val host: Activity) {
          * application hands it to its native loader, which dlopens libunity.so
          * from it, and the container's own directory holds 64-bit stand-ins
          * instead of the guest's libraries.
+         *
+         * The presentation fields are resource ids in the archive's table and
+         * have to come from the archive as well. Left as the container's they
+         * point into the container's table while the platform resolves them
+         * against the archive's -- Corona asks for the application name to put
+         * it into its own alert and printed a colour instead.
          */
         private val guestApplicationInfo: android.content.pm.ApplicationInfo by lazy {
             val info = android.content.pm.ApplicationInfo(baseContext.applicationInfo)
@@ -256,6 +262,14 @@ class GuestLauncher(private val host: Activity) {
                     info.metaData = android.os.Bundle(archive.metaData)
                 }
                 info.className = archive.className
+                info.packageName = archive.packageName
+                info.labelRes = archive.labelRes
+                info.nonLocalizedLabel = archive.nonLocalizedLabel
+                info.icon = archive.icon
+                info.logo = archive.logo
+                info.banner = archive.banner
+                info.descriptionRes = archive.descriptionRes
+                info.theme = archive.theme
             }
             info.sourceDir = guestApkPath
             info.publicSourceDir = guestApkPath
