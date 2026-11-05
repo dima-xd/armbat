@@ -17,6 +17,7 @@ namespace armbat {
 class A32Machine;
 class GuestApk;
 class GuestArena;
+class GuestHeap;
 
 // One call from guest code into a host implementation.
 class HleCall {
@@ -211,6 +212,11 @@ std::uint32_t LastGuestAbort();
 // The Android platform libraries: assets, configuration, window, looper, input
 // and EGL. They need the archive the guest was started from, hence the setter.
 void SetGuestApk(GuestApk* apk);
+
+// The guest's allocator. libjnigraphics copies a Java bitmap into guest memory
+// and hands the guest its address, which only the guest heap can provide.
+void SetGuestHeap(GuestHeap* heap);
+
 void RegisterAndroidFunctions(HleRegistry& registry);
 
 // GLES 2.0 entry points, reached through eglGetProcAddress.

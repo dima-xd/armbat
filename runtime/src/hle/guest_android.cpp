@@ -21,6 +21,7 @@
 #include "armbat/a32_machine.h"
 #include "armbat/guest_apk.h"
 #include "armbat/guest_arena.h"
+#include "armbat/guest_heap.h"
 #include "armbat/guest_input.h"
 #include "armbat/handles.h"
 #include "armbat/hle.h"
@@ -38,6 +39,11 @@ namespace armbat {
 namespace {
 
 GuestApk* g_apk = nullptr;
+
+// The guest's own allocator. libjnigraphics has to hand the guest a buffer it
+// can address, and the guest heap is the one allocator that already knows how
+// to map pages inside the arena.
+GuestHeap* g_heap = nullptr;
 
 void Log(const std::string& line) {
     // Per-call platform logging is a trace, not a feature. An engine asks for
@@ -527,9 +533,159 @@ std::vector<std::int32_t> ReadInts(HleCall& call, std::uint32_t address, std::si
     return values;
 }
 
+// ---- bitmap ---------------------------------------------------------------
+
+// android/bitmap.h, spelled out because the container does not link the guest's
+// copy of the header. The result codes and the pixel formats are the ABI a
+// caller switches on: Corona drops every bitmap whose format it cannot name,
+// which is why the numbers have to be libjnigraphics' own and not a local enum.
+constexpr std::uint32_t kBitmapFormatNone = 0;
+constexpr std::uint32_t kBitmapFormatRgba8888 = 1;
+constexpr std::uint32_t kBitmapFormatRgb565 = 4;
+constexpr std::uint32_t kBitmapFormatRgba4444 = 7;
+constexpr std::uint32_t kBitmapFormatA8 = 8;
+constexpr std::uint32_t kBitmapFormatRgbaF16 = 9;
+constexpr std::uint32_t kBitmapFormatRgba1010102 = 10;
+
+constexpr std::uint32_t kBitmapBadParameter = 0xFFFFFFFFu;     // -1
+constexpr std::uint32_t kBitmapJniException = 0xFFFFFFFEu;     // -2
+constexpr std::uint32_t kBitmapAllocationFailed = 0xFFFFFFFDu; // -3
+
+struct BitmapInfo {
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    std::uint32_t stride = 0;
+    std::uint32_t format = kBitmapFormatNone;
+};
+
+std::string HostString(JNIEnv* env, jstring value) {
+    if (value == nullptr) {
+        return {};
+    }
+    const char* text = env->GetStringUTFChars(value, nullptr);
+    if (text == nullptr) {
+        return {};
+    }
+    std::string copy(text);
+    env->ReleaseStringUTFChars(value, text);
+    return copy;
+}
+
+// The Java pixel layout in the platform numbering. Bitmap.Config is an enum
+// whose name is the only stable way to read it: the constants are ordinary
+// static fields, but comparing their names keeps this free of cached ids that
+// have to be a global reference each.
+std::uint32_t BitmapFormatOf(JNIEnv* env, jobject value) {
+    if (value == nullptr) {
+        return kBitmapFormatNone;
+    }
+    jclass config = env->GetObjectClass(value);
+    if (config == nullptr) {
+        env->ExceptionClear();
+        return kBitmapFormatNone;
+    }
+    std::string name;
+    const jmethodID name_of = env->GetMethodID(config, "name", "()Ljava/lang/String;");
+    if (name_of != nullptr) {
+        auto* text = static_cast<jstring>(env->CallObjectMethod(value, name_of));
+        if (text != nullptr) {
+            name = HostString(env, text);
+            env->DeleteLocalRef(text);
+        }
+    }
+    env->DeleteLocalRef(config);
+    if (env->ExceptionCheck() != JNI_FALSE) {
+        env->ExceptionClear();
+        return kBitmapFormatNone;
+    }
+    if (name == "ARGB_8888") {
+        return kBitmapFormatRgba8888;
+    }
+    if (name == "RGB_565") {
+        return kBitmapFormatRgb565;
+    }
+    if (name == "RGBA_4444") {
+        return kBitmapFormatRgba4444;
+    }
+    if (name == "ALPHA_8") {
+        return kBitmapFormatA8;
+    }
+    if (name == "RGBA_F16") {
+        return kBitmapFormatRgbaF16;
+    }
+    if (name == "RGBA_1010102") {
+        return kBitmapFormatRgba1010102;
+    }
+    // HARDWARE has no addressable pixels, and libjnigraphics reports it as
+    // "no format" too, which makes the caller skip the copy instead of reading
+    // a buffer that does not exist.
+    return kBitmapFormatNone;
+}
+
+bool ReadBitmapInfo(JNIEnv* env, jobject bitmap, BitmapInfo* info) {
+    jclass bitmap_class = env->GetObjectClass(bitmap);
+    if (bitmap_class == nullptr) {
+        env->ExceptionClear();
+        return false;
+    }
+    const jmethodID get_width = env->GetMethodID(bitmap_class, "getWidth", "()I");
+    const jmethodID get_height = env->GetMethodID(bitmap_class, "getHeight", "()I");
+    const jmethodID get_stride = env->GetMethodID(bitmap_class, "getRowBytes", "()I");
+    const jmethodID get_config = env->GetMethodID(bitmap_class, "getConfig",
+                                                  "()Landroid/graphics/Bitmap$Config;");
+    if (get_width == nullptr || get_height == nullptr || get_stride == nullptr ||
+        get_config == nullptr) {
+        env->ExceptionClear();
+        env->DeleteLocalRef(bitmap_class);
+        return false;
+    }
+    info->width = static_cast<std::uint32_t>(env->CallIntMethod(bitmap, get_width));
+    info->height = static_cast<std::uint32_t>(env->CallIntMethod(bitmap, get_height));
+    info->stride = static_cast<std::uint32_t>(env->CallIntMethod(bitmap, get_stride));
+    jobject config = env->CallObjectMethod(bitmap, get_config);
+    info->format = BitmapFormatOf(env, config);
+    if (config != nullptr) {
+        env->DeleteLocalRef(config);
+    }
+    env->DeleteLocalRef(bitmap_class);
+    if (env->ExceptionCheck() != JNI_FALSE) {
+        env->ExceptionClear();
+        return false;
+    }
+    return info->width != 0 && info->height != 0 && info->stride != 0;
+}
+
+// A buffer libjnigraphics lent the guest. libjnigraphics on a device returns a
+// pointer into the Java bitmap's own pixels, but that allocation is a host
+// address the guest cannot reach: the two address spaces are only the same on a
+// device. Here the pixels are copied into the guest heap instead, one buffer per
+// locked bitmap, and the guest is handed that address.
+struct BitmapLock {
+    std::uint32_t address = 0;
+    std::uint32_t bytes = 0;
+    jobject bitmap = nullptr;  // strong reference, released on unlock
+};
+
+std::mutex g_bitmap_mutex;
+std::vector<BitmapLock> g_bitmap_locks;
+
+// Caller holds g_bitmap_mutex. Objects are compared rather than handles: the
+// bridge hands out a fresh handle for every call, so lock and unlock of the same
+// bitmap need not arrive with the same number.
+std::size_t FindBitmapLock(JNIEnv* env, jobject bitmap) {
+    for (std::size_t index = 0; index < g_bitmap_locks.size(); ++index) {
+        if (env->IsSameObject(g_bitmap_locks[index].bitmap, bitmap) != JNI_FALSE) {
+            return index;
+        }
+    }
+    return g_bitmap_locks.size();
+}
+
 }  // namespace
 
 void SetGuestApk(GuestApk* apk) { g_apk = apk; }
+
+void SetGuestHeap(GuestHeap* heap) { g_heap = heap; }
 
 void RegisterAndroidFunctions(HleRegistry& registry) {
     // ---- AAssetManager ----------------------------------------------------
@@ -1414,6 +1570,164 @@ void RegisterAndroidFunctions(HleRegistry& registry) {
                 (address != 0 ? std::to_string(address) : std::string("null")));
         }
         call.Return(address);
+    });
+
+    // ---- bitmap -----------------------------------------------------------
+    //
+    // libjnigraphics: the Java bitmap a game decodes with BitmapFactory is
+    // copied into a guest buffer, and until this existed every texture went
+    // through a call that returned zero and left the caller's struct untouched.
+    // Corona then read a garbage pixel format, dropped the image, and finally
+    // dereferenced the null lockPixels cell and took the process down.
+    registry.Add("AndroidBitmap_getInfo", [](HleCall& call) {
+        JniBridge* bridge = CurrentJniBridge();
+        JNIEnv* env = bridge != nullptr ? bridge->HostEnvironment() : nullptr;
+        jobject bitmap = bridge != nullptr ? bridge->ResolveGuestObject(call.Arg(1)) : nullptr;
+        if (env == nullptr || bitmap == nullptr || call.Arg(2) == 0) {
+            call.Return(kBitmapBadParameter);
+            return;
+        }
+        BitmapInfo info;
+        if (!ReadBitmapInfo(env, bitmap, &info)) {
+            call.Return(kBitmapJniException);
+            return;
+        }
+        // AndroidBitmapInfo: width, height, stride, format, flags. The flags
+        // word has been part of the struct for as long as any caller of this
+        // API has been built, and a guest that only knows four fields reads the
+        // same three after the header either way.
+        const std::uint32_t fields[5] = {info.width, info.height, info.stride,
+                                         info.format, 0};
+        if (!call.CopyOut(call.Arg(2), fields, sizeof(fields))) {
+            call.Return(kBitmapBadParameter);
+            return;
+        }
+        call.Return(0);
+    });
+    registry.Add("AndroidBitmap_lockPixels", [&registry](HleCall& call) {
+        JniBridge* bridge = CurrentJniBridge();
+        JNIEnv* env = bridge != nullptr ? bridge->HostEnvironment() : nullptr;
+        jobject bitmap = bridge != nullptr ? bridge->ResolveGuestObject(call.Arg(1)) : nullptr;
+        if (env == nullptr || bitmap == nullptr || g_heap == nullptr ||
+            call.Mapped(call.Arg(2), sizeof(std::uint32_t)) == nullptr) {
+            call.Return(kBitmapBadParameter);
+            return;
+        }
+        BitmapInfo info;
+        if (!ReadBitmapInfo(env, bitmap, &info)) {
+            call.Return(kBitmapJniException);
+            return;
+        }
+        const std::uint64_t bytes = static_cast<std::uint64_t>(info.stride) * info.height;
+        if (bytes == 0 || bytes > 0x7FFFFFFFu) {
+            call.Return(kBitmapAllocationFailed);
+            return;
+        }
+        const std::uint32_t address = g_heap->Allocate(static_cast<std::uint32_t>(bytes));
+        if (address == 0) {
+            call.Return(kBitmapAllocationFailed);
+            return;
+        }
+
+        jclass bitmap_class = env->GetObjectClass(bitmap);
+        const jmethodID copy_in =
+            bitmap_class != nullptr
+                ? env->GetMethodID(bitmap_class, "copyPixelsToBuffer", "(Ljava/nio/Buffer;)V")
+                : nullptr;
+        if (copy_in == nullptr) {
+            env->ExceptionClear();
+            if (bitmap_class != nullptr) {
+                env->DeleteLocalRef(bitmap_class);
+            }
+            g_heap->Release(address);
+            call.Return(kBitmapJniException);
+            return;
+        }
+        // A direct buffer is a view of the arena, not a copy: the platform writes
+        // the bitmap's rows straight into the memory the guest will read.
+        jobject buffer = env->NewDirectByteBuffer(registry.Arena().Ptr(address),
+                                                  static_cast<jlong>(bytes));
+        if (buffer != nullptr) {
+            env->CallVoidMethod(bitmap, copy_in, buffer);
+            env->DeleteLocalRef(buffer);
+        }
+        env->DeleteLocalRef(bitmap_class);
+        if (buffer == nullptr || env->ExceptionCheck() != JNI_FALSE) {
+            env->ExceptionClear();
+            g_heap->Release(address);
+            call.Return(kBitmapJniException);
+            return;
+        }
+
+        // The lock outlives the call, so the object behind it has to as well: the
+        // bridge's handle is released with the call that carried it.
+        jobject kept = env->NewGlobalRef(bitmap);
+        if (kept == nullptr) {
+            g_heap->Release(address);
+            call.Return(kBitmapAllocationFailed);
+            return;
+        }
+        {
+            const std::lock_guard lock(g_bitmap_mutex);
+            g_bitmap_locks.push_back(
+                {address, static_cast<std::uint32_t>(bytes), kept});
+        }
+        call.CopyOut(call.Arg(2), &address, sizeof(address));
+        call.Return(0);
+    });
+    registry.Add("AndroidBitmap_unlockPixels", [&registry](HleCall& call) {
+        JniBridge* bridge = CurrentJniBridge();
+        JNIEnv* env = bridge != nullptr ? bridge->HostEnvironment() : nullptr;
+        jobject bitmap = bridge != nullptr ? bridge->ResolveGuestObject(call.Arg(1)) : nullptr;
+        if (env == nullptr || bitmap == nullptr) {
+            call.Return(kBitmapBadParameter);
+            return;
+        }
+        BitmapLock entry;
+        {
+            const std::lock_guard lock(g_bitmap_mutex);
+            const std::size_t index = FindBitmapLock(env, bitmap);
+            if (index >= g_bitmap_locks.size()) {
+                call.Return(0);
+                return;
+            }
+            entry = g_bitmap_locks[index];
+            g_bitmap_locks.erase(g_bitmap_locks.begin() + static_cast<std::ptrdiff_t>(index));
+        }
+
+        // A mutable bitmap may have been edited through the buffer; an immutable
+        // one rejects the copy back, so it is only asked for when it can accept
+        // one. Corona's texture path only reads, and its bitmaps are immutable.
+        jclass bitmap_class = env->GetObjectClass(bitmap);
+        const jmethodID is_mutable =
+            bitmap_class != nullptr ? env->GetMethodID(bitmap_class, "isMutable", "()Z") : nullptr;
+        if (is_mutable != nullptr && env->CallBooleanMethod(bitmap, is_mutable) != JNI_FALSE) {
+            const jmethodID copy_back = env->GetMethodID(bitmap_class, "copyPixelsFromBuffer",
+                                                         "(Ljava/nio/Buffer;)V");
+            if (copy_back != nullptr) {
+                jobject buffer = env->NewDirectByteBuffer(registry.Arena().Ptr(entry.address),
+                                                          static_cast<jlong>(entry.bytes));
+                if (buffer != nullptr) {
+                    env->CallVoidMethod(bitmap, copy_back, buffer);
+                    env->DeleteLocalRef(buffer);
+                }
+            }
+        }
+        if (bitmap_class != nullptr) {
+            env->DeleteLocalRef(bitmap_class);
+        }
+        // Any exception here belongs to the container's own copy, not to the
+        // guest's call: the lock is released either way.
+        if (env->ExceptionCheck() != JNI_FALSE) {
+            env->ExceptionClear();
+        }
+        if (entry.bitmap != nullptr) {
+            env->DeleteGlobalRef(entry.bitmap);
+        }
+        if (g_heap != nullptr) {
+            g_heap->Release(entry.address);
+        }
+        call.Return(0);
     });
 
     RegisterGlesFunctions(registry);

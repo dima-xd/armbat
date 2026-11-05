@@ -868,6 +868,7 @@ struct GuestContainer::Impl {
         // resolving the application's imports through them.
         RegisterExtraFunctions(*hle);
         stamp("extra");
+        SetGuestHeap(heap.get());
         RegisterAndroidFunctions(*hle);
         stamp("android");
         RegisterGlesFunctions(*hle);
