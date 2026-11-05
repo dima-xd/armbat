@@ -2663,8 +2663,11 @@ struct JniBridge::Impl {
                     break;
                 }
                 case 'J': {
+                    // env, receiver and field id already fill r0-r3, so AAPCS
+                    // has no even register pair left for the value: it arrives
+                    // in the first two stack slots, r3 being padding.
                     const jlong v = static_cast<jlong>(
-                        (static_cast<std::uint64_t>(call.Arg(4)) << 32) | call.Arg(3));
+                        (static_cast<std::uint64_t>(call.Arg(5)) << 32) | call.Arg(4));
                     if (is_static) env->SetStaticLongField(cls, ref.field, v);
                     else env->SetLongField(object, ref.field, v);
                     break;
@@ -2679,8 +2682,8 @@ struct JniBridge::Impl {
                 }
                 case 'D': {
                     jdouble v = 0;
-                    const std::uint64_t bits = (static_cast<std::uint64_t>(call.Arg(4)) << 32) |
-                                               call.Arg(3);
+                    const std::uint64_t bits = (static_cast<std::uint64_t>(call.Arg(5)) << 32) |
+                                               call.Arg(4);
                     std::memcpy(&v, &bits, sizeof(bits));
                     if (is_static) env->SetStaticDoubleField(cls, ref.field, v);
                     else env->SetDoubleField(object, ref.field, v);
