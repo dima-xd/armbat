@@ -1,0 +1,105 @@
+name: Game compatibility
+description: Report how far an app or game gets in Armbat
+labels: ["compatibility"]
+body:
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Before submitting
+      options:
+        - label: I looked through the existing issues and there is no open report for this app.
+          required: true
+
+  - type: input
+    id: application
+    attributes:
+      label: Application
+      description: The name shown in the launcher.
+      placeholder: Minecraft
+    validations:
+      required: true
+
+  - type: input
+    id: package-name
+    attributes:
+      label: Package name
+      description: Shown on the app's row in the library.
+      placeholder: com.mojang.minecraftpe
+    validations:
+      required: true
+
+  - type: input
+    id: app-version
+    attributes:
+      label: App version
+      description: Version name of the imported APK.
+      placeholder: 1.2.0.81
+    validations:
+      required: true
+
+  - type: input
+    id: armbat-build
+    attributes:
+      label: Armbat build
+      description: Version, commit, release date or the file name of the APK you installed.
+      placeholder: armbat-0.1.2-3.apk
+    validations:
+      required: true
+
+  - type: input
+    id: device
+    attributes:
+      label: Device
+      description: Model, Android version.
+      placeholder: OnePlus 15 (CPH2747), Android 16
+    validations:
+      required: true
+
+  - type: dropdown
+    id: status
+    attributes:
+      label: Current status
+      options:
+        - Nothing
+        - Boots
+        - Menus
+        - In game
+        - Playable
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: |
+        What works and what does not: loading screen, menus, world or level
+        creation, rendering, sound, input and multitouch, screen rotation,
+        approximate fps. One concrete observation is worth more than "it
+        does not work".
+      placeholder: Menu is stable, the world loads and renders, sound is silent, touch is off by a few pixels on the left edge.
+    validations:
+      required: true
+
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots
+      description: |
+        Optional. Add images if the problem is visual: corrupted output, black
+        screen, wrong layout or scaling. The game keeps its own resolution, so
+        note whether the picture is rotated or pillarboxed.
+      placeholder: Drag and drop the images onto this field.
+    validations:
+      required: false
+
+  - type: textarea
+    id: log-file
+    attributes:
+      label: Log file
+      description: |
+        Drag and drop `/sdcard/armbat/logs/current.log` (or `current.1.log` if
+        the failure happened in the previous launch). If the file is not
+        accepted, rename it to `current.log.txt` first.
+    validations:
+      required: false
