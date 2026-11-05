@@ -249,6 +249,23 @@ final class GuestPackageManager extends PackageManager {
             if (archived != null) {
                 info.versionCode = archived.versionCode;
                 info.versionName = archived.versionName;
+                // The components a caller asked about are the archive's, not the
+                // container's. The platform answers with the container's own
+                // manifest, which declares a startup provider and the launcher
+                // activity; a guest that validates a provider or enumerates its
+                // own components would see those instead of its own entries.
+                if ((flags & PackageManager.GET_ACTIVITIES) != 0) {
+                    info.activities = archived.activities;
+                }
+                if ((flags & PackageManager.GET_RECEIVERS) != 0) {
+                    info.receivers = archived.receivers;
+                }
+                if ((flags & PackageManager.GET_SERVICES) != 0) {
+                    info.services = archived.services;
+                }
+                if ((flags & PackageManager.GET_PROVIDERS) != 0) {
+                    info.providers = archived.providers;
+                }
             }
             if (requestedPermissions != null) {
                 info.requestedPermissions = requestedPermissions.clone();
