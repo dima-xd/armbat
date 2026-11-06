@@ -41,6 +41,14 @@ public:
     std::uint32_t Map(std::uint32_t address, std::uint32_t length, int flags, int fd,
                       std::uint32_t page_offset, std::int32_t* error);
 
+    // Anonymous guest memory for a buffer the container itself has to hand the
+    // guest and keep alive: an APK asset a game reads through AAsset_getBuffer,
+    // not a mapping the guest asked for. It lives in the mmap window, which is
+    // the only region sized for whole packs, and never overlaps a mapping the
+    // guest owns. ReleaseAnonymous is the matching free.
+    std::uint32_t Anonymous(std::uint32_t length);
+    void ReleaseAnonymous(std::uint32_t address, std::uint32_t length);
+
     // false only for EINVAL (unaligned address). Unmapping nothing succeeds,
     // like Linux.
     bool Unmap(std::uint32_t address, std::uint32_t length);

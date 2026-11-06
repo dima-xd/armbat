@@ -537,6 +537,16 @@ final class GuestPackageManager extends PackageManager {
 
     @Override
     public java.lang.String getInstallerPackageName(java.lang.String arg0) {
+        // An archive is not installed, so the platform has never heard of the
+        // guest's package and answers with an IllegalArgumentException. The
+        // callers are the analytics and ad SDKs a game starts with, and they do
+        // not catch it: Gameloft's GoogleAnalyticsTracker takes the activity
+        // down from onStart. A package installed from outside a store has no
+        // installer, which is the answer the platform itself gives, and the one
+        // every caller already handles.
+        if (isArchivePackage(arg0)) {
+            return null;
+        }
         return base.getInstallerPackageName(arg0);
     }
 

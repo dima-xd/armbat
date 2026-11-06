@@ -273,6 +273,17 @@ std::uint32_t GuestMemory::Map(std::uint32_t address, std::uint32_t length, int 
     return static_cast<std::uint32_t>(start);
 }
 
+std::uint32_t GuestMemory::Anonymous(std::uint32_t length) {
+    std::int32_t error = 0;
+    return Map(0, length, kMapPrivate | kMapAnonymous, -1, 0, &error);
+}
+
+void GuestMemory::ReleaseAnonymous(std::uint32_t address, std::uint32_t length) {
+    if (address != 0) {
+        Unmap(address, length);
+    }
+}
+
 // ---- munmap ----------------------------------------------------------------
 
 bool GuestMemory::Unmap(std::uint32_t address, std::uint32_t length) {

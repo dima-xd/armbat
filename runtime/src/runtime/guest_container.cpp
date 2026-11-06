@@ -869,6 +869,7 @@ struct GuestContainer::Impl {
         RegisterExtraFunctions(*hle);
         stamp("extra");
         SetGuestHeap(heap.get());
+        SetGuestMemory(&kernel->Memory());
         RegisterAndroidFunctions(*hle);
         stamp("android");
         RegisterGlesFunctions(*hle);

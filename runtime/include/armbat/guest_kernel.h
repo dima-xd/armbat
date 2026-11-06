@@ -90,6 +90,12 @@ public:
     std::uint64_t Calls() const { return calls_; }
     std::uint64_t LastNumber() const { return last_number_; }
 
+    // The guest's address-space manager. A subsystem outside the kernel that
+    // has to hand the guest a buffer of its own -- a whole APK asset, which is
+    // megabytes -- allocates it here, where the guest's mmap does, instead of
+    // carving the small HLE data area.
+    GuestMemory& Memory() { return memory_; }
+
     // The last few path translations, for diagnosing a library the loader could
     // not open: the mapped host path is the part the guest never sees.
     std::string RecentPaths() const;

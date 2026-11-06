@@ -18,6 +18,7 @@ class A32Machine;
 class GuestApk;
 class GuestArena;
 class GuestHeap;
+class GuestMemory;
 
 // One call from guest code into a host implementation.
 class HleCall {
@@ -216,6 +217,11 @@ void SetGuestApk(GuestApk* apk);
 // The guest's allocator. libjnigraphics copies a Java bitmap into guest memory
 // and hands the guest its address, which only the guest heap can provide.
 void SetGuestHeap(GuestHeap* heap);
+
+// The guest's address-space manager. A whole APK asset goes here: AAsset_getBuffer
+// hands the guest a pointer to megabytes of data that stays valid until the asset
+// is closed, and the HLE data area is too small to hold a pack's worth of them.
+void SetGuestMemory(GuestMemory* memory);
 
 void RegisterAndroidFunctions(HleRegistry& registry);
 

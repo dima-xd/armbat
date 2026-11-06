@@ -23,6 +23,7 @@
 #include "armbat/guest_arena.h"
 #include "armbat/guest_heap.h"
 #include "armbat/guest_input.h"
+#include "armbat/guest_memory.h"
 #include "armbat/handles.h"
 #include "armbat/hle.h"
 #include "armbat/jni_bridge.h"
@@ -44,6 +45,12 @@ GuestApk* g_apk = nullptr;
 // can address, and the guest heap is the one allocator that already knows how
 // to map pages inside the arena.
 GuestHeap* g_heap = nullptr;
+
+// The guest's address-space manager. A whole asset is the one HLE buffer that is
+// routinely megabytes: Rovio's themes alone are six, and holding a pack's worth
+// of them in the 16 MiB HLE data area ran it dry mid-load, the asset read came
+// back empty and the engine took the process down with an uncaught exception.
+GuestMemory* g_memory = nullptr;
 
 void Log(const std::string& line) {
     // Per-call platform logging is a trace, not a feature. An engine asks for
@@ -99,6 +106,9 @@ struct Asset {
     // HLE data area after a few dozen assets -- which is what happened when the
     // engine started reading its resource packs.
     std::uint32_t buffer_cell = 0;
+    // Whether the buffer came from the guest's mmap window (large assets) or
+    // from the HLE data area (the selftest, where no memory manager is wired).
+    bool buffer_mapped = false;
 };
 
 std::vector<Asset> g_assets;
@@ -686,6 +696,7 @@ std::size_t FindBitmapLock(JNIEnv* env, jobject bitmap) {
 void SetGuestApk(GuestApk* apk) { g_apk = apk; }
 
 void SetGuestHeap(GuestHeap* heap) { g_heap = heap; }
+void SetGuestMemory(GuestMemory* memory) { g_memory = memory; }
 
 void RegisterAndroidFunctions(HleRegistry& registry) {
     // ---- AAssetManager ----------------------------------------------------
@@ -820,12 +831,26 @@ void RegisterAndroidFunctions(HleRegistry& registry) {
         }
         Asset& asset = g_assets[index];
         if (asset.buffer_cell == 0) {
-            asset.buffer_cell = registry.AllocateData(
-                static_cast<std::uint32_t>(asset.data.size()));
-            if (asset.buffer_cell == 0) {
+            const auto bytes = static_cast<std::uint32_t>(asset.data.size());
+            // The buffer outlives the call, so it cannot be a temporary: the
+            // engine keeps the pointer until AAsset_close. It is mapped in the
+            // guest's mmap window, which is the only part of the address space
+            // sized for a whole resource pack, and falls back to the HLE data
+            // area for platforms where the container wires no memory manager.
+            std::uint32_t cell = 0;
+            if (g_memory != nullptr) {
+                cell = g_memory->Anonymous(bytes);
+                asset.buffer_mapped = cell != 0;
+            }
+            if (cell == 0) {
+                cell = registry.AllocateData(bytes);
+                asset.buffer_mapped = false;
+            }
+            if (cell == 0) {
                 call.Return(0);
                 return;
             }
+            asset.buffer_cell = cell;
             call.CopyOut(asset.buffer_cell, asset.data.data(), asset.data.size());
         }
         call.Return(asset.buffer_cell);
@@ -836,8 +861,14 @@ void RegisterAndroidFunctions(HleRegistry& registry) {
         if (index < g_assets.size()) {
             Asset& asset = g_assets[index];
             if (asset.buffer_cell != 0) {
-                registry.ReleaseData(asset.buffer_cell);
+                if (asset.buffer_mapped && g_memory != nullptr) {
+                    g_memory->ReleaseAnonymous(asset.buffer_cell,
+                                               static_cast<std::uint32_t>(asset.data.size()));
+                } else {
+                    registry.ReleaseData(asset.buffer_cell);
+                }
                 asset.buffer_cell = 0;
+                asset.buffer_mapped = false;
             }
             asset.closed = true;
         }
