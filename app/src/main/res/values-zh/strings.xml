@@ -1,5 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <string name="app_name">Armbat</string>
+
     <string name="search_hint">搜索</string>
     <string name="empty_title">没有应用</string>
     <string name="empty_hint">添加 APK 以开始。</string>
@@ -35,7 +37,7 @@
     <string name="arm32_none_java">无（仅 JAVA）</string>
 
     <string name="error_read_apk">无法读取 APK</string>
-    <string name="error_already_added">已经添加过</string>
+    <string name="error_already_added">已添加</string>
     <string name="error_already_added_detail">%1$s 已在应用库中。</string>
     <string name="ok">确定</string>
     <string name="error_permission">READ_PHONE_STATE 权限被拒绝</string>
@@ -66,5 +68,5 @@
 
     <string name="widescreen">宽屏</string>
     <string name="widescreen_on">开 — 占满整个屏幕</string>
-    <string name="widescreen_off">关 — 保留应用原本的屏幕</string>
+    <string name="widescreen_off">关 — 保持应用原本的屏幕比例</string>
 </resources>
