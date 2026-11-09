@@ -292,6 +292,47 @@ const MotionAccessors& Accessors(JNIEnv* env, jobject event) {
     return accessors;
 }
 
+// KeyEvent's accessors, looked up once: the ids stay valid for the life of the
+// process and a back press must not repeat ten JNI lookups.
+struct KeyAccessors {
+    jmethodID action = nullptr;
+    jmethodID key_code = nullptr;
+    jmethodID meta_state = nullptr;
+    jmethodID repeat_count = nullptr;
+    jmethodID source = nullptr;
+    jmethodID device_id = nullptr;
+    jmethodID flags = nullptr;
+    jmethodID scan_code = nullptr;
+    jmethodID down_time = nullptr;
+    jmethodID event_time = nullptr;
+};
+
+const KeyAccessors& AccessorsForKey(JNIEnv* env, jobject event) {
+    static KeyAccessors accessors;
+    if (accessors.key_code != nullptr) {
+        return accessors;
+    }
+    jclass type = env->GetObjectClass(event);
+    if (type == nullptr) {
+        return accessors;
+    }
+    accessors.action = env->GetMethodID(type, "getAction", "()I");
+    accessors.key_code = env->GetMethodID(type, "getKeyCode", "()I");
+    accessors.meta_state = env->GetMethodID(type, "getMetaState", "()I");
+    accessors.repeat_count = env->GetMethodID(type, "getRepeatCount", "()I");
+    accessors.source = env->GetMethodID(type, "getSource", "()I");
+    accessors.device_id = env->GetMethodID(type, "getDeviceId", "()I");
+    accessors.flags = env->GetMethodID(type, "getFlags", "()I");
+    accessors.scan_code = env->GetMethodID(type, "getScanCode", "()I");
+    accessors.down_time = env->GetMethodID(type, "getDownTime", "()J");
+    accessors.event_time = env->GetMethodID(type, "getEventTime", "()J");
+    env->DeleteLocalRef(type);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+    }
+    return accessors;
+}
+
 }  // namespace
 
 // Every touch the guest's window receives, already translated into the
@@ -363,6 +404,48 @@ Java_dev_armbat_GuestNatives_touch(JNIEnv* env, jobject /*self*/, jobject event)
     // now the queue's, and the Java view tree is not offered it again. The
     // archive reaches Java with the copy it dispatches itself, which is what
     // the platform does for a window that took its input queue.
+    return armbat::GuestInputQueue::Instance().Push(std::move(input)) ? JNI_TRUE : JNI_FALSE;
+}
+
+// One key the guest's window received. A native activity reads every key
+// through AInputQueue: the platform's NativeActivity takes its window's input
+// queue, so neither the view tree nor the activity's own dispatchKeyEvent sees
+// a key the archive's native loop is waiting for. The event is queued as
+// AINPUT_EVENT_TYPE_KEY and reaches the archive through the AKeyEvent family,
+// in the shape a device gives it.
+//
+// Answers true when the event went to the queue. An archive without a native
+// input loop is an ordinary Java window, and the caller delivers the key to its
+// activity instead.
+extern "C" JNIEXPORT jboolean JNICALL
+Java_dev_armbat_GuestNatives_key(JNIEnv* env, jobject /*self*/, jobject event) {
+    if (event == nullptr || !g_input_live.load(std::memory_order_relaxed)) {
+        return JNI_FALSE;
+    }
+    if (armbat::GuestInputQueue::Instance().ReadFd() < 0) {
+        return JNI_FALSE;
+    }
+    const KeyAccessors& methods = AccessorsForKey(env, event);
+    if (methods.action == nullptr || methods.key_code == nullptr ||
+        methods.event_time == nullptr) {
+        return JNI_FALSE;
+    }
+    armbat::InputEvent input;
+    input.type = 1;  // AINPUT_EVENT_TYPE_KEY
+    input.action = env->CallIntMethod(event, methods.action);
+    input.key_code = env->CallIntMethod(event, methods.key_code);
+    input.meta_state = env->CallIntMethod(event, methods.meta_state);
+    input.repeat_count = env->CallIntMethod(event, methods.repeat_count);
+    input.source = env->CallIntMethod(event, methods.source);
+    input.device_id = env->CallIntMethod(event, methods.device_id);
+    input.flags = env->CallIntMethod(event, methods.flags);
+    input.scan_code = env->CallIntMethod(event, methods.scan_code);
+    input.down_time = env->CallLongMethod(event, methods.down_time);
+    input.event_time = env->CallLongMethod(event, methods.event_time);
+    if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+        return JNI_FALSE;
+    }
     return armbat::GuestInputQueue::Instance().Push(std::move(input)) ? JNI_TRUE : JNI_FALSE;
 }
 

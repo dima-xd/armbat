@@ -1618,24 +1618,24 @@ class GuestLauncher(private val host: Activity) {
     fun isRunning(): Boolean = session != null
 
     /**
-     * The platform's back action, delivered to the archive's own activity.
+     * The platform's back action, delivered where the archive actually reads it.
      *
-     * The guest has only ever seen the input the container forwards, and back
-     * is no different -- except that it is not a view event at all. This
-     * application targets a current SDK, so the platform turns the back
-     * gesture into an invocation on the container's activity instead of a
-     * [KeyEvent]; with nothing to answer it, the container ended, and the game
-     * ended with it. The invocation is therefore turned back into the event a
-     * build of this era was written against, a [KeyEvent.KEYCODE_BACK] that
-     * goes down and up, and handed to the archive exactly as the platform
-     * handed it to an activity of that era:
+     * A native activity never sees a key in Java: the platform's NativeActivity
+     * takes its window's input queue, and every key reaches the archive's own
+     * loop as an AINPUT_EVENT_TYPE_KEY event. That is where Minecraft answers
+     * back -- its Java dispatchKeyEvent deliberately lets the key up go
+     * unanswered and its onBackPressed is empty, so the pause screen is opened
+     * natively from AKEYCODE_BACK. The queue is the same one touches go
+     * through, so back is queued there first.
      *
-     * - a game that reads the key itself answers from its own dispatchKeyEvent
-     *   (Minecraft opens its pause screen there, on the key up);
-     * - an activity overriding onKeyDown, or the platform's own Activity
-     *   answering through onKeyUp into onBackPressed, is served by the key
-     *   chain itself: the default ends that activity, which is the archive
-     *   leaving the screen -- not the container closing under it.
+     * An archive that never took the queue is an ordinary Java window, and the
+     * key goes through its own key handling instead: a game answering in
+     * dispatchKeyEvent or onKeyDown gets it, and the default chain ends the
+     * archive's activity -- the archive leaving the screen, not the container
+     * closing under it.
+     *
+     * Both halves of the press go to the same side: a game that acts on the key
+     * up never sees it otherwise.
      *
      * Returns false when no archive is on screen, so the container keeps its
      * own back behaviour.
@@ -1643,12 +1643,17 @@ class GuestLauncher(private val host: Activity) {
     fun pressBack(): Boolean {
         val hosted = hosted ?: return false
         val time = android.os.SystemClock.uptimeMillis()
+        val down = backKey(time, KeyEvent.ACTION_DOWN)
+        val up = backKey(time, KeyEvent.ACTION_UP)
+        if (GuestNatives.key(down)) {
+            GuestNatives.key(up)
+            ArmbatLog.i(TAG, "back: ${hosted.info.name} queued")
+            return true
+        }
         val handled = runCatching {
-            // Both halves are always delivered: a game that acts on the key up
-            // (Minecraft) never sees it otherwise.
-            val down = hosted.activity.dispatchKeyEvent(backKey(time, KeyEvent.ACTION_DOWN))
-            val up = hosted.activity.dispatchKeyEvent(backKey(time, KeyEvent.ACTION_UP))
-            down || up
+            val downHandled = hosted.activity.dispatchKeyEvent(down)
+            val upHandled = hosted.activity.dispatchKeyEvent(up)
+            downHandled || upHandled
         }.onFailure { ArmbatLog.w(TAG, "back: ${hosted.info.name}: $it") }.getOrDefault(false)
         ArmbatLog.i(TAG, "back: ${hosted.info.name} handled=$handled")
         return true

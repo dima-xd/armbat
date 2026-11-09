@@ -1292,6 +1292,26 @@ void RegisterAndroidFunctions(HleRegistry& registry) {
         const GuestInputEvent* event = KeyEventAt(call, call.Arg(0));
         call.Return(event != nullptr ? static_cast<std::uint32_t>(event->repeat_count) : 0u);
     });
+    registry.Add("AKeyEvent_getFlags", [](HleCall& call) {
+        const GuestInputEvent* event = KeyEventAt(call, call.Arg(0));
+        call.Return(event != nullptr ? static_cast<std::uint32_t>(event->flags) : 0u);
+    });
+    registry.Add("AKeyEvent_getScanCode", [](HleCall& call) {
+        const GuestInputEvent* event = KeyEventAt(call, call.Arg(0));
+        call.Return(event != nullptr ? static_cast<std::uint32_t>(event->scan_code) : 0u);
+    });
+    // A key carries its times the way a touch does: the platform answers
+    // nanoseconds since boot and the queued event holds milliseconds.
+    const auto add_key_time = [](std::int64_t GuestInputEvent::*field) {
+        return [field](HleCall& call) {
+            const GuestInputEvent* event = KeyEventAt(call, call.Arg(0));
+            const std::int64_t nanos = event != nullptr ? event->*field * 1000000 : 0;
+            call.ReturnPair(static_cast<std::uint32_t>(nanos & 0xffffffffu),
+                            static_cast<std::uint32_t>(nanos >> 32));
+        };
+    };
+    registry.Add("AKeyEvent_getEventTime", add_key_time(&GuestInputEvent::event_time));
+    registry.Add("AKeyEvent_getDownTime", add_key_time(&GuestInputEvent::down_time));
 
     // ---- EGL --------------------------------------------------------------
     //

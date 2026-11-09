@@ -1,6 +1,7 @@
 package dev.armbat
 
 import android.app.Activity
+import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.Surface
 
@@ -77,6 +78,19 @@ internal object GuestNatives {
      * not also receive it.
      */
     external fun touch(event: MotionEvent): Boolean
+
+    /**
+     * One key in the archive's own window. A native activity reads its keys
+     * through AInputQueue, never through the Java activity: the platform's
+     * NativeActivity takes its window's input queue, so the view tree and the
+     * activity's own dispatchKeyEvent never see a key that the archive's
+     * native loop is waiting for.
+     *
+     * Answers true when the archive is reading that queue, exactly as [touch]
+     * does. An archive without a native input loop is an ordinary Java window,
+     * and the caller dispatches the key to the activity itself.
+     */
+    external fun key(event: KeyEvent): Boolean
 
     /**
      * The archive's own activity object, handed over before onCreate so the
