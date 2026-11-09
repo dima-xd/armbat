@@ -46,7 +46,11 @@ constexpr std::uint32_t kDataBaseOffset = 0x200000;
 // AAsset_getBuffer hands over half a megabyte at a time, so the strip ran dry
 // during asset loading and every later allocation answered null. What lives in
 // here is what the guest is told it owns: strings, array copies, asset buffers.
-constexpr std::uint32_t kDataRegionSize = 0x1200000;
+// The end must stay at 0x02000000 exactly: the guest heap hands out its first
+// allocations from that address, and an overlap lets a pool buffer land on an
+// early heap object of the guest (this froze Minecraft's sound path with a
+// corrupted vtable pointer when the region size was typed as 0x1200000).
+constexpr std::uint32_t kDataRegionSize = 0x1000000;
 
 // The trap page sits one megabyte above the stub page and ends the stub region;
 // the data area begins above it.

@@ -211,6 +211,12 @@ void WriteU32(HleCall& call, std::uint32_t address, std::uint32_t value) {
     }
 }
 
+void WriteU16(HleCall& call, std::uint32_t address, std::uint16_t value) {
+    if (address != 0) {
+        call.CopyOut(address, &value, sizeof(value));
+    }
+}
+
 // The interface name behind an SLInterfaceID, or false when the guest handed
 // over something that is not a shim descriptor.
 bool ReadInterfaceId(HleCall& call, std::uint32_t iid, std::string& name) {
@@ -922,12 +928,16 @@ void VolumeSetLevel(HleCall& call) {
 void VolumeGetLevel(HleCall& call) {
     const std::lock_guard lock(g_mutex);
     const ObjectState* state = Owner(call.Arg(0));
-    WriteU32(call, call.Arg(1), state != nullptr ? static_cast<std::uint32_t>(state->volume) : 0);
+    // SLmillibel is a 16-bit scalar; a 4-byte write past its offset once
+    // clobbered the caller's next stack slot.
+    WriteU16(call, call.Arg(1),
+             state != nullptr ? static_cast<std::uint16_t>(state->volume) : 0);
     call.Return(kSlSuccess);
 }
 
 void VolumeGetMaxLevel(HleCall& call) {
-    WriteU32(call, call.Arg(1), 0);
+    // SLmillibel is 16-bit; see the note below on why the width matters.
+    WriteU16(call, call.Arg(1), 0);
     call.Return(kSlSuccess);
 }
 
@@ -962,7 +972,8 @@ void VolumeSetStereoPosition(HleCall& call) {
 }
 
 void VolumeGetStereoPosition(HleCall& call) {
-    WriteU32(call, call.Arg(1), 0);
+    // SLpermille is a 16-bit scalar like SLmillibel.
+    WriteU16(call, call.Arg(1), 0);
     call.Return(kSlSuccess);
 }
 
