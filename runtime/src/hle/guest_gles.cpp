@@ -2296,7 +2296,13 @@ void RegisterGlesFunctions(HleRegistry& registry) {
             const std::lock_guard lock(state->mutex);
             alignment = state->unpack_alignment;
         }
-        const std::size_t length = ImageSize(call.Arg(3), call.Arg(4), call.Arg(6), call.Arg(7),
+        // glTexSubImage2D(target, level, xoffset, yoffset, width, height, format,
+        // type, pixels): the size of the source image comes from width and
+        // height, which sit two slots later than in glTexImage2D. Reading the
+        // offsets instead made the validation ask for a range larger than the
+        // guest's buffer, so a legitimate upload was dropped as unmapped and the
+        // texture never received its pixels.
+        const std::size_t length = ImageSize(call.Arg(4), call.Arg(5), call.Arg(6), call.Arg(7),
                                              alignment);
         const Buffer pixels = GuestBuffer(call, call.Arg(8), length != 0 ? length : 1);
         if (!CheckBuffer("glTexSubImage2D", call.Arg(8), pixels, length != 0 ? length : 1)) {
