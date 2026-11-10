@@ -9,6 +9,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -642,9 +643,11 @@ fun SettingsScreen(
     logLevel: Int,
     widescreen: Boolean,
     version: String,
+    updateStatus: Updates.Status,
     onLocale: (String) -> Unit,
     onLogLevel: (Int) -> Unit,
     onWidescreen: (Boolean) -> Unit,
+    onCheckUpdates: () -> Unit,
     onAbout: () -> Unit,
 ) {
     var languageOpen by remember { mutableStateOf(false) }
@@ -678,6 +681,16 @@ fun SettingsScreen(
                     onToggle = { onWidescreen(!widescreen) },
                 )
                 HoloDivider()
+                // The row is also the answer: its summary is the state of the
+                // last check, so a tap that finds nothing new still says so.
+                if (Updates.enabled) {
+                    SettingsRow(
+                        title = stringResource(R.string.updates),
+                        summary = updateSummary(updateStatus),
+                        onClick = onCheckUpdates,
+                    )
+                    HoloDivider()
+                }
                 SettingsRow(
                     title = stringResource(R.string.about),
                     summary = "${stringResource(R.string.version_label)} $version",
@@ -720,6 +733,28 @@ private fun logLevelLabel(level: Int): Int = when (level) {
     ArmbatLog.DEBUG -> R.string.log_level_debug
     ArmbatLog.TRACE -> R.string.log_level_trace
     else -> R.string.log_level_info
+}
+
+/** What the update row says under its title: the channel, and the last answer. */
+@Composable
+private fun updateSummary(status: Updates.Status): String {
+    val channel = stringResource(
+        if (Updates.channel == Updates.NIGHTLY) {
+            R.string.update_channel_nightly
+        } else {
+            R.string.update_channel_release
+        },
+    )
+    return when (status) {
+        Updates.Status.Idle -> stringResource(R.string.update_check, channel)
+        Updates.Status.Checking -> stringResource(R.string.update_checking)
+        Updates.Status.UpToDate -> stringResource(R.string.update_up_to_date, channel)
+        is Updates.Status.Available -> stringResource(
+            R.string.update_available,
+            status.update.version,
+        )
+        is Updates.Status.Failed -> stringResource(R.string.update_failed)
+    }
 }
 
 /** A settings entry: title, current value underneath, chevron to say it opens. */
@@ -842,6 +877,19 @@ private fun LogLevelDialog(
     )
 }
 
+/**
+ * The dimmed layer a dialog sits on.
+ *
+ * It takes the touches that land outside the panel: a layer that only paints
+ * would let a tap through to the launcher underneath, and a modal alert whose
+ * background still starts applications is not modal.
+ */
+@Composable
+private fun Modifier.scrim(): Modifier {
+    val input = remember { MutableInteractionSource() }
+    return clickable(interactionSource = input, indication = null, onClick = {})
+}
+
 /** A list of exclusive choices in a panel, the way the platform of the era did it. */
 @Composable
 private fun <T> ChoiceDialog(
@@ -854,7 +902,8 @@ private fun <T> ChoiceDialog(
     Box(
         Modifier
             .fillMaxSize()
-            .background(Color.Black.copy(alpha = 0.65f)),
+            .background(Color.Black.copy(alpha = 0.65f))
+            .scrim(),
         contentAlignment = Alignment.Center,
     ) {
         Column(
@@ -918,7 +967,8 @@ fun MessageDialog(title: String, text: String?, onDismiss: () -> Unit) {
     Box(
         Modifier
             .fillMaxSize()
-            .background(Color.Black.copy(alpha = 0.65f)),
+            .background(Color.Black.copy(alpha = 0.65f))
+            .scrim(),
         contentAlignment = Alignment.Center,
     ) {
         Column(
@@ -958,6 +1008,94 @@ fun MessageDialog(title: String, text: String?, onDismiss: () -> Unit) {
                     letterSpacing = 1.sp,
                     modifier = Modifier
                         .clickable(onClick = onDismiss)
+                        .padding(8.dp),
+                )
+            }
+        }
+    }
+}
+
+/**
+ * The offer of a newer build: the same dark panel as every other alert, with the
+ * version, the state of the download and two answers. The download starts only
+ * after the user asks for it, because a nightly is tens of megabytes over a
+ * connection the user may be paying for.
+ */
+@Composable
+fun UpdateDialog(
+    version: String,
+    download: Int,
+    onInstall: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    // -1 means nothing is being fetched: the panel is a question again.
+    val busy = download >= 0
+    Box(
+        Modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.65f))
+            .scrim(),
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(
+            Modifier
+                .width(300.dp)
+                .background(Color(0xFF232323))
+                .border(1.dp, Color(0xFF4A4A4A)),
+        ) {
+            Text(
+                stringResource(R.string.update_title),
+                color = HoloBlue,
+                fontSize = 17.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 18.dp, bottom = 8.dp),
+            )
+            Text(
+                if (busy) {
+                    stringResource(R.string.update_downloading, download)
+                } else {
+                    stringResource(R.string.update_detail, version)
+                },
+                color = Color(0xFFCCCCCC),
+                fontSize = 15.sp,
+                lineHeight = 21.sp,
+                modifier = Modifier.padding(start = 20.dp, end = 20.dp, bottom = 16.dp),
+            )
+            if (busy) {
+                Box(Modifier.fillMaxWidth().height(2.dp).background(HoloRule)) {
+                    Box(
+                        Modifier
+                            .fillMaxHeight()
+                            .fillMaxWidth(download / 100f)
+                            .background(HoloBlue),
+                    )
+                }
+            }
+            HoloDivider()
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 14.dp),
+                horizontalArrangement = Arrangement.End,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    stringResource(R.string.update_later),
+                    color = if (busy) HoloDim else HoloDim.copy(alpha = 0.85f),
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = 1.sp,
+                    modifier = Modifier
+                        .clickable(enabled = !busy, onClick = onDismiss)
+                        .padding(8.dp),
+                )
+                Spacer(Modifier.width(10.dp))
+                Text(
+                    stringResource(R.string.update_now),
+                    color = if (busy) HoloDim else HoloBlue,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = 1.sp,
+                    modifier = Modifier
+                        .clickable(enabled = !busy, onClick = onInstall)
                         .padding(8.dp),
                 )
             }

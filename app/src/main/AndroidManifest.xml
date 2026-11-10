@@ -54,6 +54,12 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!--
+        The container updates itself from its own releases. The platform still
+        asks the user to allow installs from this application once; the updater
+        only sends the downloaded APK to that installer.
+    -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <application
         android:name=".ArmbatApp"
@@ -88,6 +94,21 @@
             value. One entry keeps the bundle present; unknown keys read as null.
         -->
         <meta-data android:name="armbat.container" android:value="1" />
+
+        <!--
+            The updater's downloaded APK lives in the cache and reaches the
+            platform installer as a content URI; the file grants are read-only
+            and last for that one intent.
+        -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.files"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
 
         <activity
             android:name=".MainActivity"

@@ -18,6 +18,14 @@ android {
         ndk {
             abiFilters += "arm64-v8a"
         }
+        // The channel is fixed where the APK is built: a tag is a release, a
+        // branch build is a nightly, and the same source produces both. Nothing
+        // inside an installed APK says which of the two it is, so without this
+        // the updater could not stay on the channel it came from.
+        val channel = (project.findProperty("armbatChannel") as String?) ?: "release"
+        val buildId = (project.findProperty("armbatBuildId") as String?) ?: ""
+        buildConfigField("String", "CHANNEL", "\"$channel\"")
+        buildConfigField("String", "BUILD_ID", "\"$buildId\"")
         externalNativeBuild {
             cmake {
                 targets += listOf("armbat_jni", "guestsdk")
@@ -48,6 +56,9 @@ android {
 
     buildFeatures {
         compose = true
+        // The update channel and the commit a nightly was built from reach the
+        // application through BuildConfig.
+        buildConfig = true
     }
 
     // The container's android.app.NativeActivity is compiled and dexed on its own

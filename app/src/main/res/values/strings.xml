@@ -70,4 +70,20 @@
     <string name="widescreen">Widescreen</string>
     <string name="widescreen_on">On — fills the whole screen</string>
     <string name="widescreen_off">Off — keeps the screen the app was made for</string>
+
+    <string name="updates">Updates</string>
+    <string name="update_channel_release">Release</string>
+    <string name="update_channel_nightly">Nightly</string>
+    <string name="update_check">%1$s · tap to check</string>
+    <string name="update_checking">Checking…</string>
+    <string name="update_up_to_date">%1$s · up to date</string>
+    <string name="update_available">Version %1$s available</string>
+    <string name="update_failed">Could not check for updates</string>
+    <string name="update_title">Update available</string>
+    <string name="update_detail">A newer build is available: %1$s.</string>
+    <string name="update_downloading">Downloading… %1$d%%</string>
+    <string name="update_now">UPDATE</string>
+    <string name="update_later">LATER</string>
+    <string name="install_permission_title">Allow installing updates</string>
+    <string name="install_permission_detail">Allow Armbat to install unknown apps in the system settings, then choose UPDATE again.</string>
 </resources>

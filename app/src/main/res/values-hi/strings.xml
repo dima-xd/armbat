@@ -67,4 +67,20 @@
     <string name="widescreen">वाइडस्क्रीन</string>
     <string name="widescreen_on">चालू — पूरी स्क्रीन भरता है</string>
     <string name="widescreen_off">बंद — ऐप की मूल स्क्रीन रहती है</string>
+
+    <string name="updates">अपडेट</string>
+    <string name="update_channel_release">रिलीज़</string>
+    <string name="update_channel_nightly">Nightly</string>
+    <string name="update_check">%1$s · जाँचने के लिए टैप करें</string>
+    <string name="update_checking">जाँच हो रही है…</string>
+    <string name="update_up_to_date">%1$s · नवीनतम</string>
+    <string name="update_available">संस्करण %1$s उपलब्ध है</string>
+    <string name="update_failed">अपडेट की जाँच नहीं हो सकी</string>
+    <string name="update_title">अपडेट उपलब्ध है</string>
+    <string name="update_detail">एक नया बिल्ड उपलब्ध है: %1$s।</string>
+    <string name="update_downloading">डाउनलोड हो रहा है… %1$d%%</string>
+    <string name="update_now">अपडेट करें</string>
+    <string name="update_later">बाद में</string>
+    <string name="install_permission_title">अपडेट इंस्टॉल करने की अनुमति दें</string>
+    <string name="install_permission_detail">सिस्टम सेटिंग्स में Armbat को अज्ञात ऐप इंस्टॉल करने की अनुमति दें, फिर दोबारा अपडेट करें चुनें।</string>
 </resources>

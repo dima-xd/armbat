@@ -70,4 +70,20 @@
     <string name="widescreen">Широкий экран</string>
     <string name="widescreen_on">Вкл. — на весь экран</string>
     <string name="widescreen_off">Выкл. — экран, под который сделано приложение</string>
+
+    <string name="updates">Обновления</string>
+    <string name="update_channel_release">Релиз</string>
+    <string name="update_channel_nightly">Nightly</string>
+    <string name="update_check">%1$s · нажмите, чтобы проверить</string>
+    <string name="update_checking">Проверка…</string>
+    <string name="update_up_to_date">%1$s · обновлений нет</string>
+    <string name="update_available">Доступна версия %1$s</string>
+    <string name="update_failed">Не удалось проверить обновления</string>
+    <string name="update_title">Доступно обновление</string>
+    <string name="update_detail">Доступна новая сборка: %1$s.</string>
+    <string name="update_downloading">Загрузка… %1$d%%</string>
+    <string name="update_now">ОБНОВИТЬ</string>
+    <string name="update_later">ПОЗЖЕ</string>
+    <string name="install_permission_title">Разрешите установку обновлений</string>
+    <string name="install_permission_detail">Разрешите Armbat устанавливать неизвестные приложения в настройках системы и снова нажмите «ОБНОВИТЬ».</string>
 </resources>

@@ -68,4 +68,20 @@
     <string name="widescreen">Pantalla ancha</string>
     <string name="widescreen_on">Activado: ocupa toda la pantalla</string>
     <string name="widescreen_off">Desactivado: mantiene la pantalla original</string>
+
+    <string name="updates">Actualizaciones</string>
+    <string name="update_channel_release">Versión estable</string>
+    <string name="update_channel_nightly">Nightly</string>
+    <string name="update_check">%1$s · toca para comprobar</string>
+    <string name="update_checking">Comprobando…</string>
+    <string name="update_up_to_date">%1$s · al día</string>
+    <string name="update_available">Versión %1$s disponible</string>
+    <string name="update_failed">No se pudieron comprobar las actualizaciones</string>
+    <string name="update_title">Actualización disponible</string>
+    <string name="update_detail">Hay una compilación más reciente: %1$s.</string>
+    <string name="update_downloading">Descargando… %1$d%%</string>
+    <string name="update_now">ACTUALIZAR</string>
+    <string name="update_later">MÁS TARDE</string>
+    <string name="install_permission_title">Permite instalar actualizaciones</string>
+    <string name="install_permission_detail">Permite que Armbat instale aplicaciones desconocidas en los ajustes del sistema y vuelve a pulsar ACTUALIZAR.</string>
 </resources>

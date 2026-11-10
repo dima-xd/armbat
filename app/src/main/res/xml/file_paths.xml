@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The updater hands its download to the platform installer, and that installer
+     only gets a content URI: a file path would be refused on a current release. -->
+<paths>
+    <cache-path name="updates" path="updates/" />
+</paths>

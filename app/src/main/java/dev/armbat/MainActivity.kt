@@ -24,6 +24,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -63,6 +64,13 @@ class MainActivity : ComponentActivity() {
 
     /** A back key of the guest's that this activity took and must finish. */
     private var backKeyDelivered = false
+
+    /**
+     * Work the shell wants repeated when this activity comes back into view --
+     * returning from the platform's install-permission screen is the one case.
+     * Set while the shell is composed and cleared with it.
+     */
+    private var onResumed: (() -> Unit)? = null
 
     /** An archive handed over by another application, consumed by [Shell]. */
     private var pendingImport by mutableStateOf<Uri?>(null)
@@ -148,6 +156,7 @@ class MainActivity : ComponentActivity() {
         guest.resume()
         keepScreenOn()
         hideSystemNav()
+        onResumed?.invoke()
     }
 
     /**
@@ -280,6 +289,13 @@ class MainActivity : ComponentActivity() {
         var localeTag by remember { mutableStateOf(AppLocale.current(context)) }
         var logLevel by remember { mutableStateOf(ArmbatLog.level()) }
         var widescreen by remember { mutableStateOf(GuestScreen.widescreen(context)) }
+        var updateStatus by remember { mutableStateOf<Updates.Status>(Updates.Status.Idle) }
+        var updateOffer by remember { mutableStateOf<Updates.Update?>(null) }
+        // -1 when nothing is being fetched; the dialog reads it as a percentage.
+        var updateDownload by remember { mutableStateOf(-1) }
+        // The offer whose file is already in the cache and only waits for the
+        // platform's install permission.
+        var pendingInstall by remember { mutableStateOf<Updates.Update?>(null) }
         val version = remember(context) {
             runCatching {
                 context.packageManager.getPackageInfo(context.packageName, 0).versionName
@@ -289,6 +305,80 @@ class MainActivity : ComponentActivity() {
         suspend fun refresh() {
             apps = withContext(Dispatchers.IO) { library.read() }
             ArmbatLog.i("Armbat", "library: ${apps.size} apk")
+        }
+
+        /**
+         * Asks the channel this build came from whether something newer exists.
+         *
+         * The launch check is quiet unless there is something to offer; the
+         * settings row shows the answer either way, so a tap that finds nothing
+         * still says so. Answers are cached for a few minutes and a turned-down
+         * offer is not repeated in the same run, so coming back from a guest
+         * does not put the same panel on screen again.
+         */
+        suspend fun checkUpdates(manual: Boolean) {
+            if (!Updates.enabled) {
+                return
+            }
+            updateStatus = Updates.Status.Checking
+            val result = Updates.check(fresh = manual)
+            updateStatus = result
+            val found = (result as? Updates.Status.Available)?.update ?: return
+            if (manual || Updates.shouldAnnounce(found)) {
+                updateOffer = found
+            }
+        }
+
+        suspend fun deliverUpdate(update: Updates.Update) {
+            val file = try {
+                Updates.download(this@MainActivity, update) { percent ->
+                    updateDownload = percent
+                }
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (error: Exception) {
+                updateDownload = -1
+                notice = Notice(
+                    context.getString(R.string.update_failed),
+                    error.message ?: error.javaClass.simpleName,
+                )
+                return
+            }
+            updateDownload = -1
+            if (Updates.install(this@MainActivity, file)) {
+                pendingInstall = null
+                updateOffer = null
+                Updates.dismiss(update)
+                return
+            }
+            // The platform wants its own switch flipped before it opens the
+            // installer. The verified file stays in the cache, so coming back
+            // from that screen installs it instead of fetching it again.
+            pendingInstall = update
+            notice = Notice(
+                context.getString(R.string.install_permission_title),
+                context.getString(R.string.install_permission_detail),
+            )
+            Updates.requestInstallPermission(this@MainActivity)
+        }
+
+        /** Fetches the offered build and hands it to the platform installer. */
+        fun installUpdate(update: Updates.Update) {
+            if (updateDownload >= 0) {
+                return
+            }
+            updateDownload = 0
+            scope.launch { deliverUpdate(update) }
+        }
+
+        /** Called when the activity comes back, e.g. from the install permission screen. */
+        suspend fun resumeInstall() {
+            val update = pendingInstall ?: return
+            if (updateDownload >= 0) {
+                return
+            }
+            updateDownload = 0
+            deliverUpdate(update)
         }
 
         lateinit var permission: androidx.activity.result.ActivityResultLauncher<Array<String>>
@@ -404,6 +494,23 @@ class MainActivity : ComponentActivity() {
             run(app)
         }
 
+        // The launcher is the only place the container is shown, so a start of
+        // it is the moment to ask whether a newer build exists.
+        LaunchedEffect(Unit) {
+            checkUpdates(manual = false)
+        }
+
+        // The install permission is granted on a system screen, so the only
+        // thing that tells this activity the answer changed is its own resume.
+        DisposableEffect(Unit) {
+            onResumed = {
+                if (pendingInstall != null && Updates.canInstall(this@MainActivity)) {
+                    scope.launch { resumeInstall() }
+                }
+            }
+            onDispose { onResumed = null }
+        }
+
         // One import path for both the file picker and an APK opened from
         // outside the container, so a tap on an archive behaves the same way
         // wherever it happens.
@@ -510,6 +617,7 @@ class MainActivity : ComponentActivity() {
                             logLevel = logLevel,
                             widescreen = widescreen,
                             version = version,
+                            updateStatus = updateStatus,
                             onLocale = { tag ->
                                 localeTag = tag
                                 AppLocale.set(this@MainActivity, tag)
@@ -522,6 +630,7 @@ class MainActivity : ComponentActivity() {
                                 widescreen = on
                                 GuestScreen.setWidescreen(this@MainActivity, on)
                             },
+                            onCheckUpdates = { scope.launch { checkUpdates(manual = true) } },
                             onAbout = { screen = Screen.About },
                         )
 
@@ -538,6 +647,23 @@ class MainActivity : ComponentActivity() {
                         )
                     }
 
+                    updateOffer?.let { offer ->
+                        UpdateDialog(
+                            version = offer.version,
+                            download = updateDownload,
+                            onInstall = { installUpdate(offer) },
+                            onDismiss = {
+                                if (updateDownload < 0) {
+                                    updateOffer = null
+                                    Updates.dismiss(offer)
+                                }
+                            },
+                        )
+                    }
+
+                    // An alert of the updater (a failed download, a missing
+                    // install permission) has to be readable over the offer that
+                    // caused it, so it is drawn last.
                     notice?.let { current ->
                         MessageDialog(
                             title = current.title,

@@ -51,6 +51,20 @@ jobs:
             echo "::warning::tag $GITHUB_REF_NAME does not match versionName $version_name"
           fi
 
+      - name: Channel
+        # A tag is a release, a branch push is a nightly, and the updater reads
+        # the channel out of the installed APK to stay on the one it came from.
+        # The commit is what makes one nightly different from the next, because
+        # the nightly asset keeps the same name and the same version code.
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            channel=release
+          else
+            channel=nightly
+          fi
+          echo "ARMBAT_CHANNEL=$channel" >> "$GITHUB_ENV"
+          echo "channel: $channel ($GITHUB_SHA)"
+
       - name: JDK 21
         uses: actions/setup-java@v4
         with:
@@ -106,7 +120,10 @@ jobs:
         run: ./gradlew --no-daemon :app:testDebugUnitTest
 
       - name: Build release APK
-        run: ./gradlew --no-daemon :app:assembleRelease
+        run: |
+          ./gradlew --no-daemon :app:assembleRelease \
+            -ParmbatChannel="$ARMBAT_CHANNEL" \
+            -ParmbatBuildId="$GITHUB_SHA"
 
       - name: Stage artifact
         run: |
@@ -171,6 +188,7 @@ jobs:
           {
             echo "Automatic build of ${GITHUB_SHA::7}."
             echo
+            echo "build: ${GITHUB_SHA}"
             echo "- version: ${ANDROID_VERSION_NAME} (${ANDROID_VERSION_CODE})"
             echo "- size: $(du -h --apparent-size out/armbat-latest.apk | cut -f1)"
             echo "- sha256: \`$(sha256sum out/armbat-latest.apk | cut -d' ' -f1)\`"

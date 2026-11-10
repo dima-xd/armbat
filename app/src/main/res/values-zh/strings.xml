@@ -69,4 +69,20 @@
     <string name="widescreen">宽屏</string>
     <string name="widescreen_on">开 — 占满整个屏幕</string>
     <string name="widescreen_off">关 — 保持应用原本的屏幕比例</string>
+
+    <string name="updates">更新</string>
+    <string name="update_channel_release">正式版</string>
+    <string name="update_channel_nightly">Nightly</string>
+    <string name="update_check">%1$s · 点按检查</string>
+    <string name="update_checking">正在检查…</string>
+    <string name="update_up_to_date">%1$s · 已是最新</string>
+    <string name="update_available">有 %1$s 版本可用</string>
+    <string name="update_failed">无法检查更新</string>
+    <string name="update_title">有可用更新</string>
+    <string name="update_detail">有更新的构建版本：%1$s。</string>
+    <string name="update_downloading">正在下载… %1$d%%</string>
+    <string name="update_now">更新</string>
+    <string name="update_later">稍后</string>
+    <string name="install_permission_title">允许安装更新</string>
+    <string name="install_permission_detail">请在系统设置中允许 Armbat 安装未知应用，然后再次点按“更新”。</string>
 </resources>
