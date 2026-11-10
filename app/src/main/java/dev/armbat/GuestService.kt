@@ -3,6 +3,7 @@ package dev.armbat
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
@@ -49,6 +50,7 @@ class GuestService : Service() {
             .setContentText(getString(R.string.guest_notification_text))
             .setOngoing(true)
             .setShowWhen(false)
+            .addAction(closeAction())
             .build()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startForeground(ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
@@ -72,6 +74,33 @@ class GuestService : Service() {
         return START_NOT_STICKY
     }
 
+    /**
+     * The action that closes the running application from the shade.
+     *
+     * A guest has no window of its own that the platform could put a button on,
+     * and its process cannot outlive the guest world inside it, so the request
+     * is handed to the launcher's activity: the task comes forward, the session
+     * is torn down there, and the shell is reopened in a fresh process (see
+     * [MainActivity.closeGuest]). The action carries no icon: current system UI
+     * does not draw one and the label is all a player sees.
+     */
+    private fun closeAction(): Notification.Action {
+        val intent = Intent(this, MainActivity::class.java)
+            .setAction(MainActivity.ACTION_CLOSE)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        val pending = PendingIntent.getActivity(
+            this,
+            CLOSE_REQUEST,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        return Notification.Action.Builder(
+            null,
+            getString(R.string.guest_notification_close),
+            pending,
+        ).build()
+    }
+
     override fun onDestroy() {
         multicast?.let { lock ->
             if (lock.isHeld) {
@@ -87,6 +116,7 @@ class GuestService : Service() {
     companion object {
         private const val CHANNEL = "guest"
         private const val ID = 1
+        private const val CLOSE_REQUEST = 1
 
         fun start(context: Context) {
             val intent = Intent(context, GuestService::class.java)

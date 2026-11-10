@@ -25,6 +25,7 @@
     <string name="launch_resources">संसाधन लोड हो रहे हैं…</string>
     <string name="guest_channel_name">चल रहे ऐप्स</string>
     <string name="guest_notification_text">ऐप बैकग्राउंड में चल रहा है</string>
+    <string name="guest_notification_close">बंद करें</string>
     <string name="delete">हटाएँ</string>
 
     <string name="size">आकार</string>

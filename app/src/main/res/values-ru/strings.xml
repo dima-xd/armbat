@@ -25,6 +25,7 @@
     <string name="launch_resources">Загрузка ресурсов…</string>
     <string name="guest_channel_name">Запущенные приложения</string>
     <string name="guest_notification_text">Приложение работает в фоне</string>
+    <string name="guest_notification_close">ЗАКРЫТЬ</string>
     <string name="delete">УДАЛИТЬ</string>
 
     <string name="size">РАЗМЕР</string>

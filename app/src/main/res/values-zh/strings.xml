@@ -27,6 +27,7 @@
     <string name="launch_resources">正在加载资源…</string>
     <string name="guest_channel_name">正在运行的应用</string>
     <string name="guest_notification_text">应用正在后台运行</string>
+    <string name="guest_notification_close">关闭</string>
     <string name="delete">删除</string>
 
     <string name="size">大小</string>

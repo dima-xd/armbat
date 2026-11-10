@@ -123,6 +123,15 @@ class MainActivity : ComponentActivity() {
             statusBarStyle = SystemBarStyle.dark(android.graphics.Color.BLACK),
             navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.BLACK),
         )
+        // A close request that reaches a process with no guest is the remains of
+        // an earlier one: the shell simply comes up, and the archive the activity
+        // was started for is dropped with the request.
+        intent?.let { request ->
+            if (request.action == ACTION_CLOSE) {
+                request.removeExtra("launch")
+                request.action = null
+            }
+        }
         // Only on a fresh start: after a recreation the view intent is still
         // attached, and importing the same archive twice is exactly what the
         // library refuses.
@@ -135,6 +144,10 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+        if (intent.action == ACTION_CLOSE) {
+            closeGuest()
+            return
+        }
         pendingImport = viewArchive(intent)
     }
 
@@ -272,6 +285,39 @@ class MainActivity : ComponentActivity() {
     private fun showLibrary() {
         intent?.removeExtra("launch")
         setContent { Shell() }
+    }
+
+    /**
+     * Ends the running application when the player closes it from the shade.
+     *
+     * The guest world cannot outlive its process: its JIT, its guest heap and
+     * one class loader per archive stay mapped, and ART refuses to map the same
+     * libraries into a second one, so [GuestLauncher.destroy] ends the process
+     * with the world.
+     *
+     * The shell is not brought back afterwards. The platform only allows an
+     * activity start from a PendingIntent if its creator or its sender is
+     * currently entitled to start activities from the background, and neither
+     * is: the container is gone by the time the request is delivered, and the
+     * alarm service that delivers it has no such privilege of its own. An exact
+     * alarm cannot outrace that either -- it needs a permission this container
+     * does not hold. So closing from the shade is closing the application, and
+     * the library is what the next start shows.
+     */
+    private fun closeGuest() {
+        intent?.removeExtra("launch")
+        if (!guest.isRunning()) {
+            // The notification outlived its guest only if the session was already
+            // gone; there is nothing to close.
+            showLibrary()
+            return
+        }
+        ArmbatLog.i("Armbat", "guest closed from the notification")
+        ArmbatLog.flush()
+        // The process ends here once a world was loaded; the shell below is what
+        // a session that never got that far falls back to.
+        guest.destroy()
+        showLibrary()
     }
 
     @Composable
@@ -692,5 +738,10 @@ class MainActivity : ComponentActivity() {
                 )
             }
         }
+    }
+
+    companion object {
+        /** What the notification's close button asks this activity to do. */
+        const val ACTION_CLOSE = "dev.armbat.CLOSE"
     }
 }

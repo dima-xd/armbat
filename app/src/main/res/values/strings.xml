@@ -27,6 +27,7 @@
     <string name="launch_resources">Loading resources…</string>
     <string name="guest_channel_name">Running apps</string>
     <string name="guest_notification_text">An app is running in the background</string>
+    <string name="guest_notification_close">CLOSE</string>
     <string name="delete">DELETE</string>
 
     <string name="size">SIZE</string>

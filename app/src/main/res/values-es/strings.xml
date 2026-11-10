@@ -25,6 +25,7 @@
     <string name="launch_resources">Cargando recursos…</string>
     <string name="guest_channel_name">Aplicaciones en ejecución</string>
     <string name="guest_notification_text">Una aplicación se está ejecutando en segundo plano</string>
+    <string name="guest_notification_close">CERRAR</string>
     <string name="delete">ELIMINAR</string>
 
     <string name="size">TAMAÑO</string>
