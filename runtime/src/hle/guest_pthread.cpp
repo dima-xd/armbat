@@ -28,6 +28,7 @@
 #include "armbat/guest_modules.h"
 #include "armbat/guest_signal.h"
 #include "armbat/hle.h"
+#include "armbat/jni_bridge.h"
 
 namespace armbat {
 namespace {
@@ -555,6 +556,9 @@ void GuestPthread::State::Run(std::shared_ptr<Thread> thread, std::uint32_t entr
     // it here keeps a detached thread from parking a megabyte until the
     // process ends.
     ReleaseStack(*thread);
+    // Whatever this thread handed the guest through the bridge dies with it, as
+    // the platform's own local references do at thread exit.
+    DetachHostThread();
 }
 
 void GuestPthread::State::Finish(Thread& thread, std::uint32_t result) {

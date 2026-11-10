@@ -54,6 +54,11 @@ public:
     // it from every thread long after the handover.
     std::uint32_t KeepObject(JNIEnv* env, jobject object);
 
+    // Drops the local references this host thread made through the bridge. The
+    // platform frees them when the thread detaches; a guest thread that runs its
+    // own native loop never enters Java, so it has to ask.
+    void ReleaseThreadReferences();
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

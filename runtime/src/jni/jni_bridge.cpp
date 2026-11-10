@@ -73,6 +73,14 @@ thread_local std::vector<std::vector<PendingRef>> g_local_frames;
 // is released when this thread enters the next native call.
 thread_local PendingRef g_deferred_return;
 
+// Handles this thread made on the guest's behalf. A guest thread that runs its
+// own native loop never enters Java, so no frame ever returns to release them,
+// and an archive that decodes its images through Java hands out a pixel array
+// per file. The platform drops a thread's local references when the thread
+// detaches; DetachHostThread asks the bridge to do the same, which is the only
+// thing that gives an image loader's memory back.
+thread_local std::vector<std::uint32_t> g_thread_refs;
+
 void Log(const std::string& line) {
     ARMBAT_LOG_TEXT(LogLevel::Info, "Armbat", line);
 }
@@ -288,6 +296,12 @@ void DetachHostThread() {
     if (g_vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) == JNI_EDETACHED) {
         return;
     }
+    // A reference the bridge made is a global one, which the runtime does not
+    // touch when the thread goes: the guest's thread-local references have to be
+    // dropped here, at the point where the platform would have dropped them.
+    if (JniBridge* bridge = CurrentJniBridge()) {
+        bridge->ReleaseThreadReferences();
+    }
     g_vm->DetachCurrentThread();
 }
 
@@ -337,6 +351,9 @@ struct JniBridge::Impl {
         // A reference the guest keeps using survives; one it made and left
         // behind is dropped on the second pass.
         mutable bool touched = false;
+        // Shallow Java size this reference keeps alive, when it is known. Arrays
+        // are the ones that matter: a decoded image is a quarter of a megabyte.
+        std::uint32_t bytes = 0;
     };
     std::vector<Ref> refs;
     std::vector<std::uint32_t> free_refs;
@@ -357,10 +374,22 @@ struct JniBridge::Impl {
     // an argument array and uses it two calls later, and the budget runs before
     // that use.
     static constexpr std::size_t kLocalRefRecent = 4096;
+    // The same budget in bytes. One reference can name a 256 KiB pixel array --
+    // an image loader that decodes through Java hands one out per file and then
+    // never deletes it -- so the count budget alone would let a few hundred
+    // files pin the whole Java heap. Arrays below kTrackedArrayBytes are left to
+    // the count budget; they cannot starve the heap at that size.
+    static constexpr std::size_t kLocalRefBytes = 48u * 1024u * 1024u;
+    static constexpr std::size_t kTrackedArrayBytes = 4096;
+    // A pass runs before every call while the table is over budget, so the
+    // overshoot is one pass. Arrays are created and consumed within a few calls,
+    // hence the much smaller window when the byte budget is what blew.
+    static constexpr std::size_t kLocalRefRecentLarge = 256;
     std::vector<std::uint32_t> local_refs;   // guarded by refs_mutex
     std::vector<std::uint32_t> dropped_refs_;   // guarded by refs_mutex
     std::atomic<std::size_t> local_ref_count{0};
     std::atomic<std::size_t> local_ref_history{0};
+    std::atomic<std::size_t> local_ref_bytes{0};
     std::vector<MethodRef> method_refs;
     // Real JNI answers the same jmethodID for the same method for the life of the
     // VM. Callers key their own caches by it (Unity's proxy bridge does), so a
@@ -523,7 +552,50 @@ struct JniBridge::Impl {
         env->DeleteLocalRef(thrown);
     }
 
-    std::uint32_t Handle(JNIEnv* env, jobject object) {
+    // Shallow size of an array the guest is being handed. Only arrays big enough
+    // to matter for the byte budget are counted; a decoded 256x256 image is
+    // exactly the case that fills the heap (int[65538] is 256 KiB plus header).
+    static std::size_t ArrayBytesOf(JNIEnv* env, jobject object, const char* descriptor) {
+        if (object == nullptr || descriptor == nullptr || descriptor[0] != '[' ||
+            env->ExceptionCheck()) {
+            return 0;
+        }
+        std::size_t width = sizeof(void*);
+        switch (descriptor[1]) {
+            case 'Z':
+            case 'B': width = 1; break;
+            case 'C':
+            case 'S': width = 2; break;
+            case 'I':
+            case 'F': width = 4; break;
+            case 'J':
+            case 'D': width = 8; break;
+            default: break;
+        }
+        const jsize length = env->GetArrayLength(static_cast<jarray>(object));
+        const std::size_t elements = static_cast<std::size_t>(length) * width;
+        return elements >= kTrackedArrayBytes ? elements + 16 : 0;
+    }
+
+    // ART answers a call that returns an object with a *local* reference: an
+    // entry in the calling thread's local table, released when a native call
+    // returns to Java. A guest thread that runs its own loop never returns to
+    // Java, so that entry stays forever -- and it is not the handle the guest
+    // uses anyway, the global reference made below is. A heap dump of a guest
+    // that decodes images through Java showed 921 image arrays (229 MB) sitting
+    // in one thread's local table while the handles accounted for 32 MB.
+    static void ReleaseIfLocal(JNIEnv* env, jobject object) {
+        if (object != nullptr && env->GetObjectRefType(object) == JNILocalRefType) {
+            env->DeleteLocalRef(object);
+        }
+    }
+
+    // `own_local` says whether the caller obtained `object` from a JNI call it
+    // made (and so may delete the local reference ART made for it). A reference
+    // ART passes into a native method belongs to the Java frame and is left
+    // alone.
+    std::uint32_t Handle(JNIEnv* env, jobject object, std::size_t bytes = 0,
+                         bool own_local = true) {
         if (env->ExceptionCheck()) {
             // CheckJNI kills the process when a global ref is made with a pending
             // exception; a device running the same app non-debuggable would just
@@ -567,6 +639,11 @@ struct JniBridge::Impl {
             // calls, and a reference slot can name another object once the frame
             // that owned it pops, so a key is verified and not trusted.
             if (env->IsSameObject(refs[known->second - 1].object, object)) {
+                // The handle exists; the local reference ART just made is still
+                // ours to drop.
+                if (own_local) {
+                    ReleaseIfLocal(env, object);
+                }
                 return known->second;
             }
             ref_ids.erase(known);
@@ -584,13 +661,28 @@ struct JniBridge::Impl {
         }
         const std::uint32_t handle = InsertRef(kept, false);
         ref_ids.emplace(kept, handle);
+        if (bytes != 0) {
+            const std::uint32_t tracked =
+                static_cast<std::uint32_t>(bytes > 0xFFFFFFFFu ? 0xFFFFFFFFu : bytes);
+            refs[handle - 1].bytes = tracked;
+            local_ref_bytes.fetch_add(tracked, std::memory_order_relaxed);
+        }
         if (!g_local_frames.empty()) {
+            // The frame owns it: ReleaseLocalFrame hands it back when the native
+            // call that made it returns.
             g_local_frames.back().push_back(
                 PendingRef{handle, refs[handle - 1].generation, false});
+        } else {
+            // Nothing else will hand it back: the guest runs its own loop and
+            // never returns to Java, so only the thread's exit can release it.
+            g_thread_refs.push_back(handle);
         }
         local_refs.push_back(handle);
         local_ref_count.fetch_add(1, std::memory_order_relaxed);
         local_ref_history.store(local_refs.size(), std::memory_order_relaxed);
+        if (own_local) {
+            ReleaseIfLocal(env, object);
+        }
         return handle;
     }
 
@@ -658,6 +750,13 @@ struct JniBridge::Impl {
         if (generation != 0 && entry.generation != generation) {
             return;
         }
+        if (entry.bytes != 0) {
+            // Under refs_mutex, so the counter is only ever changed by one thread
+            // at a time; the read-modify-write cannot lose another release.
+            const std::size_t tracked = local_ref_bytes.load(std::memory_order_relaxed);
+            local_ref_bytes.store(tracked >= entry.bytes ? tracked - entry.bytes : 0,
+                                  std::memory_order_relaxed);
+        }
         env->DeleteGlobalRef(entry.object);
         ref_ids.erase(entry.object);
         entry = Ref{};
@@ -712,7 +811,11 @@ struct JniBridge::Impl {
         static constexpr std::size_t kListLimit = 65536;
         const std::size_t live_now = local_ref_count.load(std::memory_order_relaxed);
         const bool over_budget = live_now > kLocalRefBudget + kSlack;
-        if (!over_budget &&
+        // Memory, not the count, is what an image-sized array spends: a thousand
+        // of them sit far below the count budget and still fill the heap.
+        const bool over_bytes =
+            local_ref_bytes.load(std::memory_order_relaxed) > kLocalRefBytes;
+        if (!over_budget && !over_bytes &&
             local_ref_history.load(std::memory_order_relaxed) <= kListLimit) {
             return;
         }
@@ -724,8 +827,9 @@ struct JniBridge::Impl {
             // One pass, in place: the list keeps its order (creation order) and
             // the dropped handles are released below the same lock.
             std::size_t write = 0;
+            const std::size_t recent = over_bytes ? kLocalRefRecentLarge : kLocalRefRecent;
             const std::size_t recent_from =
-                local_refs.size() > kLocalRefRecent ? local_refs.size() - kLocalRefRecent : 0;
+                local_refs.size() > recent ? local_refs.size() - recent : 0;
             for (std::size_t i = 0; i < local_refs.size(); ++i) {
                 const std::uint32_t handle = local_refs[i];
                 if (handle == 0 || handle > refs.size()) {
@@ -737,7 +841,7 @@ struct JniBridge::Impl {
                 }
                 // A compaction pass drops nothing: only a table over budget may
                 // retire a reference the guest has not resolved lately.
-                if (!over_budget || i >= recent_from || entry.touched) {
+                if ((!over_budget && !over_bytes) || i >= recent_from || entry.touched) {
                     entry.touched = false;
                     local_refs[write++] = handle;
                 } else {
@@ -752,12 +856,47 @@ struct JniBridge::Impl {
             dropped_count = dropped_refs_.size();
             local_ref_count.store(kept_count, std::memory_order_relaxed);
             local_ref_history.store(kept_count, std::memory_order_relaxed);
+            // A reference the guest released itself leaves a dead handle in this
+            // thread's exit list. Compact it so a long session does not keep a
+            // word per handle it ever made.
+            if (g_thread_refs.size() > 1024) {
+                std::size_t keep = 0;
+                for (const std::uint32_t handle : g_thread_refs) {
+                    const bool live = handle != 0 && handle <= refs.size() &&
+                                      refs[handle - 1].object != nullptr;
+                    if (live) {
+                        g_thread_refs[keep++] = handle;
+                    }
+                }
+                g_thread_refs.resize(keep);
+            }
         }
         if (dropped_count != 0 && LogAllowed("jni-budget", 8)) {
             ARMBAT_LOG_INFO("Armbat",
                             "jni: released %zu local references the guest never deleted (%zu "
-                            "kept)",
-                            dropped_count, kept_count);
+                            "kept, %zu KiB of objects still held)",
+                            dropped_count, kept_count,
+                            local_ref_bytes.load(std::memory_order_relaxed) / 1024);
+        }
+    }
+
+    // Drops the references this thread made and the guest never deleted. A
+    // native activity's own thread never returns to Java, so this is the only
+    // point at which its references -- an image-sized array per loaded file --
+    // can be handed back; the platform does the same at DetachCurrentThread.
+    void ReleaseThreadRefs() {
+        if (g_thread_refs.empty()) {
+            return;
+        }
+        std::vector<std::uint32_t> handles;
+        handles.swap(g_thread_refs);
+        JNIEnv* env = HostEnv();
+        if (env == nullptr) {
+            return;
+        }
+        const std::lock_guard lock(refs_mutex);
+        for (const std::uint32_t handle : handles) {
+            ReleaseRefLocked(handle, false);
         }
     }
 
@@ -1281,9 +1420,7 @@ struct JniBridge::Impl {
                 call.Return(0);
                 return;
             }
-            const std::uint32_t handle = Handle(env, reflected);
-            env->DeleteLocalRef(reflected);
-            call.Return(handle);
+            call.Return(Handle(env, reflected));
         });
 
         add(JNI_IDX(FromReflectedField), [this](HleCall& call) {
@@ -1337,9 +1474,7 @@ struct JniBridge::Impl {
                 call.Return(0);
                 return;
             }
-            const std::uint32_t handle = Handle(env, reflected);
-            env->DeleteLocalRef(reflected);
-            call.Return(handle);
+            call.Return(Handle(env, reflected));
         });
 
         add(JNI_IDX(GetMethodID), [this](HleCall& call) {
@@ -1434,7 +1569,9 @@ struct JniBridge::Impl {
             // device would: still throwing.
             jobject thrown = env->ExceptionOccurred();
             env->ExceptionClear();
-            const std::uint32_t handle = Handle(env, thrown);
+            // The reference is thrown again below, so it is not ours to delete
+            // here; the explicit delete at the end owns it.
+            const std::uint32_t handle = Handle(env, thrown, 0, false);
             if (thrown != nullptr) {
                 env->Throw(static_cast<jthrowable>(thrown));
                 env->DeleteLocalRef(thrown);
@@ -1553,9 +1690,12 @@ struct JniBridge::Impl {
 
         add(JNI_IDX(NewObjectArray), [this](HleCall& call) {
             JNIEnv* env = HostEnv();
-            call.Return(Handle(env, env->NewObjectArray(static_cast<jsize>(call.Arg(1)),
-                                                        static_cast<jclass>(Resolve(call.Arg(2))),
-                                                        Resolve(call.Arg(3)))));
+            const jsize length = static_cast<jsize>(call.Arg(1));
+            const std::size_t bytes =
+                length > 0 ? static_cast<std::size_t>(length) * sizeof(void*) + 16 : 0;
+            const jclass element = static_cast<jclass>(Resolve(call.Arg(2)));
+            const jobject array = env->NewObjectArray(length, element, Resolve(call.Arg(3)));
+            call.Return(Handle(env, array, bytes));
         });
 
         add(JNI_IDX(AllocObject), [this](HleCall& call) {
@@ -2029,7 +2169,10 @@ struct JniBridge::Impl {
     template <typename T>
     void NewArray(HleCall& call) {
         JNIEnv* env = HostEnv();
-        call.Return(Handle(env, HostNewArray<T>(env, static_cast<jsize>(call.Arg(1)))));
+        const jsize length = static_cast<jsize>(call.Arg(1));
+        const std::size_t bytes =
+            length > 0 ? static_cast<std::size_t>(length) * sizeof(T) + 16 : 0;
+        call.Return(Handle(env, HostNewArray<T>(env, length), bytes));
     }
 
     template <typename T, typename Add>
@@ -2339,7 +2482,8 @@ struct JniBridge::Impl {
     // float or a double arrives as its bit pattern in r0/r0:r1 (softfp), an
     // object as a reference handle, a long as a pair of words.
     void InvokeCall(HleCall& call, char result, bool is_static, bool nonvirtual,
-                    jobject object, jobject type, jmethodID method, jvalue* args) {
+                    jobject object, jobject type, jmethodID method, jvalue* args,
+                    const char* result_descriptor = nullptr) {
         JNIEnv* env = HostEnv();
         switch (result) {
             case 'V':
@@ -2473,7 +2617,7 @@ struct JniBridge::Impl {
                 } else {
                     value = env->CallObjectMethodA(object, method, args);
                 }
-                call.Return(Handle(env, value));
+                call.Return(Handle(env, value, ArrayBytesOf(env, value, result_descriptor)));
                 return;
             }
         }
@@ -2529,9 +2673,10 @@ struct JniBridge::Impl {
             return;
         }
         const std::size_t close = ref.signature.find(')');
-        const char returns = close != std::string::npos && close + 1 < ref.signature.size()
-                                 ? ref.signature[close + 1]
-                                 : 'V';
+        const bool has_result = close != std::string::npos && close + 1 < ref.signature.size();
+        const char returns = has_result ? ref.signature[close + 1] : 'V';
+        const char* result_descriptor =
+            has_result ? ref.signature.c_str() + close + 1 : nullptr;
         // The null-object diagnostic names the method it came from, and says
         // whether the framework threw something the guest then had to deal with.
         // A null answer from the guest's own file reader is silent to the
@@ -2554,7 +2699,7 @@ struct JniBridge::Impl {
         const std::string previous = current_call;
         current_call = ref.name + ref.signature;
         InvokeCall(call, returns, family == 2, family == 1, object, type, ref.method,
-                   values.empty() ? nullptr : values.data());
+                   values.empty() ? nullptr : values.data(), result_descriptor);
         current_call = previous;
     }
 
@@ -2758,7 +2903,7 @@ struct JniBridge::Impl {
             default: {
                 jobject v = is_static ? env->GetStaticObjectField(cls, ref.field)
                                       : env->GetObjectField(object, ref.field);
-                call.Return(Handle(env, v));
+                call.Return(Handle(env, v, ArrayBytesOf(env, v, ref.signature.c_str())));
                 break;
             }
         }
@@ -2800,7 +2945,10 @@ struct JniBridge::Impl {
         }
         current_env_index = index;
         current_env_lr = machine_ref.Reg(14);
-        if (local_ref_count.load(std::memory_order_relaxed) > kLocalRefBudget) {
+        // Both budgets are checked here. The byte budget is the one an image
+        // loader trips: it keeps its reference count low and its arrays huge.
+        if (local_ref_count.load(std::memory_order_relaxed) > kLocalRefBudget ||
+            local_ref_bytes.load(std::memory_order_relaxed) > kLocalRefBytes) {
             TrimLocalRefs();
         }
         HleCall call(machine_ref, arena);
@@ -3086,7 +3234,8 @@ std::uint64_t JniBridge::Impl::Dispatch(std::uint64_t* frame, std::uint64_t* sta
 
     std::vector<std::uint32_t> args;
     args.push_back(env_pointer);
-    args.push_back(Handle(env, reinterpret_cast<jobject>(frame[1])));
+    // The first argument is the receiver, a reference the Java frame owns.
+    args.push_back(Handle(env, reinterpret_cast<jobject>(frame[1]), 0, false));
 
     std::size_t x = 2;      // x0/x1 are env and this
     std::size_t d = 0;
@@ -3149,7 +3298,9 @@ std::uint64_t JniBridge::Impl::Dispatch(std::uint64_t* frame, std::uint64_t* sta
                     ++i;  // primitive element type of an array
                 }
             }
-            args.push_back(Handle(env, reinterpret_cast<jobject>(next_pointer())));
+            // ART's own reference from the native method's frame: not ours to
+            // delete.
+            args.push_back(Handle(env, reinterpret_cast<jobject>(next_pointer()), 0, false));
             break;
         }
         case 'F':
@@ -3276,6 +3427,8 @@ JniBridge::~JniBridge() {
 }
 
 JNIEnv* JniBridge::HostEnvironment() const { return HostEnv(); }
+
+void JniBridge::ReleaseThreadReferences() { impl_->ReleaseThreadRefs(); }
 
 jobject JniBridge::ResolveGuestObject(std::uint32_t handle) const { return impl_->Resolve(handle); }
 
