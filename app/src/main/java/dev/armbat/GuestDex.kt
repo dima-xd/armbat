@@ -64,7 +64,7 @@ import java.util.zip.ZipFile
 object GuestDex {
 
     /** Bump when the rewrite rules or the cache layout change. */
-    private const val CACHE_VERSION = 3
+    private const val CACHE_VERSION = 4
 
     private const val CACHE_MARKER = ".ok"
     private const val PLATFORM_DEX = "guestplatform.dex"
@@ -114,7 +114,10 @@ object GuestDex {
         }
         onStage?.invoke(LaunchStage.DEX)
         val root = File(host.filesDir, "dex/${apk.nameWithoutExtension}")
-        val key = cacheKey(host, packageName, data, obb, entries)
+        // The runtime writes the description of the emulated core here for
+        // native readers; Java readers get the same file (see rules).
+        val cpuInfo = File(host.codeCacheDir, "cpuinfo").absolutePath
+        val key = cacheKey(host, packageName, data, obb, cpuInfo, entries)
         val lock = locks.computeIfAbsent(root.absolutePath) { Any() }
         return synchronized(lock) {
             val directory = File(root, key)
@@ -133,7 +136,9 @@ object GuestDex {
                 )
                 return@synchronized names.map { File(directory, it) }.sortedBy { it.name }
             }
-            val files = build(host, apk, packageName, data, obb, root, directory, entries, onStage)
+            val files = build(
+                host, apk, packageName, data, obb, cpuInfo, root, directory, entries, onStage,
+            )
             ArmbatLog.i(
                 "Armbat",
                 "dex cache: built ${entries.size} files in ${SystemClock.elapsedRealtime() - started} ms",
@@ -151,12 +156,13 @@ object GuestDex {
         packageName: String,
         data: File,
         obb: File,
+        cpuInfo: String,
         onStage: ((LaunchStage) -> Unit)? = null,
     ) {
         if (packageName.isEmpty()) {
             return
         }
-        val rules = rules(packageName, data.absolutePath, obb.absolutePath)
+        val rules = rules(packageName, data.absolutePath, obb.absolutePath, cpuInfo)
         onStage?.invoke(LaunchStage.DEX_READ)
         if (!GuestDexScan.containsAny(
                 file,
@@ -229,6 +235,7 @@ object GuestDex {
         packageName: String,
         data: File,
         obb: File,
+        cpuInfo: String,
         entries: List<DexEntry>,
     ): String {
         val hostApk = File(host.applicationInfo.sourceDir)
@@ -237,6 +244,7 @@ object GuestDex {
             append(packageName).append('|')
             append(data.absolutePath).append('|')
             append(obb.absolutePath).append('|')
+            append(cpuInfo).append('|')
             append(hostApk.length()).append('|')
             append(hostApk.lastModified()).append('|')
             for (entry in entries) {
@@ -262,6 +270,7 @@ object GuestDex {
         packageName: String,
         data: File,
         obb: File,
+        cpuInfo: String,
         root: File,
         directory: File,
         entries: List<DexEntry>,
@@ -281,7 +290,7 @@ object GuestDex {
                     zip.getInputStream(source).use { input ->
                         target.outputStream().use { output -> input.copyTo(output) }
                     }
-                    rewrite(target, packageName, data, obb, onStage)
+                    rewrite(target, packageName, data, obb, cpuInfo, onStage)
                     target.setReadOnly()
                 }
             }
@@ -390,7 +399,12 @@ object GuestDex {
         return value
     }
 
-    private fun rules(packageName: String, data: String, obb: String): List<Pair<String, String>> {
+    private fun rules(
+        packageName: String,
+        data: String,
+        obb: String,
+        cpuInfo: String,
+    ): List<Pair<String, String>> {
         // Every spelling of the shared storage root names the container's folder:
         // the same path the framework's answer is redirected to (GuestEnvironment),
         // so a literal and a composed path reach the same files. A path already
@@ -398,6 +412,14 @@ object GuestDex {
         // nested inside itself.
         val external = GuestStorage.root().absolutePath
         return listOf(
+            // A guest that asks the kernel what its CPU can do from Java reads
+            // this process's /proc/cpuinfo, which describes the phone's AArch64
+            // core: an architecture of 8 and a Features line without "vfp".
+            // Unity's loader reads it exactly that way, concludes the hardware is
+            // unsupported and never loads its engine. The runtime writes the core
+            // the JIT emulates for native readers, and this is the same file, so
+            // both halves of a guest describe one CPU.
+            "/proc/cpuinfo" to cpuInfo,
             external to external,
             "/storage/emulated/0/Android/data/$packageName" to data,
             "/mnt/sdcard/Android/data/$packageName" to data,

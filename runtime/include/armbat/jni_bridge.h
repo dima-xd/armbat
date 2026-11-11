@@ -59,6 +59,15 @@ public:
     // own native loop never enters Java, so it has to ask.
     void ReleaseThreadReferences();
 
+    // Drops a throwable the guest left pending before control goes back to the
+    // Java half of the process. The guest's native entry points are called from
+    // Java, so an exception it raises is still pending on this thread when the
+    // entry point returns; CheckJNI ends the process at the first JNI call made
+    // with one, and an entry point that has to answer with a value (a report
+    // string, the result of a call) cannot make that call at all. `where` names
+    // the entry point in the log.
+    void DropGuestException(const char* where);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

@@ -503,7 +503,11 @@ struct JniBridge::Impl {
     // the platform of that era answered: null. ExceptionCheck and the other
     // three inspection entries are exempt, so a guest that looks first still
     // sees it.
-    static void DropPendingException(JNIEnv* env, std::size_t next_index) {
+    //
+    // `context` names where the throwable was found: a guest env call, or the
+    // return to the Java half of this process, which is the same trap seen from
+    // the other side.
+    static void DropPendingException(JNIEnv* env, const char* context) {
         if (!env->ExceptionCheck()) {
             return;
         }
@@ -545,9 +549,9 @@ struct JniBridge::Impl {
         }
         if (LogAllowed("jni-pending", 16)) {
             ARMBAT_LOG_WARN("Armbat",
-                                "jni: dropped %s%s%s from the guest's native side before call #%zu",
+                                "jni: dropped %s%s%s from the guest's native side %s",
                                 type_name.c_str(), message.empty() ? "" : ": ", message.c_str(),
-                                next_index);
+                                context);
         }
         env->DeleteLocalRef(thrown);
     }
@@ -2941,7 +2945,9 @@ struct JniBridge::Impl {
         // aborts under CheckJNI. See DropPendingException.
         if (index != JNI_IDX(ExceptionCheck) && index != JNI_IDX(ExceptionOccurred) &&
             index != JNI_IDX(ExceptionDescribe) && index != JNI_IDX(ExceptionClear)) {
-            DropPendingException(HostEnv(), index);
+            char context[48];
+            std::snprintf(context, sizeof(context), "before call #%zu", index);
+            DropPendingException(HostEnv(), context);
         }
         current_env_index = index;
         current_env_lr = machine_ref.Reg(14);
@@ -3427,6 +3433,14 @@ JniBridge::~JniBridge() {
 }
 
 JNIEnv* JniBridge::HostEnvironment() const { return HostEnv(); }
+
+void JniBridge::DropGuestException(const char* where) {
+    JNIEnv* env = HostEnv();
+    if (env == nullptr) {
+        return;
+    }
+    Impl::DropPendingException(env, where);
+}
 
 void JniBridge::ReleaseThreadReferences() { impl_->ReleaseThreadRefs(); }
 

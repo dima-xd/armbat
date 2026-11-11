@@ -52,6 +52,23 @@ bool EndsWith(const std::string& text, const char* suffix) {
     return text.size() >= length && text.compare(text.size() - length, length, suffix) == 0;
 }
 
+// The entry that holds the code of one library name.
+//
+// An archive built to keep its libraries out of the install-time extraction
+// ships a loader proxy under lib/<abi>/ and the image that proxy would load
+// under assets/libs/<abi>/. The proxy is not the library: it reads the
+// application's Java half -- UnityPlayer.currentActivity, then
+// getPackageCodePath -- and links the asset itself, which is something only a
+// device with the application running can do. The container maps the libraries
+// before that Java half exists, so it takes the image and leaves the loader
+// stub to System.loadLibrary, where the platform would have found it too.
+std::string LibraryEntryName(const GuestApk& apk, const std::string& library) {
+    const std::string& abi = apk.AbiDirectory();
+    // "lib/armeabi-v7a/" and "assets/libs/armeabi-v7a/" share the tail.
+    const std::string asset = "assets/libs/" + abi.substr(4) + library;
+    return apk.Find(asset) != nullptr ? asset : abi + library;
+}
+
 }  // namespace
 
 GuestApk::~GuestApk() {
@@ -376,7 +393,7 @@ bool GuestApk::LoadNativeLibraries(DynamicLoader& dynamic, Elf32Loader& loader,
     std::vector<Pending> pending;
     for (const std::string& library : NativeLibraries()) {
         Pending entry;
-        entry.name = abi_directory_ + library;
+        entry.name = LibraryEntryName(*this, library);
         entry.soname = library;
         entry.path = directory + "/" + library;
 
@@ -482,7 +499,7 @@ bool GuestApk::ExtractNativeLibraries(const std::string& directory,
     }
     ::mkdir(directory.c_str(), 0755);
     for (const std::string& library : NativeLibraries()) {
-        const std::string entry_name = abi_directory_ + library;
+        const std::string entry_name = LibraryEntryName(*this, library);
         std::vector<std::uint8_t> image;
         if (!Read(entry_name, &image, error)) {
             return false;

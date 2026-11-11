@@ -126,6 +126,11 @@ Java_dev_armbat_GuestNatives_loadArchive(JNIEnv* env, jobject /*self*/, jstring 
         apk, cache, static_cast<std::uint32_t>(target_sdk < 0 ? 0 : target_sdk),
         StringOf(env, data_root), StringOf(env, obb_root), StringOf(env, package_name),
         StringOf(env, shared_root));
+    // Mapping the libraries runs their initializers, which are guest code: a
+    // throwable they left pending would abort CheckJNI on the call below.
+    if (g_container) {
+        g_container->Jni().DropGuestException("before the native entry point returned");
+    }
     return env->NewStringUTF(text.c_str());
 }
 
@@ -152,6 +157,12 @@ Java_dev_armbat_GuestNatives_registerNatives(JNIEnv* env, jobject /*self*/, jobj
                 std::chrono::duration_cast<std::chrono::milliseconds>(on_load_done - started).count()));
     } catch (const std::exception& failure) {
         text = std::string("natives: error: ") + failure.what() + "\n";
+    }
+    // JNI_OnLoad is guest code called from Java: an archive whose loader refuses
+    // something leaves its exception pending, and answering with the report
+    // string would end the process under CheckJNI instead of reporting it.
+    if (g_container) {
+        g_container->Jni().DropGuestException("before the native entry point returned");
     }
     LogLines(text);
     return env->NewStringUTF(text.c_str());
