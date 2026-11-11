@@ -49,9 +49,14 @@ public:
     GuestHeap& Heap();
     HleRegistry& Imports();
     DynamicLoader& Modules();
-    // Runs the JNI_OnLoad of every mapped library. It needs the archive's
-    // class loader, so it must follow Jni().RegisterExports.
-    std::string CallOnLoad();
+    // Runs the JNI_OnLoad of the mapped library the archive's Java side is
+    // loading, named as System.loadLibrary names it ("unity") or as the file
+    // does ("libunity.so"). The platform calls the entry at that point, not at
+    // map time: a library reads the Java state its own caller has set up by
+    // then. Answers false when no entry is pending -- the library has none, or
+    // it already ran -- and stores the version the entry returned otherwise.
+    // It needs the archive's class loader, so it must follow RegisterExports.
+    bool CallOnLoad(const std::string& library, std::uint32_t* version);
 
     Elf32Loader& Loader();
     JniBridge& Jni();

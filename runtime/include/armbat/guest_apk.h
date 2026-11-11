@@ -82,6 +82,9 @@ public:
     // virtual up front so the dependency check accepts them, and cycles still
     // fail with the name of the library that could not be satisfied.
     struct LoadedNative {
+        // The name of the extracted file, which is what the archive's Java side
+        // passes to System.loadLibrary, and the name the image calls itself.
+        std::string file;
         std::string soname;
         std::uint32_t base = 0;
     };

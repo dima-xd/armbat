@@ -99,7 +99,11 @@ constexpr std::uint32_t kKuserPageAddr = 0xffff0000;
 // mapping; the page is between the main stack and the stub region, which nothing
 // else claims.
 constexpr std::uint32_t kWorkerJobsAddr = 0x00d00000;
-constexpr std::uint32_t kWorkerSlots = 8;
+// One context per platform thread that is inside a guest call. Unity reaches
+// native code from a dozen Java threads (network, audio, the engine's own), so
+// the pool covers the peak of a busy engine rather than the container's
+// historical few; a thread that exits hands its slot back.
+constexpr std::uint32_t kWorkerSlots = 24;
 
 // Mirror of `struct armbat_context` in runtime/guest/attach.c: the two sides
 // talk through one page, so the layout is a contract, not an implementation
@@ -113,6 +117,15 @@ struct WorkerContext {
 
 static_assert(sizeof(WorkerContext) == 16, "the guest lender stub expects this layout");
 static_assert(kWorkerSlots * sizeof(WorkerContext) <= 0x1000, "the contexts must fit one page");
+
+// A library whose JNI_OnLoad has not run yet. The file name is what
+// System.loadLibrary asks for; the soname is what the image calls itself and
+// the two differ (the archive's libunity.so names itself libunity_proxy.so).
+struct PendingOnLoad {
+    std::string file;
+    std::string soname;
+    std::uint32_t entry = 0;
+};
 
 bool InstallKernelHelpers(GuestArena& arena) {
     if (!arena.Map(kKuserPageAddr, 0x1000)) {
@@ -218,11 +231,20 @@ bool WriteTextFile(const std::string& path, const std::string& text) {
 
 }  // namespace
 
+// The container whose contexts platform threads borrow. A thread-local context
+// can outlive it only while the process tears down, and giving a slot back to a
+// destroyed container would be a use-after-free. The pointer is opaque here
+// because the implementation type is private to GuestContainer.
+std::atomic<void*> g_context_owner{nullptr};
+
 struct GuestContainer::Impl {
+    ~Impl() { g_context_owner.store(nullptr, std::memory_order_release); }
+
     bool Start(std::string* error) {
         if (ready) {
             return true;
         }
+        g_context_owner.store(this, std::memory_order_release);
         if (!arena.Ok()) {
             *error = arena.Error() != nullptr ? arena.Error() : "cannot reserve the arena";
             return false;
@@ -606,6 +628,13 @@ struct GuestContainer::Impl {
             }
         }
         context_count = ready;
+        {
+            const std::lock_guard lock(context_mutex);
+            free_contexts.clear();
+            for (int i = 0; i < context_count; ++i) {
+                free_contexts.push_back(i);
+            }
+        }
         ARMBAT_LOG_INFO("Armbat", "contexts: %d guest threads at 0x%08x",
                             context_count, contexts_addr);
     }
@@ -639,7 +668,8 @@ struct GuestContainer::Impl {
     // built on the stack and TLS of a parked guest thread. Null when every
     // context is taken, which the caller reports instead of running the call on
     // a machine another thread is using.
-    A32Machine* AttachHere() {
+    A32Machine* AttachHere(int* slot) {
+        *slot = -1;
         if (context_count == 0) {
             return nullptr;
         }
@@ -647,11 +677,12 @@ struct GuestContainer::Impl {
         int index = -1;
         {
             const std::lock_guard lock(context_mutex);
-            if (next_context < context_count) {
-                index = next_context++;
+            if (!free_contexts.empty()) {
+                index = free_contexts.back();
+                free_contexts.pop_back();
             }
         }
-        if (index < 0) {
+        if (index < 0 || index >= context_count) {
             ARMBAT_LOG_ERROR("Armbat",
                                 "contexts: tid=%d needs one and all %d are taken", ::gettid(),
                                 context_count);
@@ -659,10 +690,41 @@ struct GuestContainer::Impl {
         }
         const WorkerContext& context = contexts[index];
         A32Machine* attached_machine = AttachMachine(context.tls, context.sp);
+        *slot = index;
         ARMBAT_LOG_INFO("Armbat",
                             "contexts: tid=%d took slot %d tls=0x%08x sp=0x%08x", ::gettid(),
                             index, context.tls, context.sp);
         return attached_machine;
+    }
+
+    // A platform thread that exits gives its context back. The machine is that
+    // thread's alone -- nothing else ever ran on it -- so it is dropped with the
+    // JIT code it translated, and the slot returns to the pool for the next Java
+    // thread ART hands a native call to.
+    void ReleaseContext(int index, A32Machine* attached_machine) {
+        armbat::UnregisterLiveGuestThread(*attached_machine);
+        const std::uint32_t processor = attached_machine->ProcessorId();
+        if (const auto monitor = attached_machine->Settings().exclusive_monitor) {
+            monitor->ClearProcessor(processor);
+        }
+        {
+            const std::lock_guard lock(context_mutex);
+            for (auto it = attached.begin(); it != attached.end(); ++it) {
+                if (it->get() == attached_machine) {
+                    attached.erase(it);
+                    break;
+                }
+            }
+            if (index >= 0 && index < context_count) {
+                free_contexts.push_back(index);
+            }
+        }
+        {
+            const std::lock_guard lock(processor_mutex);
+            if (processor < A32Machine::Config::kProcessorLimit) {
+                free_processors.push_back(processor);
+            }
+        }
     }
 
     bool StartBionic(const std::string& cache_dir, std::uint32_t target_sdk, std::string* error) {
@@ -906,9 +968,11 @@ struct GuestContainer::Impl {
     // else, so the guest tree is the only thing the link path reveals.
     std::string armbat_root;
     std::string app_lib_dir;
-    // Libraries exporting JNI_OnLoad, in load order, waiting for the guest
-    // class loader to exist.
-    std::vector<std::pair<std::string, std::uint32_t>> on_load;
+    // Libraries exporting JNI_OnLoad, in load order, waiting for the guest's
+    // Java side to load them. The file name is what System.loadLibrary asks
+    // for; the soname is what the image calls itself and the two differ (the
+    // archive's libunity.so names itself libunity_proxy.so).
+    std::vector<PendingOnLoad> on_load;
     // Java_* entry points of the libraries the bionic path loaded, for the JNI
     // bridge to register with the host runtime.
     std::vector<GuestExport> bionic_exports;
@@ -928,13 +992,17 @@ struct GuestContainer::Impl {
     // Guest contexts lent to platform threads: the stacks and TLS blocks of
     // guest threads that do nothing but park, plus the machines the container
     // builds on top of them. A platform thread takes one on its first native
-    // call and keeps it, because the guest keeps state in it -- errno, the
-    // allocator's thread cache -- and a thread that swapped contexts would lose
-    // it between two calls.
+    // call and keeps it while it lives, because the guest keeps state in it --
+    // errno, the allocator's thread cache -- and a thread that swapped contexts
+    // would lose it between two calls.
     std::uint32_t contexts_addr = 0;
     int context_count = 0;
     std::mutex context_mutex;
-    int next_context = 0;
+    // Slots that are free to lend. A platform thread takes one on its first
+    // native call and hands it back when it exits: ART keeps a pool of Java
+    // threads and drops them as the pool shrinks, and a context that a dead
+    // thread still holds is one the next native call cannot have.
+    std::vector<int> free_contexts;
     std::vector<std::shared_ptr<A32Machine>> attached;
 
     std::uint32_t native_activity = 0;
@@ -1011,22 +1079,37 @@ bool GuestContainer::RunOnGuestThread(std::uint32_t entry, const std::vector<std
                                       std::uint32_t* result, std::uint32_t* result_high) {
     Impl& impl = *impl_;
     // One guest context per platform thread, taken on its first native call and
-    // kept: the guest keeps errno and the allocator's thread cache in the TLS
-    // block, so a thread that swapped contexts would lose them between calls.
+    // kept while the thread lives: the guest keeps errno and the allocator's
+    // thread cache in the TLS block, so a thread that swapped contexts would
+    // lose them between calls. It is handed back on the thread's way out.
     struct ThreadContext {
         Impl* owner = nullptr;
         A32Machine* machine = nullptr;
+        int slot = -1;
+        ~ThreadContext() {
+            if (machine != nullptr && owner != nullptr &&
+                g_context_owner.load(std::memory_order_acquire) ==
+                    static_cast<void*>(owner)) {
+                owner->ReleaseContext(slot, machine);
+            }
+            machine = nullptr;
+        }
     };
     thread_local ThreadContext mine;
     if (mine.owner != &impl) {
+        // The container was rebuilt under this thread (a second archive opened
+        // in the same process): the old context belongs to the old one.
         mine.owner = &impl;
         mine.machine = nullptr;
+        mine.slot = -1;
     }
     if (mine.machine == nullptr) {
-        mine.machine = impl.AttachHere();
+        int slot = -1;
+        mine.machine = impl.AttachHere(&slot);
         if (mine.machine == nullptr) {
             return false;
         }
+        mine.slot = slot;
     }
     A32Machine& target = *mine.machine;
     if (target.Executing()) {
@@ -1270,16 +1353,60 @@ std::string GuestContainer::DescribeAddress(std::uint32_t address) const {
     return "outside the loaded images";
 }
 
-std::string GuestContainer::CallOnLoad() {
-    std::string report = "JNI_OnLoad:";
-    for (const auto& [soname, entry] : impl_->on_load) {
-        const std::uint32_t version = impl_->Invoke(entry, {impl_->jni->GuestVm(), 0});
-        char line[96];
-        std::snprintf(line, sizeof(line), " %s=0x%08x", soname.c_str(), version);
-        report += line;
+bool GuestContainer::CallOnLoad(const std::string& library, std::uint32_t* version) {
+    // System.loadLibrary takes the name without prefix and suffix; the mapped
+    // images are known by their file name. A native caller may hand over either
+    // form, and the soname is a third.
+    std::string file = library;
+    const std::size_t slash = file.find_last_of('/');
+    if (slash != std::string::npos) {
+        file = file.substr(slash + 1);
     }
-    impl_->on_load.clear();
-    return report + "\n";
+    if (file.compare(0, 3, "lib") != 0) {
+        file = "lib" + file;
+    }
+    if (file.size() < 3 || file.compare(file.size() - 3, 3, ".so") != 0) {
+        file += ".so";
+    }
+    for (auto entry = impl_->on_load.begin(); entry != impl_->on_load.end(); ++entry) {
+        if (entry->file != file && entry->soname != file && entry->soname != library) {
+            continue;
+        }
+        // The entry runs on the thread that is loading the library, the way an
+        // imported native does: JNI_OnLoad is guest code reached from Java, and
+        // a platform thread has no ARM stack or TLS of its own. The boot machine
+        // cannot stand in for it -- that thread may still be parked in the boot
+        // program, and its registers and TLS belong to it alone.
+        const std::uint32_t vm = impl_->jni->GuestVm();
+        std::uint32_t value = 0;
+        if (A32Machine* current = CurrentGuestMachine(); current != nullptr) {
+            // A load issued by guest code that this call already runs: it nests
+            // on that thread's machine, where the Java frame above it lives.
+            if (current->Executing()) {
+                current->CallNested(entry->entry, {vm, 0});
+            } else {
+                current->CallFunction(entry->entry, {vm, 0});
+            }
+            value = current->Reg(0);
+        } else {
+            std::uint32_t high = 0;
+            if (!RunOnGuestThread(entry->entry, {vm, 0}, &value, &high)) {
+                return false;
+            }
+        }
+        // A refusing entry leaves the library unloaded on the platform, and the
+        // next load tries it again: a caller that has set up the state the entry
+        // reads by then gets a different answer. A successful one never runs a
+        // second time.
+        if (value != 0) {
+            impl_->on_load.erase(entry);
+        }
+        if (version != nullptr) {
+            *version = value;
+        }
+        return true;
+    }
+    return false;
 }
 
 std::string GuestContainer::LoadApk(const std::string& apk_path, const std::string& cache_dir,
@@ -1395,7 +1522,7 @@ std::string GuestContainer::LoadApk(const std::string& apk_path, const std::stri
         }
         const std::uint32_t on_load = impl_->bionic->Dlsym(handle, "JNI_OnLoad");
         if (on_load != 0) {
-            impl_->on_load.emplace_back(library.soname, on_load);
+            impl_->on_load.push_back(PendingOnLoad{library.file, library.soname, on_load});
         }
         impl_->bionic_handles.push_back(handle);
         // Java entry points exported by name: the JNI bridge registers them with
@@ -1502,13 +1629,13 @@ std::string GuestContainer::LoadApk(const std::string& apk_path, const std::stri
     impl_->on_load.clear();
     for (const GuestApk::LoadedNative& item : loaded) {
         const std::uint32_t on_load = impl_->dynamic->Symbol(item.base, "JNI_OnLoad");
-        // The platform runs JNI_OnLoad as part of loading the library, and
-        // libraries use it to cache the JavaVM and to look their own Java
-        // classes up. FindClass goes through the archive's class loader, which
-        // only exists once the Java side has handed it over, so the call waits
-        // for RegisterExports to install it.
+        // The platform runs JNI_OnLoad as part of System.loadLibrary, not at
+        // map time, and libraries use it to read the Java state their caller
+        // has set up by then. FindClass goes through the archive's class
+        // loader, which only exists once the Java side has handed it over, so
+        // the call waits for the guest to load the library (CallOnLoad).
         if (on_load != 0) {
-            impl_->on_load.emplace_back(item.soname, on_load);
+            impl_->on_load.push_back(PendingOnLoad{item.soname, item.soname, on_load});
         }
         char line[192];
         std::snprintf(line, sizeof(line), "  %-28s 0x%08x  %s\n", item.soname.c_str(), item.base,

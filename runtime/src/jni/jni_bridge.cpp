@@ -3370,15 +3370,27 @@ std::uint64_t JniBridge::Impl::Dispatch(std::uint64_t* frame, std::uint64_t* sta
     std::uint32_t r0 = 0;
     std::uint32_t r1 = 0;
     A32Machine* const current = CurrentGuestMachine();
-    if (current != nullptr || !container.RunOnGuestThread(entry, args, &r0, &r1)) {
-        A32Machine& target = current != nullptr ? *current : machine;
-        if (target.Executing()) {
-            target.CallNested(entry, args);
+    if (current != nullptr) {
+        if (current->Executing()) {
+            current->CallNested(entry, args);
         } else {
-            target.CallFunction(entry, args);
+            current->CallFunction(entry, args);
         }
-        r0 = target.Reg(0);
-        r1 = target.Reg(1);
+        r0 = current->Reg(0);
+        r1 = current->Reg(1);
+    } else if (!container.RunOnGuestThread(entry, args, &r0, &r1)) {
+        // Every context is lent to a live platform thread. The engine's own
+        // machine is not an alternative: a second thread inside one Jit is what
+        // Dynarmic asserts on, and the boot thread's stack and TLS cannot carry
+        // this thread's frames anyway. The call is refused, and the Java side
+        // sees the null/zero answer a native that ran out of threads would give.
+        static std::atomic<int> refused{0};
+        if (refused.fetch_add(1, std::memory_order_relaxed) < 8) {
+            ARMBAT_LOG_ERROR("Armbat", "jni: no guest context for native 0x%08x %s", entry,
+                                signature.c_str());
+        }
+        r0 = 0;
+        r1 = 0;
     }
 
     // Java reads a direct buffer as soon as this method returns, so anything the

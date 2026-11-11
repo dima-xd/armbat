@@ -385,6 +385,7 @@ bool GuestApk::LoadNativeLibraries(DynamicLoader& dynamic, Elf32Loader& loader,
 
     struct Pending {
         std::string name;      // entry name inside the APK
+        std::string file;      // name of the extracted file
         std::string soname;
         std::string path;      // host path after extraction
         std::vector<std::string> needed;
@@ -394,6 +395,7 @@ bool GuestApk::LoadNativeLibraries(DynamicLoader& dynamic, Elf32Loader& loader,
     for (const std::string& library : NativeLibraries()) {
         Pending entry;
         entry.name = LibraryEntryName(*this, library);
+        entry.file = library;
         entry.soname = library;
         entry.path = directory + "/" + library;
 
@@ -472,7 +474,7 @@ bool GuestApk::LoadNativeLibraries(DynamicLoader& dynamic, Elf32Loader& loader,
             --remaining;
             progress = true;
             if (loaded != nullptr) {
-                loaded->push_back(LoadedNative{pending[index].soname, base});
+                loaded->push_back(LoadedNative{pending[index].file, pending[index].soname, base});
             }
         }
         if (!progress) {

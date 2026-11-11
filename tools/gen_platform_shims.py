@@ -214,6 +214,12 @@ def build(ndk: str, out_dir: str, api: int, libraries: list[str]) -> int:
             "-nostdlib",
             "-Wl,-soname," + library + ".so",
             "-Wl,--build-id=none",
+            # Old guest loaders bundled inside games (Unity's proxy stubs, for
+            # one) predate DT_GNU_HASH and walk the SysV bucket/chain table
+            # without checking that it exists: a library carrying only the GNU
+            # table makes them divide by a zero bucket count. System libraries
+            # of that era carried both, so the shims do too.
+            "-Wl,--hash-style=both",
             "-Wl,-z,noexecstack",
             "-o",
             target,

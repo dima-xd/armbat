@@ -116,6 +116,18 @@ class GuestLauncher(private val host: Activity) {
             }
             return super.findResource(name)
         }
+
+        /**
+         * The platform runs a library's JNI_OnLoad when System.loadLibrary
+         * loads it, after the archive's Java code has set up the state the
+         * entry reads. The stand-ins here are empty files, so the archive's own
+         * entry is run now, at that same point; a library without one passes
+         * through untouched.
+         */
+        override fun findLibrary(name: String): String? {
+            GuestNatives.libraryLoaded(name)
+            return super.findLibrary(name)
+        }
     }
 
     private class GuestContext(

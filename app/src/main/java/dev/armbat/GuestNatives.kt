@@ -49,6 +49,18 @@ internal object GuestNatives {
     external fun registerNatives(loader: ClassLoader): String
 
     /**
+     * Runs the archive's JNI_OnLoad for the library its Java side is loading
+     * through System.loadLibrary, the point where the platform calls it: the
+     * entry reads Java state the caller has set up by then (Unity's proxy asks
+     * UnityPlayer.currentActivity for the archive's path).
+     *
+     * Answers the version the archive returned, or -1 when the library has no
+     * pending entry. Throws [UnsatisfiedLinkError] when the entry refuses, the
+     * way a failed load fails on the platform.
+     */
+    external fun libraryLoaded(name: String): Int
+
+    /**
      * Starts the archive's native activity. Mirrors what android.app.NativeActivity
      * does once it has loaded the library: the archive's ANativeActivity_onCreate
      * runs with the container's activity as its Java side.

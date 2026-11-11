@@ -147,25 +147,59 @@ Java_dev_armbat_GuestNatives_registerNatives(JNIEnv* env, jobject /*self*/, jobj
         const auto started = std::chrono::steady_clock::now();
         text = g_container->Jni().RegisterExports(env, loader);
         const auto registered = std::chrono::steady_clock::now();
-        text += g_container->CallOnLoad();
-        const auto on_load_done = std::chrono::steady_clock::now();
-        ARMBAT_LOG_INFO("Armbat",
-            "startup: natives registered at %lld ms, JNI_OnLoad done at %lld ms",
+        ARMBAT_LOG_INFO("Armbat", "startup: natives registered at %lld ms",
             static_cast<long long>(
-                std::chrono::duration_cast<std::chrono::milliseconds>(registered - started).count()),
-            static_cast<long long>(
-                std::chrono::duration_cast<std::chrono::milliseconds>(on_load_done - started).count()));
+                std::chrono::duration_cast<std::chrono::milliseconds>(registered - started).count()));
     } catch (const std::exception& failure) {
         text = std::string("natives: error: ") + failure.what() + "\n";
     }
-    // JNI_OnLoad is guest code called from Java: an archive whose loader refuses
-    // something leaves its exception pending, and answering with the report
-    // string would end the process under CheckJNI instead of reporting it.
+    // The archive's own JNI_OnLoad runs when its Java side loads the library,
+    // through libraryLoaded below: the platform calls it at that point too.
     if (g_container) {
         g_container->Jni().DropGuestException("before the native entry point returned");
     }
     LogLines(text);
     return env->NewStringUTF(text.c_str());
+}
+
+// The archive's Java side has just called System.loadLibrary, which is where
+// the platform runs the library's JNI_OnLoad: the entry reads Java state that
+// the caller has set up by then (Unity's proxy asks UnityPlayer.currentActivity
+// for the archive's own path). The images are already mapped by the container,
+// so only the entry is left to run.
+//
+// This method is reached from inside a guest Java call that may already hold
+// g_mutex (an Activity constructor runs under the lifecycle entry), so it must
+// not take that mutex. A guest entry may load another library from the same
+// thread, hence the recursive one: re-entry is the platform's own behaviour.
+// Answers the version the archive returned, or -1 when the library has no
+// pending entry (no JNI_OnLoad, or it already ran).
+extern "C" JNIEXPORT jint JNICALL
+Java_dev_armbat_GuestNatives_libraryLoaded(JNIEnv* env, jobject /*self*/, jstring library) {
+    armbat::GuestContainer* container = g_container.get();
+    if (container == nullptr) {
+        return -1;
+    }
+    static std::recursive_mutex mutex;
+    const std::lock_guard<std::recursive_mutex> lock(mutex);
+    const std::string name = StringOf(env, library);
+    std::uint32_t version = 0;
+    if (!container->CallOnLoad(name, &version)) {
+        return -1;
+    }
+    ARMBAT_LOG_INFO("Armbat", "JNI_OnLoad: %s=0x%08x", name.c_str(), version);
+    if (version == 0) {
+        // The platform fails System.loadLibrary when the entry refuses, and the
+        // archive's own catch decides what to do with that.
+        jclass error = env->FindClass("java/lang/UnsatisfiedLinkError");
+        if (error != nullptr) {
+            const std::string message = "JNI_OnLoad failed in " + name;
+            env->ThrowNew(error, message.c_str());
+            env->DeleteLocalRef(error);
+        }
+        return 0;
+    }
+    return static_cast<jint>(version);
 }
 
 // The archive's Java activity, handed over before onCreate. ANativeActivity.clazz
