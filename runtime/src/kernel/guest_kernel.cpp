@@ -268,6 +268,117 @@ std::uint64_t Split64(std::uint32_t low, std::uint32_t high) {
     return static_cast<std::uint64_t>(low) | (static_cast<std::uint64_t>(high) << 32);
 }
 
+bool IsRegularFile(int fd) {
+    struct stat host {};
+    return ::fstat(fd, &host) == 0 && S_ISREG(host.st_mode);
+}
+
+// `read` on a regular file answers the whole request unless it reaches the end of
+// the file. A guest is entitled to that: an application's files sit on ext4, but
+// the archive it reads its own data from sits on shared storage, where the
+// platform's FUSE layer caps every call at its max_read. Passing the short answer
+// through hands the guest a buffer whose tail still holds whatever the heap had
+// there. Unity 3.5 reads its APK that way -- one read per object -- and kept
+// parsing the stale tail as mesh data until a heap pointer reached a string
+// length and killed the loading thread. Answer regular files in full; pipes,
+// sockets and ttys keep their own semantics, where a short answer is the answer.
+ssize_t ReadFully(int fd, void* out, std::size_t count) {
+    auto* bytes = static_cast<std::uint8_t*>(out);
+    std::size_t done = 0;
+    while (done < count) {
+        const ssize_t got = ::read(fd, bytes + done, count - done);
+        if (got < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return done == 0 ? -1 : static_cast<ssize_t>(done);
+        }
+        if (got == 0) {
+            break;
+        }
+        done += static_cast<std::size_t>(got);
+    }
+    return static_cast<ssize_t>(done);
+}
+
+ssize_t PreadFully(int fd, void* out, std::size_t count, off_t offset) {
+    auto* bytes = static_cast<std::uint8_t*>(out);
+    std::size_t done = 0;
+    while (done < count) {
+        const ssize_t got = ::pread(fd, bytes + done, count - done,
+                                    offset + static_cast<off_t>(done));
+        if (got < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return done == 0 ? -1 : static_cast<ssize_t>(done);
+        }
+        if (got == 0) {
+            break;
+        }
+        done += static_cast<std::size_t>(got);
+    }
+    return static_cast<ssize_t>(done);
+}
+
+// How much of `count` at `address` the guest actually mapped. A kernel copies a
+// read into the caller's pages as it goes: a request that reaches the end of the
+// file before it reaches an unmapped page succeeds with a short count, and only a
+// copy that really has to step past the mapping fails with EFAULT. Rejecting the
+// whole range up front -- what the container did -- turns every such call into an
+// error the guest reads as "the file ended here", and a loader that trusts its
+// own size stops at that point without a fault, a log line or a crash.
+std::uint32_t MappedPrefix(const GuestArena& arena, std::uint32_t address,
+                           std::uint32_t count) {
+    if (count == 0) {
+        return 0;
+    }
+    if (!arena.IsMapped(address, 1)) {
+        return 0;
+    }
+    const std::uint64_t room = arena.MappedEnd(address) - address;
+    return static_cast<std::uint32_t>(
+        std::min<std::uint64_t>(room, static_cast<std::uint64_t>(count)));
+}
+
+// read() as the host kernel would have answered it: fill the mapped prefix,
+// complete the request for a regular file, and report EFAULT only when the data
+// would have run past the mapping.
+std::int32_t ReadInto(int fd, GuestArena& arena, std::uint32_t buffer, std::uint32_t count) {
+    const std::uint32_t length = MappedPrefix(arena, buffer, count);
+    if (length == 0) {
+        return count == 0 ? 0 : -EFAULT;
+    }
+    const ssize_t result = IsRegularFile(fd) ? ReadFully(fd, arena.Ptr(buffer), length)
+                                             : ::read(fd, arena.Ptr(buffer), length);
+    if (result < 0) {
+        return -errno;
+    }
+    if (length != count && static_cast<std::uint32_t>(result) == length) {
+        return -EFAULT;
+    }
+    return ClampSize(result);
+}
+
+std::int32_t PreadInto(int fd, GuestArena& arena, std::uint32_t buffer, std::uint32_t count,
+                       std::uint64_t offset) {
+    const std::uint32_t length = MappedPrefix(arena, buffer, count);
+    if (length == 0) {
+        return count == 0 ? 0 : -EFAULT;
+    }
+    const ssize_t result =
+        IsRegularFile(fd)
+            ? PreadFully(fd, arena.Ptr(buffer), length, static_cast<off_t>(offset))
+            : ::pread(fd, arena.Ptr(buffer), length, static_cast<off_t>(offset));
+    if (result < 0) {
+        return -errno;
+    }
+    if (length != count && static_cast<std::uint32_t>(result) == length) {
+        return -EFAULT;
+    }
+    return ClampSize(result);
+}
+
 // The guest's 32-bit `struct epoll_event`: 4 bytes of events and an 8-byte
 // union aligned to 8, so 16 bytes with padding.
 struct GuestEpollEvent {
@@ -784,11 +895,7 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
         const int fd = static_cast<int>(args[0]);
         const std::uint32_t buffer = args[1];
         const std::uint32_t count = std::min<std::uint32_t>(args[2], INT32_MAX);
-        if (count != 0 && !arena_.IsMapped(buffer, count)) {
-            return -EFAULT;
-        }
-        const ssize_t result = ::read(fd, arena_.Ptr(buffer), count);
-        return result < 0 ? -errno : ClampSize(result);
+        return ReadInto(fd, arena_, buffer, count);
     }
 
     case kSysWrite: {
@@ -827,11 +934,25 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
                         vector_count * sizeof(GuestIoVec));
         }
         std::size_t total = 0;
-        for (const GuestIoVec& vector : guest_vectors) {
-            if (!arena_.IsMapped(vector.base, vector.length)) {
-                return -EFAULT;
+        std::vector<std::uint32_t> lengths(guest_vectors.size(), 0);
+        bool clamped = false;
+        for (std::size_t index = 0; index < guest_vectors.size(); ++index) {
+            const GuestIoVec& vector = guest_vectors[index];
+            if (number == kSysWritev) {
+                if (!arena_.IsMapped(vector.base, vector.length)) {
+                    return -EFAULT;
+                }
+                lengths[index] = vector.length;
+            } else {
+                // A read only fails where the data really reaches the unmapped
+                // tail, the same rule as read() itself.
+                lengths[index] = MappedPrefix(arena_, vector.base, vector.length);
+                if (lengths[index] == 0 && vector.length != 0) {
+                    return -EFAULT;
+                }
+                clamped = clamped || lengths[index] != vector.length;
             }
-            total += vector.length;
+            total += lengths[index];
         }
         std::vector<char> buffer(total);
         std::size_t offset = 0;
@@ -852,18 +973,23 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
             const ssize_t result = ::write(fd, buffer.data(), buffer.size());
             return result < 0 ? -errno : ClampSize(result);
         }
-        const ssize_t result = ::read(fd, buffer.data(), buffer.size());
+        const ssize_t result = IsRegularFile(fd) ? ReadFully(fd, buffer.data(), buffer.size())
+                                                 : ::read(fd, buffer.data(), buffer.size());
         if (result < 0) {
             return -errno;
         }
-        for (const GuestIoVec& vector : guest_vectors) {
+        for (std::size_t index = 0; index < guest_vectors.size(); ++index) {
             const std::size_t chunk =
-                std::min<std::size_t>(vector.length, static_cast<std::size_t>(result) - offset);
+                std::min<std::size_t>(lengths[index],
+                                      static_cast<std::size_t>(result) - offset);
             if (chunk == 0) {
                 break;
             }
-            std::memcpy(arena_.Ptr(vector.base), buffer.data() + offset, chunk);
+            std::memcpy(arena_.Ptr(guest_vectors[index].base), buffer.data() + offset, chunk);
             offset += chunk;
+        }
+        if (clamped && static_cast<std::size_t>(result) == total && total != 0) {
+            return -EFAULT;
         }
         return ClampSize(result);
     }
@@ -879,14 +1005,14 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
         // caller's stack; reading r3:r4 instead asks the kernel for an offset of
         // (garbage << 0), which happily returns zero bytes at end of file.
         const std::uint64_t offset = Split64(args[4], args[5]);
+        if (number == kSysPread64) {
+            return PreadInto(fd, arena_, buffer, count, offset);
+        }
         if (count != 0 && !arena_.IsMapped(buffer, count)) {
             return -EFAULT;
         }
-        const ssize_t result = number == kSysPread64
-                                   ? ::pread(fd, arena_.Ptr(buffer), count,
-                                             static_cast<off_t>(offset))
-                                   : ::pwrite(fd, arena_.Ptr(buffer), count,
-                                              static_cast<off_t>(offset));
+        const ssize_t result = ::pwrite(fd, arena_.Ptr(buffer), count,
+                                       static_cast<off_t>(offset));
         return result < 0 ? -errno : ClampSize(result);
     }
 
@@ -2551,14 +2677,24 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
     case kSysGetdents64: {
         const int fd = static_cast<int>(args[0]);
         const std::uint32_t buffer = args[1];
-        const std::uint32_t length = std::min<std::uint32_t>(args[2], 1u << 20);
-        if (length != 0 && !arena_.IsMapped(buffer, length)) {
-            return -EFAULT;
+        const std::uint32_t requested = std::min<std::uint32_t>(args[2], 1u << 20);
+        // Entries are packed until the buffer is full, so a listing that ends
+        // before the unmapped tail is a complete answer -- unlike write(), where
+        // the whole range is read from the guest.
+        const std::uint32_t length = MappedPrefix(arena_, buffer, requested);
+        if (length == 0) {
+            return requested == 0 ? 0 : -EFAULT;
         }
         // linux_dirent64 is ABI-identical on 32-bit and 64-bit Linux, and the
         // descriptor is the host's own, so the call passes straight through.
         const long result = ::syscall(SYS_getdents64, fd, arena_.Ptr(buffer), length);
-        return result < 0 ? -errno : ClampSize(result);
+        if (result < 0) {
+            return -errno;
+        }
+        if (length != requested && static_cast<std::uint32_t>(result) == length) {
+            return -EFAULT;
+        }
+        return ClampSize(result);
     }
 
     case kSysStatfs64:

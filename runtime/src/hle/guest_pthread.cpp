@@ -52,6 +52,13 @@ constexpr int kEbusy = 16;
 // The mutex word: bit 0 is "locked", bit 1 is "waiters". The waiter bit is what
 // lets unlock know that somebody is asleep on the futex and has to be woken;
 // without it a waiter can go to sleep after the unlock and never be woken.
+//
+// The bit is sticky while the mutex has waiters: unlock leaves it set, and a
+// waiter that takes the lock keeps it. Clearing it on acquisition -- what this
+// did -- loses everybody except the one thread an unlock wakes, because the
+// second waiter is still asleep on the old value and no later unlock sees a
+// reason to wake it. Three threads on one mutex were enough to strand one of
+// them for the rest of the run.
 constexpr std::uint32_t kMutexLocked = 1;
 constexpr std::uint32_t kMutexWaiters = 2;
 
@@ -61,7 +68,6 @@ constexpr std::uint32_t kMutexWaiters = 2;
 // the shared bit and the owner/depth of a recursive mutex must survive
 // lock/unlock unchanged, otherwise a mutex the guest considers free looks
 // permanently held to us.
-constexpr std::uint32_t kMutexStateMask = 3;
 constexpr std::uint32_t kMutexTypeMask = 0xc000;
 constexpr std::uint32_t kMutexTypeRecursive = 0x4000;
 constexpr std::uint32_t kMutexSharedBit = 0x2000;
@@ -185,9 +191,8 @@ int MutexLock(std::uint32_t address, HleCall& call) {
     for (;;) {
         std::uint32_t current = __atomic_load_n(word, __ATOMIC_ACQUIRE);
         const std::uint32_t type = current & kMutexTypeMask;
-        const std::uint32_t state = current & kMutexStateMask;
-        if (type == kMutexTypeRecursive && (current >> kMutexOwnerShift) == tid &&
-            state == kMutexLocked) {
+        const bool locked = (current & kMutexLocked) != 0;
+        if (type == kMutexTypeRecursive && (current >> kMutexOwnerShift) == tid && locked) {
             // Owned by this thread already: recurse instead of deadlocking.
             if ((current & kMutexDepthMask) != kMutexDepthMask) {
                 const std::uint32_t next = current + kMutexDepthStep;
@@ -198,8 +203,10 @@ int MutexLock(std::uint32_t address, HleCall& call) {
             }
             continue;
         }
-        if (state == 0) {
-            std::uint32_t next = (current & ~kMutexStateMask) | kMutexLocked;
+        if (!locked) {
+            // Take it and keep the waiter bit that is already there: the threads
+            // that set it are still asleep and the next unlock has to see it.
+            std::uint32_t next = current | kMutexLocked;
             if (type == kMutexTypeRecursive) {
                 next = (next & ~(kMutexDepthMask | (0xffffu << kMutexOwnerShift))) |
                        (tid << kMutexOwnerShift);
@@ -210,7 +217,7 @@ int MutexLock(std::uint32_t address, HleCall& call) {
             }
             continue;
         }
-        if (state == kMutexLocked) {
+        if ((current & kMutexWaiters) == 0) {
             // Held with nobody waiting: set the waiter bit so unlock knows to
             // wake us, then sleep. Setting the bit is not an acquire.
             std::uint32_t next = current | kMutexWaiters;
@@ -231,9 +238,8 @@ int MutexTryLock(std::uint32_t address, HleCall& call) {
     for (;;) {
         std::uint32_t current = __atomic_load_n(word, __ATOMIC_ACQUIRE);
         const std::uint32_t type = current & kMutexTypeMask;
-        const std::uint32_t state = current & kMutexStateMask;
         if (type == kMutexTypeRecursive && (current >> kMutexOwnerShift) == tid &&
-            state == kMutexLocked) {
+            (current & kMutexLocked) != 0) {
             const std::uint32_t next = current + kMutexDepthStep;
             if (__atomic_compare_exchange_n(word, &current, next, false, __ATOMIC_ACQUIRE,
                                             __ATOMIC_RELAXED)) {
@@ -241,10 +247,10 @@ int MutexTryLock(std::uint32_t address, HleCall& call) {
             }
             continue;
         }
-        if (state != 0) {
+        if ((current & kMutexLocked) != 0) {
             return kEbusy;
         }
-        std::uint32_t next = (current & ~kMutexStateMask) | kMutexLocked;
+        std::uint32_t next = current | kMutexLocked;
         if (type == kMutexTypeRecursive) {
             next = (next & ~(kMutexDepthMask | (0xffffu << kMutexOwnerShift))) |
                    (tid << kMutexOwnerShift);
@@ -274,10 +280,14 @@ int MutexUnlock(std::uint32_t address, HleCall& call) {
             }
             continue;
         }
-        const std::uint32_t next = current & (kMutexTypeMask | kMutexSharedBit);
+        // Leave the waiter bit behind: the threads it stands for are still
+        // asleep, and only the next unlock can hand the level over to them.
+        const bool waiters = (current & kMutexWaiters) != 0;
+        const std::uint32_t next = (current & (kMutexTypeMask | kMutexSharedBit)) |
+                                   (waiters ? kMutexWaiters : 0);
         if (__atomic_compare_exchange_n(word, &current, next, false, __ATOMIC_RELEASE,
                                         __ATOMIC_RELAXED)) {
-            if ((current & kMutexWaiters) != 0) {
+            if (waiters) {
                 FutexWake(word, 1);
             }
             return kSuccess;

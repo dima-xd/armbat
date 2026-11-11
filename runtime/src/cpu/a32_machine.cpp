@@ -515,6 +515,40 @@ private:
                 DumpGuestTrace(pc, regs[14], regs[13], regs[11]);
                 DumpRecentBlocks();
                 DumpRecentCalls();
+                // TEMP: Subway Surfers 1.0.4 faults inside a stream reader and
+                // the reader's own fields say where its position stopped, which
+                // is the one fact the registers do not carry. Remove with the
+                // fix.
+                for (std::uint32_t base : {regs[4], regs[5]}) {
+                    if (!arena_.IsMapped(base, 32)) {
+                        continue;
+                    }
+                    std::uint32_t words[8];
+                    std::memcpy(words, arena_.Ptr(base), sizeof(words));
+                    ARMBAT_LOG_ERROR("Armbat",
+                                     "fault words: %08x: %08x %08x %08x %08x %08x %08x %08x %08x",
+                                     base, words[0], words[1], words[2], words[3], words[4],
+                                     words[5], words[6], words[7]);
+                    // The reader's own fields look like {position, buffer, end}:
+                    // the buffer's first and last words say which asset this is
+                    // and whether the position is where the format says it is.
+                    for (std::uint32_t sample :
+                         {words[1], words[0] >= 0x20 ? words[0] - 0x20 : 0}) {
+                        if (sample == 0 || !arena_.IsMapped(sample, 64)) {
+                            continue;
+                        }
+                        std::uint32_t peek[16];
+                        std::memcpy(peek, arena_.Ptr(sample), sizeof(peek));
+                        std::string text;
+                        char cell[16];
+                        for (std::uint32_t word : peek) {
+                            std::snprintf(cell, sizeof(cell), "%08x ", word);
+                            text += cell;
+                        }
+                        ARMBAT_LOG_ERROR("Armbat", "fault data: %08x: %s", sample,
+                                         text.c_str());
+                    }
+                }
             }
             // A fault has to stop the block. Running it again would re-execute
             // the same bad access forever: a load from an unmapped page returns
