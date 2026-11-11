@@ -3,9 +3,11 @@
 #include "armbat/guest_modules.h"
 #include "armbat/hle.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 
 #include <android/log.h>
 
@@ -585,6 +587,23 @@ public:
 
 }  // namespace
 
+namespace {
+
+// Code memory is shared, translation caches are not: a machine keeps its own
+// Jit, and dynarmic drops only the blocks of the Jit that was flushed. A guest
+// that rewrites instructions at run time -- Mono emits and patches ARM callsites
+// and flushes them immediately -- expects the new instructions to be what every
+// thread runs next. Reaching only the flushing thread left the others running
+// translations of code that no longer existed, and which thread held the stale
+// block decided whether the guest worked at all.
+//
+// The lock also covers adding a nested Jit, because a flush from another thread
+// walks the list that add grows.
+std::mutex g_machines_mutex;
+std::vector<A32Machine*> g_machines;
+
+}  // namespace
+
 struct A32Machine::Impl {
     // dynarmic drops its whole translation cache when less than a megabyte is
     // left, and re-translates everything the guest touches afterwards. A game
@@ -640,6 +659,10 @@ struct A32Machine::Impl {
         callbacks->svc_handlers = &svc_handlers;
         callbacks->machine = owner;
         callback_set.push_back(std::move(callbacks));
+        // A flush on another thread walks this list, so it grows under the same
+        // lock that a flush holds. A Jit added after a flush cannot be stale:
+        // its cache is empty.
+        const std::lock_guard lock(g_machines_mutex);
         jits.push_back(std::move(jit));
         return jits.back().get();
     }
@@ -755,22 +778,30 @@ struct A32Machine::Impl {
 
 A32Machine::A32Machine(GuestArena& arena) : A32Machine(arena, Config{}) {}
 
-A32Machine::A32Machine(GuestArena& arena, Config config) : impl_(std::make_unique<Impl>(arena, config)) {
+A32Machine::A32Machine(GuestArena& arena, Config config)
+    : impl_(std::make_unique<Impl>(arena, config)) {
     impl_->owner = this;
     for (auto& callbacks : impl_->callback_set) {
         callbacks->machine = this;
     }
+    const std::lock_guard lock(g_machines_mutex);
+    g_machines.push_back(this);
 }
-A32Machine::~A32Machine() = default;
+
+A32Machine::~A32Machine() {
+    {
+        const std::lock_guard lock(g_machines_mutex);
+        g_machines.erase(std::remove(g_machines.begin(), g_machines.end(), this),
+                         g_machines.end());
+    }
+}
 
 bool A32Machine::LoadCode(std::uint32_t addr, const void* data, std::size_t len) {
     if (!impl_->arena.IsMapped(addr, len)) {
         return false;
     }
     std::memcpy(impl_->arena.Ptr(addr), data, len);
-    for (auto& jit : impl_->jits) {
-        jit->InvalidateCacheRange(addr, len);
-    }
+    InvalidateCacheRange(addr, len);
     return true;
 }
 
@@ -1138,8 +1169,14 @@ std::string A32Machine::LastHaltReasonName() const {
 }
 
 void A32Machine::InvalidateCacheRange(std::uint32_t addr, std::size_t len) {
-    for (auto& jit : impl_->jits) {
-        jit->InvalidateCacheRange(addr, len);
+    if (len == 0) {
+        return;
+    }
+    const std::lock_guard lock(g_machines_mutex);
+    for (A32Machine* machine : g_machines) {
+        for (auto& jit : machine->impl_->jits) {
+            jit->InvalidateCacheRange(addr, len);
+        }
     }
 }
 
@@ -1151,8 +1188,11 @@ void A32Machine::SetTickBudget(std::uint64_t ticks) {
 }
 
 void A32Machine::ClearCache() {
-    for (auto& jit : impl_->jits) {
-        jit->ClearCache();
+    const std::lock_guard lock(g_machines_mutex);
+    for (A32Machine* machine : g_machines) {
+        for (auto& jit : machine->impl_->jits) {
+            jit->ClearCache();
+        }
     }
 }
 
