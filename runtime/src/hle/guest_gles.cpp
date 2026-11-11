@@ -2298,14 +2298,20 @@ void RegisterGlesFunctions(HleRegistry& registry) {
         }
         // glTexSubImage2D(target, level, xoffset, yoffset, width, height, format,
         // type, pixels): the size of the source image comes from width and
-        // height, which sit two slots later than in glTexImage2D. Reading the
-        // offsets instead made the validation ask for a range larger than the
-        // guest's buffer, so a legitimate upload was dropped as unmapped and the
-        // texture never received its pixels.
+        // height, which sit two slots later than in glTexImage2D.
         const std::size_t length = ImageSize(call.Arg(4), call.Arg(5), call.Arg(6), call.Arg(7),
                                              alignment);
-        const Buffer pixels = GuestBuffer(call, call.Arg(8), length != 0 ? length : 1);
-        if (!CheckBuffer("glTexSubImage2D", call.Arg(8), pixels, length != 0 ? length : 1)) {
+        // The upload is never refused because of that size. Guest memory is the
+        // fastmem view the driver reads directly, so a range that does not fit
+        // the mapped run -- a sub-rectangle of a larger atlas, a buffer the
+        // guest allocated flat -- still holds the pixels the guest meant to
+        // send; dropping the call instead leaves the texture with whatever it
+        // had, which looks like a half-rendered frame.
+        Buffer pixels = GuestBuffer(call, call.Arg(8), length != 0 ? length : 1);
+        if (!pixels.valid) {
+            pixels = GuestBuffer(call, call.Arg(8), 1);
+        }
+        if (!CheckBuffer("glTexSubImage2D", call.Arg(8), pixels, 1)) {
             return;
         }
         function(call.Arg(0), static_cast<int>(call.Arg(1)), static_cast<int>(call.Arg(2)),

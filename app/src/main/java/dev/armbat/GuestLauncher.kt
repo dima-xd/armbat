@@ -1214,12 +1214,19 @@ class GuestLauncher(private val host: Activity) {
         val activity = type.getDeclaredConstructor().newInstance() as Activity
         val context = session.context
         val theme = archiveTheme(archive)
+        // PhoneWindow takes its theme from the context as well as from the
+        // Activity, so the archive's theme has to land here: otherwise the
+        // decor grows a title/action bar that the guest does not know about.
         if (theme != 0) {
-            // PhoneWindow takes its theme from the context as well as from the
-            // Activity, so the archive's theme has to land here: otherwise the
-            // decor grows a title/action bar that the guest does not know about.
             context.theme.applyStyle(theme, true)
         }
+        // The guest's window is the archive's whole screen. A title or action
+        // bar the platform adds on its own takes that strip off the surface, so
+        // the picture starts below it and the archive's layout and hit-testing
+        // are off by its height. The platform's own NoTitleBar style is applied
+        // last, after the archive's theme, so no theme of an archive can put the
+        // bar back.
+        context.theme.applyStyle(android.R.style.Theme_NoTitleBar, true)
         attachBaseContext(activity, context)
         attachFragments(activity)
         field(activity, "mResources", prepared.resources)
@@ -1276,6 +1283,11 @@ class GuestLauncher(private val host: Activity) {
         // owns the theme, and the window's inflater and every view it creates
         // read the theme from there.
         val window = newWindow(activity)
+        // The platform builds the decor layout from the window style, and the
+        // style is read from the theme: asking for the feature as well is what
+        // keeps the decor from installing an action bar even when the archive's
+        // theme declares one. It has to happen before any content is added.
+        window.requestFeature(Window.FEATURE_NO_TITLE)
         // A guest dialog is a window of its own, and the platform inherits the
         // dialog's token from the window manager's parent window. Point the
         // activity at a local manager whose parent is this window and give the
