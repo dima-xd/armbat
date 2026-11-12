@@ -3,8 +3,8 @@ package dev.armbat
 import java.io.File
 
 /**
- * Answers whether a dex file contains any of the absolute paths the container
- * has to rewrite.
+ * Answers whether a dex file contains any of the path strings or framework
+ * class descriptors the container has to rewrite.
  *
  * The answer comes from the dex string table, not from a scan of the whole
  * file: an archive that stores a path in a string it never loads still pays for

@@ -6,20 +6,30 @@ import com.android.tools.smali.dexlib2.DexFileFactory
 import com.android.tools.smali.dexlib2.Opcode
 import com.android.tools.smali.dexlib2.Opcodes
 import com.android.tools.smali.dexlib2.iface.DexFile
+import com.android.tools.smali.dexlib2.iface.instruction.FiveRegisterInstruction
 import com.android.tools.smali.dexlib2.iface.instruction.Instruction
+import com.android.tools.smali.dexlib2.iface.instruction.OneRegisterInstruction
+import com.android.tools.smali.dexlib2.iface.instruction.RegisterRangeInstruction
+import com.android.tools.smali.dexlib2.iface.instruction.ThreeRegisterInstruction
+import com.android.tools.smali.dexlib2.iface.instruction.TwoRegisterInstruction
+import com.android.tools.smali.dexlib2.iface.instruction.formats.Instruction12x
 import com.android.tools.smali.dexlib2.iface.instruction.formats.Instruction21c
+import com.android.tools.smali.dexlib2.iface.instruction.formats.Instruction22x
+import com.android.tools.smali.dexlib2.iface.instruction.formats.Instruction32x
 import com.android.tools.smali.dexlib2.iface.instruction.formats.Instruction31c
 import com.android.tools.smali.dexlib2.iface.instruction.formats.Instruction35c
 import com.android.tools.smali.dexlib2.iface.instruction.formats.Instruction3rc
 import com.android.tools.smali.dexlib2.iface.instruction.ReferenceInstruction
 import com.android.tools.smali.dexlib2.iface.reference.MethodReference
 import com.android.tools.smali.dexlib2.iface.reference.StringReference
+import com.android.tools.smali.dexlib2.iface.reference.TypeReference
 import com.android.tools.smali.dexlib2.immutable.instruction.ImmutableInstruction21c
 import com.android.tools.smali.dexlib2.immutable.instruction.ImmutableInstruction31c
 import com.android.tools.smali.dexlib2.immutable.instruction.ImmutableInstruction35c
 import com.android.tools.smali.dexlib2.immutable.instruction.ImmutableInstruction3rc
 import com.android.tools.smali.dexlib2.immutable.reference.ImmutableMethodReference
 import com.android.tools.smali.dexlib2.immutable.reference.ImmutableStringReference
+import com.android.tools.smali.dexlib2.immutable.reference.ImmutableTypeReference
 import com.android.tools.smali.dexlib2.rewriter.DexRewriter
 import com.android.tools.smali.dexlib2.rewriter.InstructionRewriter
 import com.android.tools.smali.dexlib2.rewriter.Rewriter
@@ -52,8 +62,10 @@ import java.util.zip.ZipFile
  * launches, which also lets ART keep its profile and oat data next to the file.
  *
  * The same pass also redirects a few framework calls whose answer belongs to
- * the guest rather than to the container. The framework evaluates a behaviour
- * change (PendingIntent mutability) against the uid's target SDK, which is the
+ * the guest rather than to the container, and replaces direct DexClassLoader
+ * allocations with Armbat's read-only staging loader for Android 14+.
+ * The framework evaluates a behaviour change (PendingIntent mutability) against
+ * the uid's target SDK, which is the
  * container's 36, not the archive's; an archive built before Android 12 passes
  * 0 and the factory throws. And `Environment` describes the real device's
  * shared storage, so an archive builds `Android/obb/...` paths that exist for
@@ -64,9 +76,11 @@ import java.util.zip.ZipFile
 object GuestDex {
 
     /** Bump when the rewrite rules or the cache layout change. */
-    private const val CACHE_VERSION = 4
+    private const val CACHE_VERSION = 5
 
     private const val CACHE_MARKER = ".ok"
+    private const val DEX_CLASS_LOADER_CLASS = "Ldalvik/system/DexClassLoader;"
+    private const val GUEST_DEX_CLASS_LOADER_CLASS = "Ldev/armbat/GuestDexClassLoader;"
     private const val PLATFORM_DEX = "guestplatform.dex"
 
     private const val PENDING_INTENT_CLASS = "Landroid/app/PendingIntent;"
@@ -166,7 +180,7 @@ object GuestDex {
         onStage?.invoke(LaunchStage.DEX_READ)
         if (!GuestDexScan.containsAny(
                 file,
-                rules.map { it.first } + listOf(PENDING_INTENT_CLASS, ENVIRONMENT_CLASS),
+                rules.map { it.first } + listOf(PENDING_INTENT_CLASS, ENVIRONMENT_CLASS, DEX_CLASS_LOADER_CLASS),
             )
         ) {
             ArmbatLog.i("Armbat", "dex paths: ${file.name} unchanged")
@@ -180,8 +194,77 @@ object GuestDex {
         }
         val rewriter = DexRewriter(object : RewriterModule() {
             override fun getInstructionRewriter(rewriters: Rewriters): Rewriter<Instruction> {
+                // Track uninitialized DexClassLoader allocations by register.
+                // Constructor arguments can contain other allocations, so keep
+                // independent identities for nested loaders and follow move-object
+                // aliases until the matching invoke-direct initializes each one.
+                val pendingDexLoaderObjects = mutableMapOf<Int, Int>()
+                var nextDexLoaderObjectId = 0
                 return object : InstructionRewriter(rewriters) {
                     override fun rewrite(instruction: Instruction): Instruction {
+                        if (instruction is Instruction21c && instruction.opcode == Opcode.NEW_INSTANCE) {
+                            pendingDexLoaderObjects.remove(instruction.registerA)
+                            if ((instruction.reference as? TypeReference)?.type == DEX_CLASS_LOADER_CLASS) {
+                                val objectId = nextDexLoaderObjectId++
+                                pendingDexLoaderObjects[instruction.registerA] = objectId
+                                return ImmutableInstruction21c(
+                                    Opcode.NEW_INSTANCE,
+                                    instruction.registerA,
+                                    ImmutableTypeReference(GUEST_DEX_CLASS_LOADER_CLASS),
+                                )
+                            }
+                        }
+
+                        val move = when (instruction) {
+                            is Instruction12x -> if (instruction.opcode == Opcode.MOVE_OBJECT) {
+                                instruction.registerA to instruction.registerB
+                            } else null
+                            is Instruction22x -> if (instruction.opcode == Opcode.MOVE_OBJECT_FROM16) {
+                                instruction.registerA to instruction.registerB
+                            } else null
+                            is Instruction32x -> if (instruction.opcode == Opcode.MOVE_OBJECT_16) {
+                                instruction.registerA to instruction.registerB
+                            } else null
+                            else -> null
+                        }
+                        if (move != null) {
+                            val objectId = pendingDexLoaderObjects[move.second]
+                            pendingDexLoaderObjects.remove(move.first)
+                            if (objectId != null) {
+                                pendingDexLoaderObjects[move.first] = objectId
+                            }
+                        } else if (pendingDexLoaderObjects.isNotEmpty()) {
+                            val receiver = when (instruction) {
+                                is Instruction35c -> if (instruction.opcode == Opcode.INVOKE_DIRECT &&
+                                    instruction.registerCount > 0
+                                ) instruction.registerC else null
+                                is Instruction3rc -> if (instruction.opcode == Opcode.INVOKE_DIRECT_RANGE &&
+                                    instruction.registerCount > 0
+                                ) instruction.startRegister else null
+                                else -> null
+                            }
+                            val objectId = receiver?.let { pendingDexLoaderObjects[it] }
+                            if (objectId != null) {
+                                val rewrittenConstructor = rewriteDexLoaderConstructor(instruction, receiver)
+                                if (rewrittenConstructor != null) {
+                                    pendingDexLoaderObjects.entries.removeAll { it.value == objectId }
+                                    return rewrittenConstructor
+                                }
+                            }
+                            // Any other use of an uninitialized reference is not
+                            // a valid constructor path. Remove only the aliases
+                            // touched by this instruction; unrelated pending
+                            // allocations (for example, an outer constructor
+                            // while evaluating an inner argument) remain tracked.
+                            for (register in registersOf(instruction)) {
+                                pendingDexLoaderObjects.remove(register)
+                            }
+                            if (instruction.opcode == Opcode.THROW ||
+                                instruction.opcode.name.startsWith("RETURN")
+                            ) {
+                                pendingDexLoaderObjects.clear()
+                            }
+                        }
                         redirect(instruction)?.let { return it }
                         val path = pathOf(instruction) ?: return super.rewrite(instruction)
                         val replacement = rewritePath(path, rules)
@@ -319,6 +402,77 @@ object GuestDex {
         } catch (error: Throwable) {
             temporary.deleteRecursively()
             throw error
+        }
+    }
+	
+    /** Register operands carried by an instruction, including output registers. */
+    private fun registersOf(instruction: Instruction): List<Int> =
+        when (instruction) {
+            is FiveRegisterInstruction -> listOf(
+                instruction.registerC,
+                instruction.registerD,
+                instruction.registerE,
+                instruction.registerF,
+                instruction.registerG,
+            ).take(instruction.registerCount)
+            is RegisterRangeInstruction ->
+                (instruction.startRegister until instruction.startRegister + instruction.registerCount).toList()
+            is ThreeRegisterInstruction -> listOf(
+                instruction.registerA, instruction.registerB, instruction.registerC,
+            )
+            is TwoRegisterInstruction -> listOf(instruction.registerA, instruction.registerB)
+            is OneRegisterInstruction -> listOf(instruction.registerA)
+            else -> emptyList()
+        }
+
+    /**
+     * Changes the constructor paired with a rewritten DexClassLoader allocation.
+     * The replacement subclasses DexClassLoader, so guest code can continue to
+     * hold it and pass it anywhere a platform DexClassLoader is expected.
+     */
+    private fun rewriteDexLoaderConstructor(
+        instruction: Instruction,
+        receiverRegister: Int,
+    ): Instruction? {
+        val reference = (instruction as? ReferenceInstruction)?.reference as? MethodReference
+            ?: return null
+        if (reference.definingClass != DEX_CLASS_LOADER_CLASS || reference.name != "<init>") {
+            return null
+        }
+        val target = ImmutableMethodReference(
+            GUEST_DEX_CLASS_LOADER_CLASS,
+            reference.name,
+            reference.parameterTypes,
+            reference.returnType,
+        )
+        return when (instruction) {
+            is Instruction35c -> if (
+                instruction.opcode == Opcode.INVOKE_DIRECT &&
+                instruction.registerCount > 0 && instruction.registerC == receiverRegister
+            ) {
+                ImmutableInstruction35c(
+                    instruction.opcode,
+                    instruction.registerCount,
+                    instruction.registerC,
+                    instruction.registerD,
+                    instruction.registerE,
+                    instruction.registerF,
+                    instruction.registerG,
+                    target,
+                )
+            } else null
+            is Instruction3rc -> if (
+                instruction.opcode == Opcode.INVOKE_DIRECT_RANGE &&
+                instruction.registerCount > 0 && instruction.startRegister == receiverRegister
+            ) {
+                ImmutableInstruction3rc(
+                    instruction.opcode,
+                    instruction.registerCount,
+                    instruction.startRegister,
+                    target,
+                )
+            } else null
+            else -> null
         }
     }
 
