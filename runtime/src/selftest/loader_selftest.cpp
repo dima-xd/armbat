@@ -96,6 +96,45 @@ SuiteReport RunLoaderSelftest() {
 
     HleRegistry hle(machine, arena, kStubAddr);
     RegisterStandardFunctions(hle);
+    RegisterGlesFunctions(hle);
+
+    // The OES framebuffer object names are resolved by the GLES 1.x dispatch
+    // path. Check that both statically imported symbols and eglGetProcAddress-
+    // style lookups can resolve the complete OES surface.
+    static constexpr const char* kFramebufferOesFunctions[] = {
+        "glIsRenderbufferOES",
+        "glBindRenderbufferOES",
+        "glDeleteRenderbuffersOES",
+        "glGenRenderbuffersOES",
+        "glRenderbufferStorageOES",
+        "glGetRenderbufferParameterivOES",
+        "glIsFramebufferOES",
+        "glBindFramebufferOES",
+        "glDeleteFramebuffersOES",
+        "glGenFramebuffersOES",
+        "glCheckFramebufferStatusOES",
+        "glFramebufferTexture2DOES",
+        "glFramebufferRenderbufferOES",
+        "glGetFramebufferAttachmentParameterivOES",
+    };
+    bool framebuffer_oes_resolves = true;
+    std::string missing_framebuffer_oes;
+    for (const char* name : kFramebufferOesFunctions) {
+        if (hle.Resolve(name) == 0) {
+            framebuffer_oes_resolves = false;
+            if (!missing_framebuffer_oes.empty()) {
+                missing_framebuffer_oes += ", ";
+            }
+            missing_framebuffer_oes += name;
+        }
+    }
+    const std::string framebuffer_oes_detail =
+        framebuffer_oes_resolves
+            ? "all 14 GL_OES_framebuffer_object entry points resolve"
+            : "missing: " + missing_framebuffer_oes;
+    report.Check("gles.framebuffer_oes_exports", framebuffer_oes_resolves,
+                 framebuffer_oes_detail);
+
     heap.RegisterFunctions(hle);
 
     GuestStdio stdio(hle);
