@@ -463,7 +463,8 @@ class GuestLauncher(private val host: Activity) {
                 if (packageName == "com.android.vending" ||
                     packageName == "com.google.android.gms" ||
                     packageName == "com.google.android.gsf" ||
-                    packageName == "com.google.android.gms.phenotype"
+                    packageName == "com.google.android.gms.phenotype" ||
+                    packageName == "com.bda.controller"
                 ) {
                     return true
                 }
@@ -471,12 +472,14 @@ class GuestLauncher(private val host: Activity) {
             val action = service.action ?: return false
             return action.startsWith("com.android.vending.") ||
                 action.startsWith("com.google.android.gms.") ||
-                action.startsWith("com.google.android.finsky.")
+                action.startsWith("com.google.android.finsky.") ||
+                action == "com.bda.controller.IControllerService" ||
+                action.startsWith("com.bda.controller.")
         }
 
         override fun bindService(service: Intent, conn: ServiceConnection, flags: Int): Boolean {
             if (isUnavailableService(service)) {
-                ArmbatLog.i(TAG, "bindService refused: ${service.`package`} is not part of this device")
+                ArmbatLog.i(TAG, "bindService refused: ${service.`package` ?: service.action} is not part of this device")
                 return false
             }
             return super.bindService(service, conn, flags)
@@ -484,7 +487,7 @@ class GuestLauncher(private val host: Activity) {
 
         override fun startService(service: Intent): ComponentName? {
             if (isUnavailableService(service)) {
-                ArmbatLog.i(TAG, "startService refused: ${service.`package`} is not part of this device")
+                ArmbatLog.i(TAG, "startService refused: ${service.`package` ?: service.action} is not part of this device")
                 return null
             }
             return super.startService(service)
