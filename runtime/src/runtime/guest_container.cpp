@@ -932,6 +932,7 @@ struct GuestContainer::Impl {
         stamp("extra");
         SetGuestHeap(heap.get());
         SetGuestMemory(&kernel->Memory());
+		SetGuestKernel(kernel.get());
         RegisterAndroidFunctions(*hle);
         stamp("android");
         RegisterGlesFunctions(*hle);
@@ -1048,6 +1049,7 @@ GuestContainer::~GuestContainer() {
     // That thread runs on the arena, so it has to be gone before the arena is.
     StopGuestCallThread();
     SetGuestCallRunner(nullptr);
+	SetGuestKernel(nullptr);
 }
 
 bool GuestContainer::Start(std::string* error) {

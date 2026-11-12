@@ -708,6 +708,10 @@ std::string GuestKernel::MapPath(const std::string& guest_path) const {
     return guest_path;
 }
 
+void GuestKernel::RegisterGuestFd(int fd) {
+    TrackGuestFd(fd);
+}
+
 std::string GuestKernel::ResolveGuestPath(std::string guest_path) {
     // The guest has no working directory of its own: `chdir` is not part of the
     // emulated kernel and `getcwd` answers "/", so a relative name always means

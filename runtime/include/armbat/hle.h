@@ -19,6 +19,7 @@ class GuestApk;
 class GuestArena;
 class GuestHeap;
 class GuestMemory;
+class GuestKernel;
 
 // One call from guest code into a host implementation.
 class HleCall {
@@ -222,6 +223,9 @@ void SetGuestHeap(GuestHeap* heap);
 // hands the guest a pointer to megabytes of data that stays valid until the asset
 // is closed, and the HLE data area is too small to hold a pack's worth of them.
 void SetGuestMemory(GuestMemory* memory);
+
+// The guest kernel owns the descriptors returned by AAsset_openFileDescriptor.
+void SetGuestKernel(GuestKernel* kernel);
 
 void RegisterAndroidFunctions(HleRegistry& registry);
 

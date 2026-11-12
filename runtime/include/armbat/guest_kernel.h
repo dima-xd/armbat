@@ -86,6 +86,10 @@ public:
     // Last syscall number that returned -ENOSYS: naming the missing call is the
     // difference between "libc is stuck" and "implement this one next".
     std::uint32_t LastUnimplemented() const { return last_unimplemented_; }
+	
+    // Takes ownership of a host descriptor created by a platform HLE call and
+    // makes it eligible for guest close(), just like a descriptor from open().
+    void RegisterGuestFd(int fd);
 
     std::uint64_t Calls() const { return calls_; }
     std::uint64_t LastNumber() const { return last_number_; }
