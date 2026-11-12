@@ -307,10 +307,10 @@ std::uint32_t StringCellAddress(HleRegistry& registry, StringCell& cell,
     return cell.address;
 }
 
-// Extensions are filtered down to the ones that add enums only, never entry
-// points: the container serves exactly the GLES 2.0 functions, and an extension
-// with its own functions would invite the guest to call a stub that is not
-// there. The list must not be empty, though -- engines probe it to pick
+// Extensions are filtered down to the ones whose advertised surface is fully
+// supported. GL_OES_framebuffer_object is safe because its entry points are
+// forwarded through the GLES 1.x host library below. The list must not be
+// empty, though -- engines probe it to pick
 // internal formats for their off-screen targets. Without packed_depth_stencil
 // Unity builds a depth-only renderbuffer, attaches it at the stencil point and
 // keeps drawing into an incomplete framebuffer: every draw then fails with
@@ -318,6 +318,7 @@ std::uint32_t StringCellAddress(HleRegistry& registry, StringCell& cell,
 // the call counters look healthy.
 std::string FilterExtensions(const std::string& driver) {
     static const char* const kSafe[] = {
+        "GL_OES_framebuffer_object",
         "GL_OES_packed_depth_stencil",
         "GL_OES_depth24",
         "GL_OES_stencil8",
@@ -366,8 +367,8 @@ void RegisterGlesFunctions(HleRegistry& registry) {
         }
         std::string value(reinterpret_cast<const char*>(text));
         // The version string tells loaders what to resolve; the extension list
-        // stays filtered because the extensions it would expose add entry
-        // points this container does not serve.
+		// stays filtered to the subset this container implements, including
+        // the OES framebuffer entry points registered below.
         if (name == 0x1f02) {  // GL_VERSION
             // Loaders such as glad parse this string to decide which entry
             // points to fetch. The host driver is ES 3.x even for the ES 2.0
@@ -767,6 +768,157 @@ void RegisterGlesFunctions(HleRegistry& registry) {
         }
         function(call.Arg(0), call.Arg(1), out);
     });
+
+    // ---- GL_OES_framebuffer_object (GLES 1.x extension) -------------------
+    // These names must go through libGLESv1_CM.so: the guest can be running an
+    // ES 1.x context, where the OES extension is the API and the GLES 2.0 core
+    // entry points are not a valid substitute. Keep the same guest-buffer
+    // checks as the core handlers above before passing pointers to the driver.
+    registry.Add("glGenFramebuffersOES", [](HleCall& call) {
+        static const auto function =
+            Gl1<void (*)(int, unsigned int*)>("glGenFramebuffersOES");
+        if (function == nullptr) {
+            return;
+        }
+        const int count = static_cast<int>(call.Arg(0));
+        if (count < 0 || count > 65536) {
+            return;
+        }
+        const std::size_t length = static_cast<std::size_t>(count) * sizeof(unsigned int);
+        const Buffer out = GuestBuffer(call, call.Arg(1), length);
+        if (!RequireArray("glGenFramebuffersOES", call.Arg(1), out, length, count)) {
+            return;
+        }
+        function(count, static_cast<unsigned int*>(out.bytes));
+    });
+    registry.Add("glDeleteFramebuffersOES", [](HleCall& call) {
+        static const auto function =
+            Gl1<void (*)(int, const unsigned int*)>("glDeleteFramebuffersOES");
+        if (function == nullptr) {
+            return;
+        }
+        const int count = static_cast<int>(call.Arg(0));
+        if (count < 0 || count > 65536) {
+            return;
+        }
+        const std::size_t length = static_cast<std::size_t>(count) * sizeof(unsigned int);
+        const Buffer names = GuestBuffer(call, call.Arg(1), length);
+        if (!RequireArray("glDeleteFramebuffersOES", call.Arg(1), names, length, count)) {
+            return;
+        }
+        function(count, static_cast<const unsigned int*>(names.bytes));
+    });
+    registry.Add("glBindFramebufferOES", [](HleCall& call) {
+        static const auto function =
+            Gl1<void (*)(unsigned int, unsigned int)>("glBindFramebufferOES");
+        if (function != nullptr) function(call.Arg(0), call.Arg(1));
+	});
+    registry.Add("glIsFramebufferOES", [](HleCall& call) {
+        static const auto function = Gl1<unsigned char (*)(unsigned int)>("glIsFramebufferOES");
+        call.Return(function != nullptr ? function(call.Arg(0)) : 0);
+    });
+    registry.Add("glCheckFramebufferStatusOES", [](HleCall& call) {
+        static const auto function =
+            Gl1<unsigned int (*)(unsigned int)>("glCheckFramebufferStatusOES");
+        call.Return(function != nullptr ? function(call.Arg(0)) : 0);
+    });
+    registry.Add("glFramebufferTexture2DOES", [](HleCall& call) {
+        static const auto function =
+            Gl1<void (*)(unsigned int, unsigned int, unsigned int, unsigned int, int)>(
+                "glFramebufferTexture2DOES");
+        if (function != nullptr) {
+            function(call.Arg(0), call.Arg(1), call.Arg(2), call.Arg(3),
+                     static_cast<int>(call.Arg(4)));
+        }
+    });
+    registry.Add("glFramebufferRenderbufferOES", [](HleCall& call) {
+        static const auto function =
+            Gl1<void (*)(unsigned int, unsigned int, unsigned int, unsigned int)>(
+                "glFramebufferRenderbufferOES");
+        if (function != nullptr) {
+            function(call.Arg(0), call.Arg(1), call.Arg(2), call.Arg(3));
+        }
+    });
+    registry.Add("glGenRenderbuffersOES", [](HleCall& call) {
+        static const auto function =
+            Gl1<void (*)(int, unsigned int*)>("glGenRenderbuffersOES");
+        if (function == nullptr) {
+            return;
+        }
+        const int count = static_cast<int>(call.Arg(0));
+        if (count < 0 || count > 65536) {
+            return;
+        }
+        const std::size_t length = static_cast<std::size_t>(count) * sizeof(unsigned int);
+        const Buffer out = GuestBuffer(call, call.Arg(1), length);
+        if (!RequireArray("glGenRenderbuffersOES", call.Arg(1), out, length, count)) {
+            return;
+        }
+        function(count, static_cast<unsigned int*>(out.bytes));
+    });
+    registry.Add("glDeleteRenderbuffersOES", [](HleCall& call) {
+        static const auto function =
+            Gl1<void (*)(int, const unsigned int*)>("glDeleteRenderbuffersOES");
+        if (function == nullptr) {
+            return;
+        }
+        const int count = static_cast<int>(call.Arg(0));
+        if (count < 0 || count > 65536) {
+            return;
+        }
+        const std::size_t length = static_cast<std::size_t>(count) * sizeof(unsigned int);
+        const Buffer names = GuestBuffer(call, call.Arg(1), length);
+        if (!RequireArray("glDeleteRenderbuffersOES", call.Arg(1), names, length, count)) {
+            return;
+        }
+        function(count, static_cast<const unsigned int*>(names.bytes));
+    });
+    registry.Add("glBindRenderbufferOES", [](HleCall& call) {
+        static const auto function =
+            Gl1<void (*)(unsigned int, unsigned int)>("glBindRenderbufferOES");
+        if (function != nullptr) function(call.Arg(0), call.Arg(1));
+    });
+    registry.Add("glIsRenderbufferOES", [](HleCall& call) {
+        static const auto function =
+            Gl1<unsigned char (*)(unsigned int)>("glIsRenderbufferOES");
+        call.Return(function != nullptr ? function(call.Arg(0)) : 0);
+    });
+    registry.Add("glRenderbufferStorageOES", [](HleCall& call) {
+        static const auto function =
+            Gl1<void (*)(unsigned int, unsigned int, int, int)>("glRenderbufferStorageOES");
+        if (function != nullptr) {
+            function(call.Arg(0), call.Arg(1), static_cast<int>(call.Arg(2)),
+                     static_cast<int>(call.Arg(3)));
+        }
+    });
+    registry.Add("glGetFramebufferAttachmentParameterivOES", [](HleCall& call) {
+        static const auto function =
+            Gl1<void (*)(unsigned int, unsigned int, unsigned int, int*)>(
+                "glGetFramebufferAttachmentParameterivOES");
+        if (function == nullptr) {
+            return;
+        }
+        int* out = reinterpret_cast<int*>(call.Mapped(call.Arg(3), sizeof(int)));
+        if (out == nullptr) {
+            RejectBuffer("glGetFramebufferAttachmentParameterivOES", call.Arg(3), sizeof(int));
+            return;
+        }
+        function(call.Arg(0), call.Arg(1), call.Arg(2), out);
+    });
+    registry.Add("glGetRenderbufferParameterivOES", [](HleCall& call) {
+        static const auto function =
+            Gl1<void (*)(unsigned int, unsigned int, int*)>("glGetRenderbufferParameterivOES");
+        if (function == nullptr) {
+            return;
+        }
+        int* out = reinterpret_cast<int*>(call.Mapped(call.Arg(2), sizeof(int)));
+        if (out == nullptr) {
+            RejectBuffer("glGetRenderbufferParameterivOES", call.Arg(2), sizeof(int));
+            return;
+        }
+        function(call.Arg(0), call.Arg(1), out);
+    });
+
     registry.Add("glIsBuffer", [](HleCall& call) {
         static const auto function = Gl<unsigned char (*)(unsigned int)>("glIsBuffer");
         call.Return(function != nullptr ? function(call.Arg(0)) : 0);
