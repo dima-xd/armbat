@@ -40,6 +40,12 @@ def main() -> None:
                      compress_type=zipfile.ZIP_STORED)
         apk.writestr("classes.dex", b"dex\n035\x00" + b"\x00" * 120,
                      compress_type=zipfile.ZIP_STORED)
+        # Asset-file-descriptor tests need one direct (stored) asset and one
+        # compressed asset, which must correctly reject direct fd access.
+        apk.writestr("assets/fd/stored.txt", b"asset fd fixture\n",
+                     compress_type=zipfile.ZIP_STORED)
+        apk.writestr("assets/fd/compressed.txt", b"compressed asset fixture\n",
+                     compress_type=zipfile.ZIP_DEFLATED)
         apk.writestr(f"lib/{args.abi}/libguesttest.so", library,
                      compress_type=zipfile.ZIP_DEFLATED)
         if extra is not None:

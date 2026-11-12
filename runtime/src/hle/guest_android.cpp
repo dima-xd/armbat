@@ -23,6 +23,7 @@
 #include "armbat/guest_arena.h"
 #include "armbat/guest_heap.h"
 #include "armbat/guest_input.h"
+#include "armbat/guest_kernel.h"
 #include "armbat/guest_memory.h"
 #include "armbat/handles.h"
 #include "armbat/hle.h"
@@ -40,6 +41,7 @@ namespace armbat {
 namespace {
 
 GuestApk* g_apk = nullptr;
+GuestKernel* g_kernel = nullptr;
 
 // The guest's own allocator. libjnigraphics has to hand the guest a buffer it
 // can address, and the guest heap is the one allocator that already knows how
@@ -97,6 +99,7 @@ int WindowExtent(std::uint32_t handle, bool want_height) {
 // AAsset has no fields the guest may touch; the guest only ever holds the
 // pointer. The container keeps everything behind it.
 struct Asset {
+	std::string name;
     std::vector<std::uint8_t> data;
     std::uint64_t position = 0;
     bool closed = false;
@@ -134,6 +137,34 @@ std::size_t HandleSlot(std::uint32_t handle) {
     return handle < kFirstAssetHandle ? static_cast<std::size_t>(-1)
                                       : handle - kFirstAssetHandle;
 }
+
+// Android's asset implementation rejects seeks outside the asset and rejects
+// unknown whence values. Keep the position within [0, length], which also makes
+// the following read/remaining-length calculations safe at EOF.
+bool SeekAsset(Asset& asset, std::int64_t offset, std::uint32_t whence,
+               std::uint64_t* position) {
+    std::uint64_t base = 0;
+    switch (whence) {
+        case SEEK_SET:
+            break;
+        case SEEK_CUR:
+            base = asset.position;
+            break;
+        case SEEK_END:
+            base = asset.data.size();
+            break;
+        default:
+            return false;
+    }
+    const __int128 target = static_cast<__int128>(base) + offset;
+    if (target < 0 || target > static_cast<__int128>(asset.data.size())) {
+        return false;
+    }
+    *position = static_cast<std::uint64_t>(target);
+    asset.position = *position;
+    return true;
+}
+
 
 // AAssetDir is a name list plus the guest cell the next name is written into:
 // the platform owns the returned string until the next call.
@@ -697,6 +728,7 @@ void SetGuestApk(GuestApk* apk) { g_apk = apk; }
 
 void SetGuestHeap(GuestHeap* heap) { g_heap = heap; }
 void SetGuestMemory(GuestMemory* memory) { g_memory = memory; }
+void SetGuestKernel(GuestKernel* kernel) { g_kernel = kernel; }
 
 void RegisterAndroidFunctions(HleRegistry& registry) {
     // ---- AAssetManager ----------------------------------------------------
@@ -717,6 +749,7 @@ void RegisterAndroidFunctions(HleRegistry& registry) {
         // every other thread's asset read wait for the biggest inflate in
         // flight, which is exactly what a world load does on several threads.
         Asset asset;
+		asset.name = name;
         std::string error;
         if (g_apk == nullptr || !g_apk->ReadAsset(name, &asset.data, &error)) {
             // Distinct names only: the engine probes the same optional files
@@ -764,28 +797,45 @@ void RegisterAndroidFunctions(HleRegistry& registry) {
     registry.Add("AAsset_getLength", [](HleCall& call) {
         const std::lock_guard asset_lock(g_asset_mutex);
         const std::size_t index = HandleSlot(call.Arg(0));
-        call.Return(index < g_assets.size() ? static_cast<std::uint32_t>(g_assets[index].data.size()) : 0);
+        const std::uint64_t size =
+            index < g_assets.size() && !g_assets[index].closed ? g_assets[index].data.size() : 0;
+        call.Return(static_cast<std::uint32_t>(size));
+    });
+    registry.Add("AAsset_getRemainingLength", [](HleCall& call) {
+        const std::lock_guard asset_lock(g_asset_mutex);
+        const std::size_t index = HandleSlot(call.Arg(0));
+        if (index >= g_assets.size() || g_assets[index].closed) {
+            call.Return(0);
+            return;
+        }
+        const Asset& asset = g_assets[index];
+        const std::uint64_t size = asset.data.size();
+        const std::uint64_t left = asset.position < size ? size - asset.position : 0;
+        call.Return(static_cast<std::uint32_t>(left));
     });
     registry.Add("AAsset_getLength64", [](HleCall& call) {
         const std::lock_guard asset_lock(g_asset_mutex);
         const std::size_t index = HandleSlot(call.Arg(0));
-        const std::uint64_t size = index < g_assets.size() ? g_assets[index].data.size() : 0;
+        const std::uint64_t size =
+            index < g_assets.size() && !g_assets[index].closed ? g_assets[index].data.size() : 0;
         call.ReturnPair(static_cast<std::uint32_t>(size), static_cast<std::uint32_t>(size >> 32));
     });
     registry.Add("AAsset_getRemainingLength64", [](HleCall& call) {
         const std::lock_guard asset_lock(g_asset_mutex);
         const std::size_t index = HandleSlot(call.Arg(0));
-        const std::uint64_t left = index < g_assets.size()
-                                       ? g_assets[index].data.size() - g_assets[index].position
-                                       : 0;
+        const std::uint64_t size =
+            index < g_assets.size() && !g_assets[index].closed ? g_assets[index].data.size() : 0;
+        const std::uint64_t position =
+            index < g_assets.size() && !g_assets[index].closed ? g_assets[index].position : 0;
+        const std::uint64_t left = position < size ? size - position : 0;
         call.ReturnPair(static_cast<std::uint32_t>(left), static_cast<std::uint32_t>(left >> 32));
     });
     registry.Add("AAsset_read", [](HleCall& call) {
         const std::lock_guard asset_lock(g_asset_mutex);
         const std::size_t index = HandleSlot(call.Arg(0));
-        if (index >= g_assets.size()) {
-            call.Return(0);
-            return;
+        if (index >= g_assets.size() || g_assets[index].closed) {
+            call.Return(static_cast<std::uint32_t>(-1));
+             return;
         }
         Asset& asset = g_assets[index];
         const std::uint32_t wanted = call.Arg(2);
@@ -797,35 +847,127 @@ void RegisterAndroidFunctions(HleRegistry& registry) {
         }
         call.Return(static_cast<std::uint32_t>(count));
     });
-    registry.Add("AAsset_seek64", [](HleCall& call) {
+    registry.Add("AAsset_seek", [](HleCall& call) {
         const std::lock_guard asset_lock(g_asset_mutex);
         const std::size_t index = HandleSlot(call.Arg(0));
-        if (index >= g_assets.size()) {
+        if (index >= g_assets.size() || g_assets[index].closed) {
             call.Return(static_cast<std::uint32_t>(-1));
             return;
         }
-        Asset& asset = g_assets[index];
-        std::int64_t offset = static_cast<std::int64_t>(
-            static_cast<std::uint64_t>(call.Arg(1)) |
-            (static_cast<std::uint64_t>(call.Arg(2)) << 32));
-        const std::uint32_t whence = call.Arg(3);
-        std::int64_t base = 0;
-        if (whence == SEEK_CUR) {
-            base = static_cast<std::int64_t>(asset.position);
-        } else if (whence == SEEK_END) {
-            base = static_cast<std::int64_t>(asset.data.size());
+        std::uint64_t position = 0;
+        const std::int64_t offset = static_cast<std::int32_t>(call.Arg(1));
+        if (!SeekAsset(g_assets[index], offset, call.Arg(2), &position)) {
+            call.Return(static_cast<std::uint32_t>(-1));
+            return;
         }
-        offset += base;
-        if (offset < 0) {
-            offset = 0;
-        }
-        asset.position = static_cast<std::uint64_t>(offset);
-        call.ReturnPair(static_cast<std::uint32_t>(offset), static_cast<std::uint32_t>(offset >> 32));
+        call.Return(static_cast<std::uint32_t>(position));
     });
+    registry.Add("AAsset_seek64", [](HleCall& call) {
+        const std::lock_guard asset_lock(g_asset_mutex);
+        const std::size_t index = HandleSlot(call.Arg(0));
+        if (index >= g_assets.size() || g_assets[index].closed) {
+            call.ReturnPair(static_cast<std::uint32_t>(-1), static_cast<std::uint32_t>(-1));
+            return;
+        }
+        const std::uint64_t bits = static_cast<std::uint64_t>(call.Arg(1)) |
+                                   (static_cast<std::uint64_t>(call.Arg(2)) << 32);
+        const std::int64_t offset = std::bit_cast<std::int64_t>(bits);
+        std::uint64_t position = 0;
+        if (!SeekAsset(g_assets[index], offset, call.Arg(3), &position)) {
+            call.ReturnPair(static_cast<std::uint32_t>(-1), static_cast<std::uint32_t>(-1));
+            return;
+        }
+        call.ReturnPair(static_cast<std::uint32_t>(position),
+                        static_cast<std::uint32_t>(position >> 32));
+    });
+    registry.Add("AAsset_openFileDescriptor64", [](HleCall& call) {
+        if (g_apk == nullptr || g_kernel == nullptr) {
+            call.Return(static_cast<std::uint32_t>(-1));
+            return;
+        }
+        std::string name;
+        {
+            const std::lock_guard asset_lock(g_asset_mutex);
+            const std::size_t index = HandleSlot(call.Arg(0));
+            if (index >= g_assets.size() || g_assets[index].closed) {
+                call.Return(static_cast<std::uint32_t>(-1));
+                return;
+            }
+            name = g_assets[index].name;
+        }
+
+        std::uint64_t start = 0;
+        std::uint64_t length = 0;
+        std::string error;
+        const int descriptor = g_apk->OpenAssetFileDescriptor(name, &start, &length, &error);
+        if (descriptor < 0) {
+            if (!error.empty()) Log("asset fd: " + error);
+            call.Return(static_cast<std::uint32_t>(-1));
+            return;
+        }
+        const bool start_written = call.Arg(1) == 0 || call.CopyOut(call.Arg(1), &start, sizeof(start));
+        const bool length_written =
+            call.Arg(2) == 0 || call.CopyOut(call.Arg(2), &length, sizeof(length));
+        if (!start_written || !length_written) {
+            ::close(descriptor);
+            call.Return(static_cast<std::uint32_t>(-1));
+            return;
+        }
+        g_kernel->RegisterGuestFd(descriptor);
+        call.Return(static_cast<std::uint32_t>(descriptor));
+    });
+    registry.Add("AAsset_openFileDescriptor", [](HleCall& call) {
+        if (g_apk == nullptr || g_kernel == nullptr) {
+            call.Return(static_cast<std::uint32_t>(-1));
+            return;
+        }
+        std::string name;
+        {
+            const std::lock_guard asset_lock(g_asset_mutex);
+            const std::size_t index = HandleSlot(call.Arg(0));
+            if (index >= g_assets.size() || g_assets[index].closed) {
+                call.Return(static_cast<std::uint32_t>(-1));
+                return;
+            }
+            name = g_assets[index].name;
+        }
+
+        std::uint64_t start = 0;
+        std::uint64_t length = 0;
+        std::string error;
+        const int descriptor = g_apk->OpenAssetFileDescriptor(name, &start, &length, &error);
+        if (descriptor < 0) {
+            if (!error.empty()) Log("asset fd: " + error);
+            call.Return(static_cast<std::uint32_t>(-1));
+            return;
+        }
+        // The legacy ARM ABI uses 32-bit off_t. Android documents that these
+        // fields are truncated for large offsets; callers needing full ranges
+        // use AAsset_openFileDescriptor64.
+        const std::uint32_t start32 = static_cast<std::uint32_t>(start);
+        const std::uint32_t length32 = static_cast<std::uint32_t>(length);
+        const bool start_written =
+            call.Arg(1) == 0 || call.CopyOut(call.Arg(1), &start32, sizeof(start32));
+        const bool length_written =
+            call.Arg(2) == 0 || call.CopyOut(call.Arg(2), &length32, sizeof(length32));
+        if (!start_written || !length_written) {
+            ::close(descriptor);
+            call.Return(static_cast<std::uint32_t>(-1));
+            return;
+        }
+        g_kernel->RegisterGuestFd(descriptor);
+        call.Return(static_cast<std::uint32_t>(descriptor));
+    });
+	registry.Add("AAsset_isAllocated", [](HleCall& call) {
+		const std::lock_guard asset_lock(g_asset_mutex);
+		const std::size_t index = HandleSlot(call.Arg(0));
+
+		call.Return(index < g_assets.size() && !g_assets[index].closed ? 1 : 0);
+	});
     registry.Add("AAsset_getBuffer", [&registry](HleCall& call) {
         const std::lock_guard asset_lock(g_asset_mutex);
         const std::size_t index = HandleSlot(call.Arg(0));
-        if (index >= g_assets.size() || g_assets[index].data.empty()) {
+        if (index >= g_assets.size() || g_assets[index].closed || g_assets[index].data.empty()) {
             call.Return(0);
             return;
         }

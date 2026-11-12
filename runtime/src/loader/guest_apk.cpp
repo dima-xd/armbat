@@ -6,6 +6,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <set>
 #include <string>
 
@@ -26,6 +27,17 @@ std::string AssetRelative(const std::string& name) {
     relative = first == std::string::npos ? std::string() : relative.substr(first);
     if (relative.rfind("./", 0) == 0) {
         relative.erase(0, 2);
+    }
+    return relative;
+}
+
+std::string AssetEntryName(const std::string& name) {
+    std::string relative = AssetRelative(name);
+    if (relative.empty()) {
+        return {};
+    }
+    if (relative.rfind("assets/", 0) != 0) {
+        relative.insert(0, "assets/");
     }
     return relative;
 }
@@ -231,6 +243,7 @@ bool GuestApk::Open(const std::string& path, std::string* error) {
     while (cursor + 46 <= directory.size() &&
            Read32(directory.data(), cursor) == kCentralHeader) {
         Entry entry;
+		entry.flags = Read16(directory.data(), cursor + 8);
         entry.method = Read16(directory.data(), cursor + 10);
         entry.compressed_size = Read32(directory.data(), cursor + 20);
         entry.size = Read32(directory.data(), cursor + 24);
@@ -323,13 +336,10 @@ bool GuestApk::Read(const std::string& name, std::vector<std::uint8_t>* out,
 
 bool GuestApk::ReadAsset(const std::string& name, std::vector<std::uint8_t>* out,
                          std::string* error) const {
-    std::string relative = AssetRelative(name);
+    const std::string relative = AssetEntryName(name);
     if (relative.empty()) {
         if (error) *error = "empty asset name";
         return false;
-    }
-    if (relative.rfind("assets/", 0) != 0) {
-        relative.insert(0, "assets/");
     }
     const Entry* entry = Find(relative);
     if (entry == nullptr) {
@@ -337,6 +347,85 @@ bool GuestApk::ReadAsset(const std::string& name, std::vector<std::uint8_t>* out
         return false;
     }
     return ExtractEntry(*entry, relative, out, error);
+}
+
+int GuestApk::OpenAssetFileDescriptor(const std::string& name, std::uint64_t* start,
+                                      std::uint64_t* length, std::string* error) const {
+    if (start != nullptr) *start = 0;
+    if (length != nullptr) *length = 0;
+
+    const std::string relative = AssetEntryName(name);
+    if (relative.empty()) {
+        if (error) *error = "empty asset name";
+        return -1;
+    }
+    const Entry* entry = Find(relative);
+    if (entry == nullptr) {
+        if (error) *error = "'" + relative + "' is not in the archive";
+        return -1;
+    }
+
+    // AAsset_openFileDescriptor exposes the asset's bytes directly inside the
+    // APK. That is only possible for stored, unencrypted ZIP entries; a deflated
+    // entry has no contiguous uncompressed byte range in the archive. Keep this
+    // distinction instead of silently returning a descriptor to compressed data.
+    constexpr std::uint16_t kEncryptedFlags = (1u << 0) | (1u << 6) | (1u << 13);
+    if (entry->method != 0 || (entry->flags & kEncryptedFlags) != 0) {
+        if (error) {
+            *error = "asset '" + relative + "' is compressed or encrypted; direct fd access is unavailable";
+        }
+        return -1;
+    }
+    if (fd_ < 0) {
+        if (error) *error = "APK file is not open";
+        return -1;
+    }
+
+    std::uint8_t header[30];
+    if (!ReadAt(entry->local_offset, header, sizeof(header))) {
+        if (error) *error = "cannot read the local header of '" + relative + "'";
+        return -1;
+    }
+    if (Read32(header, 0) != kLocalHeader) {
+        if (error) *error = "local header for '" + relative + "' is corrupt";
+        return -1;
+    }
+
+    const std::uint16_t local_flags = Read16(header, 6);
+    const std::uint16_t local_method = Read16(header, 8);
+    if (local_method != 0 || (local_flags & kEncryptedFlags) != 0) {
+        if (error) *error = "local header for '" + relative + "' does not describe a stored, unencrypted entry";
+        return -1;
+    }
+    const std::uint16_t name_length = Read16(header, 26);
+    const std::uint16_t extra_length = Read16(header, 28);
+    const std::uint64_t data_offset =
+        entry->local_offset + 30u + name_length + extra_length;
+    if (data_offset < entry->local_offset || data_offset > size_ ||
+        entry->compressed_size > size_ - data_offset ||
+        entry->compressed_size != entry->size) {
+        if (error) *error = "data range for '" + relative + "' lies outside the APK or is inconsistent";
+        return -1;
+    }
+    const std::uint64_t max_offset =
+        static_cast<std::uint64_t>(std::numeric_limits<off_t>::max());
+    if (data_offset > max_offset || entry->size > max_offset - data_offset) {
+        if (error) *error = "asset range is not representable by the host file API";
+        return -1;
+    }
+
+    // Reopen the same APK through its procfs descriptor link. Unlike dup(),
+    // this gives the guest an independent open-file description and therefore
+    // an independent file position when multiple assets are streamed at once.
+    const std::string descriptor_path = "/proc/self/fd/" + std::to_string(fd_);
+    const int descriptor = ::open(descriptor_path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (descriptor < 0) {
+        if (error) *error = "cannot reopen APK descriptor: " + std::string(std::strerror(errno));
+        return -1;
+    }
+    if (start != nullptr) *start = data_offset;
+    if (length != nullptr) *length = entry->size;
+    return descriptor;
 }
 
 std::vector<std::string> GuestApk::ListAssets(const std::string& directory) const {

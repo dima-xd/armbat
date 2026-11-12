@@ -24,6 +24,7 @@ public:
         std::uint64_t compressed_size = 0;
         std::uint64_t local_offset = 0;   // start of the entry's local header
         std::uint16_t method = 0;         // 0 stored, 8 deflated
+        std::uint16_t flags = 0;          // general-purpose ZIP flags
     };
 
     GuestApk() = default;
@@ -64,6 +65,13 @@ public:
     // "assets/resource_packs/vanilla/manifest.json".
     bool ReadAsset(const std::string& name, std::vector<std::uint8_t>* out,
                    std::string* error) const;
+				   
+    // Opens the APK itself for an uncompressed asset and returns the byte range
+    // occupied by that entry. The returned descriptor is a new host descriptor
+    // owned by the caller; compressed or encrypted entries cannot be exposed this
+    // way and return -1, matching AAsset_openFileDescriptor semantics.
+    int OpenAssetFileDescriptor(const std::string& name, std::uint64_t* start,
+                                std::uint64_t* length, std::string* error) const;
 
     // Immediate children of an asset directory, the names
     // AAssetDir_getNextFileName returns. The directory itself may be given with

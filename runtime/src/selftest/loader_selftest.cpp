@@ -1214,6 +1214,39 @@ SuiteReport RunLoaderSelftest() {
                                         native.size() == 2
                                             ? (native[0] + ", " + native[1]).c_str()
                                             : ""));
+											
+            // AAsset_openFileDescriptor can expose stored APK entries directly,
+            // but must reject compressed entries rather than returning a range
+            // containing deflated bytes.
+            {
+                constexpr char kAssetContents[] = "asset fd fixture\n";
+                std::uint64_t asset_start = 0;
+                std::uint64_t asset_length = 0;
+                std::string fd_error;
+                const int asset_fd = apk.OpenAssetFileDescriptor(
+                    "fd/stored.txt", &asset_start, &asset_length, &fd_error);
+                char asset_contents[sizeof(kAssetContents)]{};
+                const bool read_asset = asset_fd >= 0 && asset_length == sizeof(kAssetContents) - 1 &&
+                    ::pread(asset_fd, asset_contents, asset_length,
+                            static_cast<off_t>(asset_start)) ==
+                        static_cast<ssize_t>(asset_length) &&
+                    std::memcmp(asset_contents, kAssetContents, asset_length) == 0;
+                if (asset_fd >= 0) ::close(asset_fd);
+                report.Check("apk.asset_fd_stored", read_asset,
+                             read_asset ? "stored asset read through duplicated APK fd"
+                                        : (fd_error.empty() ? "stored asset fd read failed" : fd_error));
+
+                std::uint64_t compressed_start = 0;
+                std::uint64_t compressed_length = 0;
+                std::string compressed_error;
+                const int compressed_fd = apk.OpenAssetFileDescriptor(
+                    "fd/compressed.txt", &compressed_start, &compressed_length,
+                    &compressed_error);
+                if (compressed_fd >= 0) ::close(compressed_fd);
+                report.Check("apk.asset_fd_compressed", compressed_fd < 0,
+                             compressed_fd < 0 ? "compressed asset rejected for direct fd access"
+                                               : "compressed asset unexpectedly returned a descriptor");
+            }
 
             // The arm64 entry must not be mistaken for a guest library.
             const auto* arm64 = apk.Find("lib/arm64-v8a/libguesttest.so");
