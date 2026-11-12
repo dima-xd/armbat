@@ -20,6 +20,7 @@ class ArmbatApp : Application() {
     override fun onCreate() {
         super.onCreate()
         ArmbatLog.init(this)
+		GuestDexRuntime.initialize(this)
         installCrashHandler()
         GuestPendingIntents.host = this
     }
