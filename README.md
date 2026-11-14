@@ -1,5 +1,7 @@
 [English](README.md) · [中文](README.zh.md)
 
+[![Discord](https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?logo=discord&logoColor=white)](https://discord.gg/dSpQ7XamWT)
+
 # Armbat
 
 Armbat is a container for 32-bit ARM Android applications running on a 64-bit

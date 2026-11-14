@@ -232,6 +232,10 @@ enum SyscallNumber : std::uint32_t {
     kSysSchedGetPriorityMax = 159,
     kSysSchedGetPriorityMin = 160,
     kSysPpoll = 336,
+    // bionic has no epoll_wait syscall: its wrapper recomputes the sigset and
+    // forwards to epoll_pwait. Anything built on bionic's epoll_wait -- Mono's
+    // network thread, for one -- lands here instead of on 252.
+    kSysEpollPwait = 346,
     kSysTimerfdCreate = 350,
     kSysTimerfdSettime = 351,
     kSysTimerfdGettime = 352,
@@ -2224,7 +2228,8 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
                    : -errno;
     }
 
-    case kSysEpollWait: {
+    case kSysEpollWait:
+    case kSysEpollPwait: {
         const int max_events = static_cast<int>(args[2]);
         const std::uint32_t events = args[1];
         if (max_events <= 0 || max_events > 4096 ||
@@ -2232,8 +2237,14 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
             return -EINVAL;
         }
         std::vector<epoll_event> host_events(static_cast<std::size_t>(max_events));
-        const int result = ::epoll_wait(static_cast<int>(args[0]), host_events.data(), max_events,
-                                        static_cast<int>(args[3]));
+        // The guest's sigset_t is a 4-byte mask and the kernel ABI carries 8;
+        // the container never delivers guest signals, so the mask is dropped
+        // here the same way the HLE epoll_pwait drops it.
+        const int result = number == kSysEpollPwait
+                               ? ::epoll_pwait(static_cast<int>(args[0]), host_events.data(),
+                                               max_events, static_cast<int>(args[3]), nullptr)
+                               : ::epoll_wait(static_cast<int>(args[0]), host_events.data(),
+                                              max_events, static_cast<int>(args[3]));
         if (result < 0) {
             return -errno;
         }

@@ -1,5 +1,7 @@
 [English](README.md) · [中文](README.zh.md)
 
+[![Discord](https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?logo=discord&logoColor=white)](https://discord.gg/dSpQ7XamWT)
+
 # Armbat
 
 Armbat 是一个容器，用于在没有 32 位 ABI 的 64 位设备上运行 32 位 ARM Android

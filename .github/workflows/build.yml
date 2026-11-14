@@ -102,8 +102,8 @@ jobs:
           KEYSTORE_ALIAS: ${{ secrets.KEYSTORE_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
+          mkdir -p build/apk
           if [ -n "$ANDROID_KEYSTORE_BASE64" ]; then
-            mkdir -p build/apk
             printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 -d > build/apk/upload-keystore.jks
             {
               echo "ANDROID_KEYSTORE=$GITHUB_WORKSPACE/build/apk/upload-keystore.jks"
@@ -113,7 +113,22 @@ jobs:
             } >> "$GITHUB_ENV"
             echo "signing: upload keystore from secrets"
           else
-            echo "signing: no keystore in secrets, the APK will be unsigned"
+            # PRs (especially from forks) have no access to secrets. An unsigned
+            # APK cannot be installed at all, so sign with a throwaway key. Such
+            # a build is only for testing: it cannot update, or be updated over,
+            # a build signed with a different key.
+            keytool -genkeypair \
+              -keystore build/apk/ci-keystore.jks \
+              -storepass android -keypass android -alias ci \
+              -keyalg RSA -keysize 2048 -validity 3650 \
+              -dname "CN=Armbat CI, O=CI"
+            {
+              echo "ANDROID_KEYSTORE=$GITHUB_WORKSPACE/build/apk/ci-keystore.jks"
+              echo "KEYSTORE_PASSWORD=android"
+              echo "KEYSTORE_ALIAS=ci"
+              echo "KEY_PASSWORD=android"
+            } >> "$GITHUB_ENV"
+            echo "signing: throwaway CI key (no keystore in secrets, not for release)"
           fi
 
       - name: Unit tests

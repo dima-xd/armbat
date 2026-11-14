@@ -117,6 +117,15 @@ struct WorkerContext {
 
 static_assert(sizeof(WorkerContext) == 16, "the guest lender stub expects this layout");
 static_assert(kWorkerSlots * sizeof(WorkerContext) <= 0x1000, "the contexts must fit one page");
+// The pthread_t outputs live in the same page, right after the contexts. They used
+// to start at a fixed 0x100, which is inside the array: pthread_create wrote its
+// answer into the ready/tls/sp/park words of the last contexts, so those lenders
+// parked on a pointer instead of a zero and never slept -- five threads spun at a
+// full core each -- and a borrowed context handed the engine a pthread_t as its
+// TLS base and stack pointer.
+constexpr std::uint32_t kWorkerThreadIds = kWorkerSlots * sizeof(WorkerContext);
+static_assert(kWorkerThreadIds + kWorkerSlots * sizeof(std::uint32_t) <= 0x1000,
+              "the thread ids must fit the context page");
 
 // A library whose JNI_OnLoad has not run yet. The file name is what
 // System.loadLibrary asks for; the soname is what the image calls itself and
@@ -598,7 +607,7 @@ struct GuestContainer::Impl {
         auto* contexts = reinterpret_cast<WorkerContext*>(arena.Ptr(kWorkerJobsAddr));
         std::memset(contexts, 0, kWorkerSlots * sizeof(WorkerContext));
         // pthread_t outputs, above the contexts in the same page.
-        const std::uint32_t thread_ids = kWorkerJobsAddr + 0x100;
+        const std::uint32_t thread_ids = kWorkerJobsAddr + kWorkerThreadIds;
         int started = 0;
         for (std::uint32_t i = 0; i < kWorkerSlots; ++i) {
             const std::uint32_t context = kWorkerJobsAddr + i * sizeof(WorkerContext);
