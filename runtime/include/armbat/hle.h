@@ -92,6 +92,10 @@ public:
 
     void Add(std::string name, HleFunction function);
 
+    // Stateless, high-frequency imports can use a plain function pointer and
+    // avoid the std::function trampoline on every SVC dispatch.
+    void AddFast(std::string name, void (*function)(HleCall&));
+
     // Guest memory for an imported *variable* rather than a function, such as
     // `stdout`. The import resolves to the returned address, so guest code can
     // load and store the cell like any other global.
@@ -148,6 +152,18 @@ public:
 
 private:
     struct RecentCall;
+    struct HleEntry {
+        HleFunction function;
+        void (*fast_function)(HleCall&) = nullptr;
+
+        void Invoke(HleCall& call) const {
+            if (fast_function != nullptr) {
+                fast_function(call);
+            } else if (function) {
+                function(call);
+            }
+        }
+    };
     bool Dispatch(std::uint32_t svc, A32Machine& machine);
     bool DispatchIndex(std::uint32_t index, A32Machine& machine);
     void CensusCall(std::uint32_t index) const;
@@ -157,8 +173,13 @@ private:
     A32Machine& machine_;
     GuestArena& arena_;
     std::uint32_t stub_base_;
+    // Per-call history and graphics census are useful while debugging, but
+    // their shared atomics sit directly on the SVC/HLE hot path. Opt in with
+    // ARMBAT_HLE_TRACE=1 and ARMBAT_GFX_CENSUS=1 respectively.
+    bool trace_calls_ = false;
+    bool graphics_census_ = false;
     std::uint32_t data_cursor_ = 0;
-    std::vector<HleFunction> functions_;
+    std::vector<HleEntry> functions_;
     std::unordered_map<std::string, std::uint32_t> by_name_;
     std::unordered_map<std::string, std::uint32_t> data_by_name_;
     struct DataBlock {

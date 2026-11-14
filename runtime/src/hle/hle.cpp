@@ -56,6 +56,12 @@ constexpr std::uint32_t kDataRegionSize = 0x1000000;
 // the data area begins above it.
 constexpr std::uint32_t kStubRegionLimit = 0x100000;
 
+bool EnvironmentFlag(const char* name) {
+    const char* value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0 &&
+           std::strcmp(value, "false") != 0 && std::strcmp(value, "off") != 0;
+}
+
 // Guest wchar_t is 4 bytes on ARM32. %ls and %lc hand over UTF-32.
 void AppendUtf8(std::string& out, std::uint32_t code) {
     if (code < 0x80) {
@@ -257,18 +263,39 @@ std::byte* HleCall::Mapped(std::uint32_t address, std::size_t length) {
 }
 
 HleRegistry::HleRegistry(A32Machine& machine, GuestArena& arena, std::uint32_t stub_base)
-    : machine_(machine), arena_(arena), stub_base_(stub_base) {}
+    : machine_(machine), arena_(arena), stub_base_(stub_base),
+      trace_calls_(EnvironmentFlag("ARMBAT_HLE_TRACE")),
+      graphics_census_(EnvironmentFlag("ARMBAT_GFX_CENSUS")) {}
 
 void HleRegistry::Add(std::string name, HleFunction function) {
+    HleEntry entry;
+    entry.function = std::move(function);
     const auto existing = by_name_.find(name);
     if (existing != by_name_.end()) {
-        functions_[existing->second] = std::move(function);
+        functions_[existing->second] = std::move(entry);
         names_[existing->second] = std::move(name);
         return;
     }
     by_name_.emplace(name, static_cast<std::uint32_t>(functions_.size()));
     names_.push_back(std::move(name));
-    functions_.push_back(std::move(function));
+    functions_.push_back(std::move(entry));
+}
+
+void HleRegistry::AddFast(std::string name, void (*function)(HleCall&)) {
+    if (function == nullptr) {
+        return;
+    }
+    HleEntry entry;
+    entry.fast_function = function;
+    const auto existing = by_name_.find(name);
+    if (existing != by_name_.end()) {
+        functions_[existing->second] = std::move(entry);
+        names_[existing->second] = std::move(name);
+        return;
+    }
+    by_name_.emplace(name, static_cast<std::uint32_t>(functions_.size()));
+    names_.push_back(std::move(name));
+    functions_.push_back(std::move(entry));
 }
 
 std::uint32_t HleRegistry::Resolve(std::string_view name) const {
@@ -400,9 +427,9 @@ bool HleRegistry::Prepare(std::string* error) {
         std::memcpy(arena_.Ptr(stub_base_ + i * kStubSize), code, sizeof(code));
     }
 
-    // Per-function counters for the graphics census, sized once the table is
-    // known. A function registered after this point is simply not counted.
-    if (counts_size_ < functions_.size()) {
+    // Allocate counters only when requested. In the default performance mode,
+    // graphics dispatch does not touch a shared atomic on every draw call.
+    if (graphics_census_ && counts_size_ < functions_.size()) {
         counts_ = std::make_unique<std::atomic<std::uint32_t>[]>(functions_.size());
         for (std::size_t i = 0; i < functions_.size(); ++i) {
             counts_[i].store(0, std::memory_order_relaxed);
@@ -430,7 +457,9 @@ void HleRegistry::Record(std::uint32_t index, std::uint32_t pc, bool jni) const 
 }
 
 void HleRegistry::RecordJniCall(std::uint32_t index, std::uint32_t pc) {
-    Record(index, pc, true);
+    if (trace_calls_) {
+        Record(index, pc, true);
+    }
 }
 
 std::string HleRegistry::DescribeRecent(const RecentCall& entry) const {
@@ -606,15 +635,23 @@ bool HleRegistry::Dispatch(std::uint32_t svc, A32Machine& machine) {
 
 bool HleRegistry::DispatchIndex(std::uint32_t index, A32Machine& machine) {
     HleCall call(machine, arena_);
+    // Keep the most recent symbol name available for failure reports. The
+    // argument snapshot, shared call ring and per-thread HLE label are optional.
     last_index_.store(index, std::memory_order_relaxed);
-    for (std::size_t i = 0; i < 4; ++i) {
-        last_args_[i].store(call.Arg(i), std::memory_order_relaxed);
+    if (trace_calls_) {
+        for (std::size_t i = 0; i < 4; ++i) {
+            last_args_[i].store(call.Arg(i), std::memory_order_relaxed);
+        }
+        Record(index, machine.Reg(14), false);
+        machine.SetHleCall(names_[index].c_str());
     }
-    Record(index, machine.Reg(14), false);
-    machine.SetHleCall(names_[index].c_str());
-    CensusCall(index);
-    functions_[index](call);
-    machine.SetHleCall(nullptr);
+    if (counts_ != nullptr) {
+        CensusCall(index);
+    }
+    functions_[index].Invoke(call);
+    if (trace_calls_) {
+        machine.SetHleCall(nullptr);
+    }
     return true;
 }
 
