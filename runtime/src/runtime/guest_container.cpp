@@ -1476,10 +1476,15 @@ std::string GuestContainer::LoadApk(const std::string& apk_path, const std::stri
     // is mapped: the application's getaddrinfo() then finds it first, and a
     // server address a player typed resolves like it does on a phone. A missing
     // shim is not fatal -- it costs name lookups only.
-    if (impl_->bionic->Dlopen("/system/lib/libarmbat_net.so", 0x102 /*RTLD_NOW|RTLD_GLOBAL*/) ==
-        0) {
+    const std::uint32_t net_handle =
+        impl_->bionic->Dlopen("/system/lib/libarmbat_net.so", 2 /*RTLD_NOW*/);
+    if (net_handle == 0) {
         ARMBAT_LOG_WARN("Armbat", "resolve shim not loaded: %s",
                         impl_->bionic->LastError().c_str());
+    } else if (impl_->bionic->Dlsym(net_handle, "getaddrinfo") == 0) {
+        ARMBAT_LOG_WARN("Armbat", "network: resolver loaded but getaddrinfo is not exported");
+    } else {
+        ARMBAT_LOG_INFO("Armbat", "network: guest DNS resolver loaded and exported");
     }
 
     std::vector<GuestApk::ExtractedNative> extracted;
