@@ -83,6 +83,19 @@ public:
     std::uint32_t CallNestedPreservingRegisters(std::uint32_t entry,
                                                 const std::vector<std::uint32_t>& args);
 
+    // Called from the JIT's memory callbacks when the arena cannot serve an
+    // access. The run then stops at the faulting instruction, and the fault is
+    // what the guest's own signal handler is allowed to answer first.
+    void NoteMemoryFault(std::uint32_t address, std::uint32_t size, bool write);
+    bool HasMemoryFault() const;
+    std::uint32_t MemoryFaultAddress() const;
+    void ClearMemoryFault();
+
+    // Guest CPSR of the code that is running. A signal context carries it, and
+    // the handler's copy decides which instruction set the thread resumes in.
+    std::uint32_t Cpsr() const;
+    void SetCpsr(std::uint32_t value);
+
     // Queues a guest signal on this machine's thread. Safe to call from another
     // thread: the pending set is atomic and the JIT is halted through its own
     // halt flag, which RunJit sees at the next slice boundary.

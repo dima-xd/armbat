@@ -38,6 +38,16 @@ bool HasGuestSignalHandler(int signal);
 // called on that thread at a safe point: between JIT slices or on SVC entry.
 void DeliverGuestSignals(A32Machine& machine);
 
+// Reports a guest memory fault as the signal a device would raise, so the
+// guest's own handler decides what the fault means: Mono turns a read of a
+// near-null address into a NullReferenceException and rewrites the context so
+// the thread resumes at its thrower instead of at the instruction that faulted.
+// Must be called on the faulting thread with the register file of the code that
+// faulted, i.e. after the JIT stopped on the fault. Returns true when the guest
+// took the fault and the register file now holds where to continue; false means
+// nobody took it and the caller reports the fault and ends the run.
+bool DeliverGuestFault(A32Machine& machine, std::uint32_t address);
+
 // Queues `signal` on the guest thread `tid` and interrupts it. `tid` is a host
 // thread id, which is what the guest's clone() returned. Returns false when no
 // such thread is alive.

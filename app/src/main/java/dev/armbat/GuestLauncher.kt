@@ -1439,14 +1439,17 @@ class GuestLauncher(private val host: Activity) {
         runCatching {
             if (hosted.resumed) {
                 windowFocus(hosted.activity, false)
+                ArmbatLog.i(TAG, "destroy: pause ${hosted.info.name}")
                 lifecycle(hosted.activity, "onPause")
                 hosted.resumed = false
+                ArmbatLog.i(TAG, "destroy: paused ${hosted.info.name}")
             }
             if (hosted.started) {
                 lifecycle(hosted.activity, "onStop")
                 hosted.started = false
             }
             lifecycle(hosted.activity, "onDestroy")
+            ArmbatLog.i(TAG, "destroy: destroyed ${hosted.info.name}")
         }.onFailure { ArmbatLog.w(TAG, "guest activity ${hosted.info.name}: $it") }
     }
 

@@ -57,6 +57,22 @@ void WakeupHandler(int) {
     // handler runs later, on the guest thread, at a safe point.
 }
 
+// The ARM32 siginfo_t and ucontext_t the guest's own C library and its runtime
+// read. sigcontext is the kernel's, unchanged since ARMv7: three bookkeeping
+// words, then r0-r10, fp, ip, sp, lr, pc, cpsr and the address that faulted.
+// ucontext keeps it at 0x14, after the flags, the link and the stack.
+constexpr std::uint32_t kUcMcontext = 0x14;
+// siginfo_t: si_signo, si_errno, si_code, then the union; SIGSEGV fills
+// _sigfault with the address that faulted.
+constexpr std::uint32_t kSiSegv = 11;
+constexpr std::uint32_t kSegvMaperr = 1;  // the page is not mapped at all
+constexpr std::uint32_t kThumbCpsr = 0x20;
+
+std::uint32_t FrameForThisThread() {
+    return kFrameBase + (static_cast<std::uint32_t>(::gettid()) & (kFrameSlots - 1)) *
+                           kFrameSlotSize;
+}
+
 }  // namespace
 
 void InitGuestSignals(GuestArena& arena) {
@@ -94,6 +110,16 @@ void SetGuestSignalAction(int signal, std::uint32_t handler, std::uint32_t flags
                           std::uint32_t restorer) {
     if (signal <= 0 || signal >= 65) {
         return;
+    }
+    // A guest that installs a handler for a fault signal is a guest that expects
+    // faults to become its exceptions; one line names it at boot, which is the
+    // difference between "the runtime took the fault" and "nobody was there".
+    if (signal == kSiSegv && handler != kSigDfl && handler != kSigIgn) {
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) {
+            ARMBAT_LOG_INFO("Armbat", "signals: SIGSEGV handler at 0x%08x flags=0x%x", handler,
+                            flags);
+        }
     }
     const std::lock_guard lock(g_actions_mutex);
     g_actions[signal].handler = handler;
@@ -148,9 +174,7 @@ void DeliverGuestSignals(A32Machine& machine) {
             continue;
         }
 
-        const std::uint32_t frame =
-            kFrameBase + (static_cast<std::uint32_t>(::gettid()) & (kFrameSlots - 1)) *
-                             kFrameSlotSize;
+        const std::uint32_t frame = FrameForThisThread();
         // siginfo_t on ARM32: int si_signo, si_errno, si_code, then the union.
         std::uint32_t info[32] = {};
         info[0] = signal;
@@ -168,6 +192,115 @@ void DeliverGuestSignals(A32Machine& machine) {
         }
         machine.CallNestedPreservingRegisters(action.handler, arguments);
     }
+}
+
+bool DeliverGuestFault(A32Machine& machine, std::uint32_t address) {
+    // One fault at a time on this thread: a handler that faults again would
+    // rewrite the frame the outer handler is still reading.
+    static thread_local int depth = 0;
+    // A handler that returns the context unchanged is a handler that only
+    // watched (or repaired the page). Retrying is what a device does, but it
+    // has to end: the same pc faulting again and again is a run that would
+    // never report anything.
+    static thread_local std::uint32_t retry_pc = 0;
+    static thread_local int retries = 0;
+
+    if (depth != 0 || !g_ready.load(std::memory_order_acquire) || g_arena == nullptr) {
+        return false;
+    }
+    Action action;
+    {
+        const std::lock_guard lock(g_actions_mutex);
+        action = g_actions[kSiSegv];
+    }
+    if (action.handler == kSigDfl || action.handler == kSigIgn) {
+        return false;
+    }
+
+    const std::uint32_t frame = FrameForThisThread();
+    const std::uint32_t ucontext = frame + kUcontextOffset;
+    std::memset(g_arena->Ptr(frame), 0, kFrameSlotSize);
+
+    // siginfo_t, ARM32: si_signo, si_errno, si_code, then _sigfault.si_addr.
+    std::uint32_t* const info = reinterpret_cast<std::uint32_t*>(g_arena->Ptr(frame));
+    info[0] = kSiSegv;
+    info[2] = kSegvMaperr;
+    info[3] = address;
+
+    // The register file of the code that faulted, in the layout of the kernel's
+    // struct sigcontext. A handler that wants the thread to continue elsewhere
+    // writes pc here; the register file is read back after it returns, which is
+    // what rt_sigreturn does on a device.
+    std::uint32_t* const context =
+        reinterpret_cast<std::uint32_t*>(g_arena->Ptr(ucontext + kUcMcontext));
+    std::uint32_t interrupted[16] = {};
+    for (std::uint32_t index = 0; index < 16; ++index) {
+        interrupted[index] = machine.Reg(index);
+    }
+    const std::uint32_t interrupted_cpsr = machine.Cpsr();
+    for (std::uint32_t index = 0; index <= 10; ++index) {
+        context[3 + index] = interrupted[index];
+    }
+    context[14] = interrupted[11];
+    context[15] = interrupted[12];
+    context[16] = interrupted[13];
+    context[17] = interrupted[14];
+    context[18] = interrupted[15];
+    context[19] = interrupted_cpsr;
+    context[20] = address;
+
+    std::vector<std::uint32_t> arguments{kSiSegv};
+    if ((action.flags & kSaSiginfo) != 0) {
+        arguments.push_back(frame);
+        arguments.push_back(ucontext);
+    }
+
+    depth = 1;
+    machine.CallNestedPreservingRegisters(action.handler, arguments);
+    depth = 0;
+
+    // The handler ran with the interrupted file saved and restored around it, so
+    // the only way to say "continue elsewhere" is the context it was given.
+    // One line for the first fault a thread takes: a runtime that converts
+    // faults into exceptions does it often, and each one is normal there.
+    static thread_local bool logged = false;
+    if (!logged) {
+        logged = true;
+        ARMBAT_LOG_INFO("Armbat", "fault: sigsegv at 0x%08x taken by the guest, pc=0x%08x",
+                        address, interrupted[15]);
+    }
+    const std::uint32_t resume_pc = context[18];
+    if (resume_pc == interrupted[15] && context[19] == interrupted_cpsr) {
+        if (retry_pc == interrupted[15]) {
+            if (++retries > 4) {
+                return false;
+            }
+        } else {
+            retry_pc = interrupted[15];
+            retries = 0;
+        }
+        return true;  // retry the instruction: the handler left the context alone
+    }
+    retry_pc = 0;
+    retries = 0;
+
+    std::uint32_t pc = resume_pc;
+    std::uint32_t cpsr = context[19];
+    if ((pc & 1u) != 0) {
+        // An exception handler is often a Thumb pointer with the bit still in it.
+        pc &= ~1u;
+        cpsr |= kThumbCpsr;
+    }
+    for (std::uint32_t index = 0; index <= 10; ++index) {
+        machine.SetReg(index, context[3 + index]);
+    }
+    machine.SetReg(11, context[14]);
+    machine.SetReg(12, context[15]);
+    machine.SetReg(13, context[16]);
+    machine.SetReg(14, context[17]);
+    machine.SetReg(15, pc);
+    machine.SetCpsr(cpsr);
+    return true;
 }
 
 }  // namespace armbat

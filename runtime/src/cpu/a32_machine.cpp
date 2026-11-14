@@ -1,6 +1,7 @@
-﻿#include "armbat/a32_machine.h"
+#include "armbat/a32_machine.h"
 #include "armbat/crash_handler.h"
 #include "armbat/guest_modules.h"
+#include "armbat/guest_signal.h"
 #include "armbat/hle.h"
 
 #include <algorithm>
@@ -436,12 +437,18 @@ public:
     void NoteError(std::string message) { Fail(std::move(message)); }
 
 private:
+    // An access the arena cannot serve is a fault, not a value. The guest's own
+    // signal handler is what turns it into an exception -- Mono converts a read
+    // of a near-null address into a NullReferenceException and resumes at its
+    // own thrower -- so the container reports the fault and stops the run at
+    // the instruction that caused it instead of inventing a zero. A run that
+    // carries on with a zero dies somewhere else entirely, which is a game that
+    // quits and a stack that names nothing.
     template <typename T>
     T Read(VAddr addr) {
         ++reads_;
         if (!arena_.IsMapped(addr, sizeof(T))) {
-            Fail("read of " + std::to_string(sizeof(T)) + " bytes from unmapped guest address " +
-                 Hex(addr));
+            NoteFault(addr, sizeof(T), false);
             return 0;
         }
         T value;
@@ -453,8 +460,7 @@ private:
     void Write(VAddr addr, T value) {
         ++writes_;
         if (!arena_.IsMapped(addr, sizeof(T))) {
-            Fail("write of " + std::to_string(sizeof(T)) + " bytes to unmapped guest address " +
-                 Hex(addr));
+            NoteFault(addr, sizeof(T), true);
             return;
         }
         std::memcpy(arena_.Ptr(addr), &value, sizeof(value));
@@ -464,8 +470,7 @@ private:
     bool WriteExclusive(VAddr addr, T value, T expected) {
         ++writes_;
         if (!arena_.IsMapped(addr, sizeof(T))) {
-            Fail("exclusive write of " + std::to_string(sizeof(T)) +
-                 " bytes to unmapped guest address " + Hex(addr));
+            NoteFault(addr, sizeof(T), true);
             return false;
         }
         // A compare and a store are one step: another guest thread's plain
@@ -486,82 +491,99 @@ private:
     }
 
     void Fail(std::string message) {
-        if (error_.empty()) {
-            // The JIT keeps the register file of the running block; r15 is the
-            // instruction that faulted, which is the only way to tell where in
-            // an initializer the container handed out a bad pointer.
-            std::uint32_t pc = 0;
-            std::uint32_t regs[16] = {};
-            if (jit_ != nullptr) {
-                for (std::size_t i = 0; i < 16; ++i) {
-                    regs[i] = jit_->Regs()[i];
-                }
-                pc = regs[15];
+        const bool first = error_.empty();
+        // The JIT keeps the register file of the running block; r15 is the
+        // instruction that faulted, which is the only way to tell where in
+        // an initializer the container handed out a bad pointer.
+        std::uint32_t pc = 0;
+        std::uint32_t regs[16] = {};
+        if (jit_ != nullptr) {
+            for (std::size_t i = 0; i < 16; ++i) {
+                regs[i] = jit_->Regs()[i];
             }
-            char suffix[288];
-            std::snprintf(suffix, sizeof(suffix),
-                          " (pc=0x%08x lr=0x%08x sp=0x%08x cpsr=0x%08x r0=0x%08x r1=0x%08x "
-                          "r2=0x%08x r3=0x%08x r4=0x%08x r5=0x%08x r6=0x%08x r7=0x%08x "
-                          "r8=0x%08x r12=0x%08x)",
-                          pc, regs[14], regs[13], jit_ != nullptr ? jit_->Cpsr() : 0, regs[0],
-                          regs[1], regs[2], regs[3], regs[4], regs[5], regs[6], regs[7], regs[8],
-                          regs[12]);
-            error_ = std::move(message) + suffix;
-            ARMBAT_LOG_ERROR("Armbat", "%s", error_.c_str());
+            pc = regs[15];
+        }
+        char suffix[288];
+        std::snprintf(suffix, sizeof(suffix),
+                      " (pc=0x%08x lr=0x%08x sp=0x%08x cpsr=0x%08x r0=0x%08x r1=0x%08x "
+                      "r2=0x%08x r3=0x%08x r4=0x%08x r5=0x%08x r6=0x%08x r7=0x%08x "
+                      "r8=0x%08x r12=0x%08x)",
+                      pc, regs[14], regs[13], jit_ != nullptr ? jit_->Cpsr() : 0, regs[0],
+                      regs[1], regs[2], regs[3], regs[4], regs[5], regs[6], regs[7], regs[8],
+                      regs[12]);
+        std::string text = std::move(message) + suffix;
+        if (first) {
+            error_ = text;
+        }
+        // Every error is printed, not only the first: an "unhandled SVC" that
+        // ends a run after an earlier fault used to be dropped here, and the
+        // line that explains the run was the one that never appeared.
+        ARMBAT_LOG_ERROR("Armbat", "%s", text.c_str());
 
+        if (first && jit_ != nullptr) {
             // Every fault gets the same report. A read of address zero used to
             // arrive with less than a jump to zero: the stack scan and the
             // blocks, but not the frame chain and not the calls that led here,
             // which are exactly what names the caller of the bad pointer.
-            if (jit_ != nullptr) {
-                DumpGuestTrace(pc, regs[14], regs[13], regs[11]);
-                DumpRecentBlocks();
-                DumpRecentCalls();
-                // TEMP: Subway Surfers 1.0.4 faults inside a stream reader and
-                // the reader's own fields say where its position stopped, which
-                // is the one fact the registers do not carry. Remove with the
-                // fix.
-                for (std::uint32_t base : {regs[4], regs[5]}) {
-                    if (!arena_.IsMapped(base, 32)) {
+            DumpGuestTrace(pc, regs[14], regs[13], regs[11]);
+            DumpRecentBlocks();
+            DumpRecentCalls();
+            // TEMP: Subway Surfers 1.0.4 faults inside a stream reader and
+            // the reader's own fields say where its position stopped, which
+            // is the one fact the registers do not carry. Remove with the
+            // fix.
+            for (std::uint32_t base : {regs[4], regs[5]}) {
+                if (!arena_.IsMapped(base, 32)) {
+                    continue;
+                }
+                std::uint32_t words[8];
+                std::memcpy(words, arena_.Ptr(base), sizeof(words));
+                ARMBAT_LOG_ERROR("Armbat",
+                                 "fault words: %08x: %08x %08x %08x %08x %08x %08x %08x %08x",
+                                 base, words[0], words[1], words[2], words[3], words[4],
+                                 words[5], words[6], words[7]);
+                // The reader's own fields look like {position, buffer, end}:
+                // the buffer's first and last words say which asset this is
+                // and whether the position is where the format says it is.
+                for (std::uint32_t sample :
+                     {words[1], words[0] >= 0x20 ? words[0] - 0x20 : 0}) {
+                    if (sample == 0 || !arena_.IsMapped(sample, 64)) {
                         continue;
                     }
-                    std::uint32_t words[8];
-                    std::memcpy(words, arena_.Ptr(base), sizeof(words));
-                    ARMBAT_LOG_ERROR("Armbat",
-                                     "fault words: %08x: %08x %08x %08x %08x %08x %08x %08x %08x",
-                                     base, words[0], words[1], words[2], words[3], words[4],
-                                     words[5], words[6], words[7]);
-                    // The reader's own fields look like {position, buffer, end}:
-                    // the buffer's first and last words say which asset this is
-                    // and whether the position is where the format says it is.
-                    for (std::uint32_t sample :
-                         {words[1], words[0] >= 0x20 ? words[0] - 0x20 : 0}) {
-                        if (sample == 0 || !arena_.IsMapped(sample, 64)) {
-                            continue;
-                        }
-                        std::uint32_t peek[16];
-                        std::memcpy(peek, arena_.Ptr(sample), sizeof(peek));
-                        std::string text;
-                        char cell[16];
-                        for (std::uint32_t word : peek) {
-                            std::snprintf(cell, sizeof(cell), "%08x ", word);
-                            text += cell;
-                        }
-                        ARMBAT_LOG_ERROR("Armbat", "fault data: %08x: %s", sample,
-                                         text.c_str());
+                    std::uint32_t peek[16];
+                    std::memcpy(peek, arena_.Ptr(sample), sizeof(peek));
+                    std::string dump;
+                    char cell[16];
+                    for (std::uint32_t word : peek) {
+                        std::snprintf(cell, sizeof(cell), "%08x ", word);
+                        dump += cell;
                     }
+                    ARMBAT_LOG_ERROR("Armbat", "fault data: %08x: %s", sample,
+                                     dump.c_str());
                 }
             }
-            // A fault has to stop the block. Running it again would re-execute
-            // the same bad access forever: a load from an unmapped page returns
-            // a value, and a store that cannot complete turns an atomic loop
-            // into a spin that never reports anything.
-            if (jit_ != nullptr) {
-                jit_->HaltExecution(Dynarmic::HaltReason::UserDefined1);
-            }
-            // The report is the reason this run is being read at all, and the
-            // process may die before the writer thread drains its queue.
-            armbat::LogFlush();
+        }
+        // A fault has to stop the block. Running it again would re-execute
+        // the same bad access forever: a load from an unmapped page returns
+        // a value, and a store that cannot complete turns an atomic loop
+        // into a spin that never reports anything.
+        if (jit_ != nullptr) {
+            jit_->HaltExecution(Dynarmic::HaltReason::UserDefined1);
+        }
+        // The report is the reason this run is being read at all, and the
+        // process may die before the writer thread drains its queue.
+        armbat::LogFlush();
+    }
+
+    void NoteFault(VAddr addr, std::uint32_t size, bool write) {
+        if (machine != nullptr) {
+            machine->NoteMemoryFault(addr, size, write);
+        }
+        if (jit_ != nullptr) {
+            // MemoryAbort is the only halt dynarmic reports from inside a
+            // block, and the emitted check returns with r15 on the faulting
+            // instruction, which is the pc the guest handler has to see.
+            jit_->HaltExecution(Dynarmic::HaltReason::MemoryAbort);
         }
     }
 
@@ -644,6 +666,13 @@ struct A32Machine::Impl {
         user_config.enable_cycle_counting = config.cycle_counting;
         user_config.always_little_endian = true;
         user_config.code_cache_size = code_cache_size;
+        // A memory access the arena cannot serve has to end the block where it
+        // happened. Without the emitted check the block runs to its terminal
+        // with an invented zero, and the fault lands in the guest's lap at the
+        // end of the block: an address it cannot explain and a pc that is not
+        // the one that faulted. The check costs three host instructions on the
+        // path that already made a host call, and only there.
+        user_config.check_halt_on_memory_access = true;
         if (config.fastmem && arena.Ok()) {
             user_config.fastmem_pointer = reinterpret_cast<std::uintptr_t>(arena.Base());
         }
@@ -686,6 +715,7 @@ struct A32Machine::Impl {
         auto& regs = target.Regs();
         regs.fill(0);
         regs[13] = stack_pointer;
+        fault.pending = false;
 
         std::size_t index = 0;
         for (std::uint32_t arg : args) {
@@ -716,14 +746,68 @@ struct A32Machine::Impl {
     // flushes as responsive as they were without linking.
     static constexpr std::uint64_t kSliceTicks = 20'000'000;
 
+    // The first access of a run that the arena could not serve.
+    struct Fault {
+        std::uint32_t address = 0;
+        std::uint32_t size = 0;
+        bool write = false;
+        bool pending = false;
+    };
+
+    static std::string DescribeFault(const Fault& failed) {
+        char address[16];
+        std::snprintf(address, sizeof(address), "0x%08x", failed.address);
+        return std::string(failed.write ? "write of " : "read of ") +
+               std::to_string(failed.size) + (failed.write ? " bytes to " : " bytes from ") +
+               "unmapped guest address " + address;
+    }
+
     // The JIT's run loop: CacheInvalidation is a normal exit path, not a failure.
     std::uint32_t RunJit(Dynarmic::A32::Jit& target) {
         RunningMachine running(owner, &running_tid);
+        // A run that keeps faulting without making progress is a handler that
+        // resumes somewhere that faults again; the report is worth more than
+        // the answer it would eventually give.
+        int delivered = 0;
         for (;;) {
             for (auto& callbacks : callback_set) {
                 callbacks->SetTickBudget(kSliceTicks);
             }
             halt_reason = target.Run();
+            if ((static_cast<std::uint32_t>(halt_reason) &
+                 static_cast<std::uint32_t>(HaltReason::MemoryAbort)) != 0) {
+                // A guest access the arena could not serve. On the device the
+                // access raises SIGSEGV and the guest's own handler decides
+                // what happens: Mono turns a near-null read into a
+                // NullReferenceException and rewrites the context so the
+                // thread resumes at its thrower. Only when there is no handler,
+                // or the handler leaves the context alone, is the fault fatal
+                // to the run -- which is what a device does as well.
+                //
+                // The run stopped on the faulting instruction and not at the
+                // end of its block, so the context the handler is given is the
+                // one the guest would have seen.
+                if (owner != nullptr && fault.pending && delivered < 4096 &&
+                    DeliverGuestFault(*owner, fault.address)) {
+                    fault.pending = false;
+                    ++delivered;
+                    continue;
+                }
+                const Fault failed = fault;
+                fault.pending = false;
+                // Report through the callbacks of the Jit that faulted: the pc
+                // and the register file in the report are that run's.
+                Callbacks* const source = [&] {
+                    for (std::size_t index = 0; index < jits.size(); ++index) {
+                        if (jits[index].get() == &target) {
+                            return callback_set[index].get();
+                        }
+                    }
+                    return callback_set.front().get();
+                }();
+                source->NoteError(DescribeFault(failed));
+                break;
+            }
             if ((static_cast<std::uint32_t>(halt_reason) &
                  static_cast<std::uint32_t>(HaltReason::UserDefined2)) != 0) {
                 // Another thread asked this machine to stop so it could run a
@@ -769,6 +853,7 @@ struct A32Machine::Impl {
     std::uint32_t sp = 0;
     std::uint32_t tls_base = 0;
     std::uint32_t return_trap = 0;
+    Fault fault;
     std::vector<A32Machine::SvcHandler> svc_handlers;
     std::vector<std::unique_ptr<Callbacks>> callback_set;
     std::vector<std::unique_ptr<Dynarmic::A32::Jit>> jits;
@@ -900,6 +985,26 @@ std::uint32_t A32Machine::ProcessorId() const {
 void A32Machine::SetHleCall(const char* name) { impl_->hle_call.store(name); }
 
 const char* A32Machine::HleCallName() const { return impl_->hle_call.load(); }
+
+void A32Machine::NoteMemoryFault(std::uint32_t address, std::uint32_t size, bool write) {
+    if (impl_->fault.pending) {
+        return;  // the first fault of a run is the one that explains it
+    }
+    impl_->fault.address = address;
+    impl_->fault.size = size;
+    impl_->fault.write = write;
+    impl_->fault.pending = true;
+}
+
+bool A32Machine::HasMemoryFault() const { return impl_->fault.pending; }
+
+std::uint32_t A32Machine::MemoryFaultAddress() const { return impl_->fault.address; }
+
+void A32Machine::ClearMemoryFault() { impl_->fault.pending = false; }
+
+std::uint32_t A32Machine::Cpsr() const { return impl_->Current().Cpsr(); }
+
+void A32Machine::SetCpsr(std::uint32_t value) { impl_->Current().SetCpsr(value); }
 
 A32Machine* CurrentGuestMachine() { return t_current_machine; }
 
