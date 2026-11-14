@@ -5,7 +5,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 
@@ -37,6 +39,29 @@ using Dynarmic::HaltReason;
 constexpr VAddr kSentinelLr = 0xFFFFFFF0u;
 constexpr std::uint32_t kUserModeCpsr = 0x00000010u;
 constexpr std::uint32_t kThumbBit = 0x00000020u;
+
+std::uint64_t JitSliceTicks() {
+    // Keep the previous responsiveness by default. A device-specific override
+    // is available for measured experiments without rebuilding the runtime.
+    static const std::uint64_t ticks = [] {
+        constexpr std::uint64_t kDefault = 20'000'000;
+        constexpr std::uint64_t kMinimum = 1'000'000;
+        constexpr std::uint64_t kMaximum = 200'000'000;
+        const std::string value = SystemProperty("debug.armbat.jit_slice_ticks");
+        if (value.empty()) {
+            return kDefault;
+        }
+        char* end = nullptr;
+        errno = 0;
+        const unsigned long long parsed = std::strtoull(value.c_str(), &end, 10);
+        if (errno == 0 && end != value.c_str() && *end == '\0' && parsed >= kMinimum &&
+            parsed <= kMaximum) {
+            return static_cast<std::uint64_t>(parsed);
+        }
+        return kDefault;
+    }();
+    return ticks;
+}
 
 // Which machine is running guest code on this thread. A Java method the guest
 // called can reach native code again, and that callback belongs to the machine
@@ -149,7 +174,8 @@ private:
 class Callbacks final : public Dynarmic::A32::UserCallbacks {
 public:
     Callbacks(GuestArena& arena, std::uint64_t tick_budget)
-        : arena_(arena), tick_budget_(tick_budget) {}
+        : arena_(arena), tick_budget_(tick_budget),
+          trace_recent_pcs_(SystemPropertyEnabled("debug.armbat.jit_trace", true)) {}
 
     void Attach(Dynarmic::A32::Jit* jit) { jit_ = jit; }
 
@@ -306,7 +332,7 @@ public:
     }
 
     std::optional<std::uint32_t> MemoryReadCode(VAddr addr) override {
-        if (jit_ != nullptr) {
+        if (jit_ != nullptr && trace_recent_pcs_) {
             recent_pcs_[recent_count_ & (kRecentPcs - 1)] = addr;
             ++recent_count_;
         }
@@ -392,7 +418,7 @@ public:
 
     void AddTicks(std::uint64_t ticks) override {
         ticks_ += ticks;
-        if (jit_ != nullptr) {
+        if (jit_ != nullptr && trace_recent_pcs_) {
             recent_pcs_[recent_count_ & (kRecentPcs - 1)] = jit_->Regs()[15];
             ++recent_count_;
         }
@@ -568,6 +594,7 @@ private:
     GuestArena& arena_;
     std::uint64_t tick_budget_;
     std::uint64_t ticks_ = 0;
+    const bool trace_recent_pcs_;
     static constexpr std::uint32_t kRecentPcs = 8;
     // A report is read by a person and by tools/debug_log.py, not replayed: a
     // deep chain of static constructors says nothing past the first frames.
@@ -617,7 +644,7 @@ struct A32Machine::Impl {
     static constexpr std::size_t kNestedCodeCache = 16 * 1024 * 1024;
 
     Impl(GuestArena& arena, const Config& settings)
-        : arena(arena), config(settings) {
+        : arena(arena), config(settings), slice_ticks(JitSliceTicks()) {
         if (config.exclusive_monitor == nullptr) {
             config.exclusive_monitor =
                 std::make_shared<Dynarmic::ExclusiveMonitor>(Config::kProcessorLimit);
@@ -711,17 +738,15 @@ struct A32Machine::Impl {
     // A run is sliced. dynarmic re-reads the halt flag -- and therefore the
     // watchdog's stop request -- only where a block hands control back to it,
     // and a guest loop of linked blocks never does. A finite tick budget forces
-    // that hand-back once per slice, which costs one return per few tens of
-    // milliseconds of guest time and keeps Stop(), hang samples and cache
-    // flushes as responsive as they were without linking.
-    static constexpr std::uint64_t kSliceTicks = 20'000'000;
+    // that hand-back. debug.armbat.jit_slice_ticks allows a device-specific
+    // latency/throughput tradeoff, with the previous budget as the default.
 
     // The JIT's run loop: CacheInvalidation is a normal exit path, not a failure.
     std::uint32_t RunJit(Dynarmic::A32::Jit& target) {
         RunningMachine running(owner, &running_tid);
         for (;;) {
             for (auto& callbacks : callback_set) {
-                callbacks->SetTickBudget(kSliceTicks);
+                callbacks->SetTickBudget(slice_ticks);
             }
             halt_reason = target.Run();
             if ((static_cast<std::uint32_t>(halt_reason) &
@@ -750,6 +775,7 @@ struct A32Machine::Impl {
 
     GuestArena& arena;
     Config config;
+    const std::uint64_t slice_ticks;
     A32Machine* owner = nullptr;
     // The base JIT, for halting this machine from another thread.
     Dynarmic::A32::Jit* base_jit = nullptr;

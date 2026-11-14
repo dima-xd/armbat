@@ -10,7 +10,7 @@
     <string name="apps">ऐप्स</string>
     <string name="about">परिचय</string>
     <string name="version_label">संस्करण</string>
-    <string name="about_description">64-बिट Android पर 32-बिट ARM ऐप्स चलाता है।</string>
+    <string name="about_description">64-बिट ARM डिवाइसों पर संगत 32-बिट ARM Android ऐप चलाता है, भले ही सिस्टम में 32-बिट सपोर्ट न हो। Java कोड Android के ART पर चलता है और नेटिव ARM कोड रनटाइम पर ARM64 में अनुवादित होता है।</string>
     <string name="cancel">रद्द करें</string>
 
     <string name="launch">चलाएँ</string>

@@ -346,6 +346,19 @@ std::string FilterExtensions(const std::string& driver) {
     return out;
 }
 
+void DrawArrays(HleCall& call) {
+    static const auto function = Gl<void (*)(unsigned int, int, int)>("glDrawArrays");
+    if (function == nullptr) {
+        return;
+    }
+    const int first = static_cast<int>(call.Arg(1));
+    const int count = static_cast<int>(call.Arg(2));
+    if (first < 0 || count < 0) {
+        return;
+    }
+    function(call.Arg(0), first, count);
+}
+
 }  // namespace
 
 void RegisterGlesFunctions(HleRegistry& registry) {
@@ -1571,19 +1584,9 @@ void RegisterGlesFunctions(HleRegistry& registry) {
         const std::uint32_t cell = call.Arg(2);
         call.CopyOut(cell, &value, sizeof(value));
     });
-    registry.Add("glDrawArrays", [](HleCall& call) {
-        static const auto function =
-            Gl<void (*)(unsigned int, int, int)>("glDrawArrays");
-        if (function == nullptr) {
-            return;
-        }
-        const int first = static_cast<int>(call.Arg(1));
-        const int count = static_cast<int>(call.Arg(2));
-        if (first < 0 || count < 0) {
-            return;
-        }
-        function(call.Arg(0), first, count);
-    });
+    // This is one of the hottest imports in draw-call-heavy GLES 1.x games.
+    // Register it as a plain function pointer to skip std::function dispatch.
+    registry.AddFast("glDrawArrays", DrawArrays);
     registry.Add("glDrawElements", [state](HleCall& call) {
         static const auto function =
             Gl<void (*)(unsigned int, int, unsigned int, const void*)>("glDrawElements");
