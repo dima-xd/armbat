@@ -240,9 +240,13 @@ add_custom_target(guest_unwind DEPENDS "${_guest_unwind_header}")
 # shim exports getaddrinfo() and asks the container instead (one private trap),
 # which makes a server address a player typed work the way it does on a device.
 set(_guest_net_so "${_guest_lib_dir}/libarmbat_net.so")
+# The resolver must interpose libc's getaddrinfo() for later-loaded game
+# libraries. Mark it global in the ELF so its exports are visible to later loads
+# without relying on the runtime linker's handling of RTLD_GLOBAL.
+set(_guest_net_flags ${ARMBAT_GUEST_LINKED_FLAGS} "-Wl,-z,global")
 armbat_guest_module("${_guest_net_so}" "libarmbat_net.so"
     "${PROJECT_SOURCE_DIR}/runtime/guest/net.c"
-    "${CMAKE_C_COMPILER}" "${ARMBAT_GUEST_LINKED_FLAGS}")
+    "${CMAKE_C_COMPILER}" "${_guest_net_flags}")
 
 set(_guest_net_header "${CMAKE_BINARY_DIR}/generated/guest_net.h")
 armbat_embed_binary("${_guest_net_so}" "${_guest_net_header}" guest_net kNet)
