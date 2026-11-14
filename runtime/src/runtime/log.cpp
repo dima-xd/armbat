@@ -412,15 +412,25 @@ LogLevel ParseLevel(const char* text, LogLevel fallback) {
 
 // `adb shell setprop debug.armbat.log debug` before a run is the whole control
 // surface; there is no switch in the UI, and the property needs no rebuild.
+// The only direct system-property read in the runtime. Keep the typed accessors
+// below and the device-header helper on this path so debug knobs stay consistent.
+std::string ReadSystemProperty(const char* name) {
+    char value[PROP_VALUE_MAX] = {};
+    if (__system_property_get(name, value) <= 0) {
+        return {};
+    }
+    return value;
+}
+
 void ApplyProperties() {
     State& state = S();
-    char value[PROP_VALUE_MAX] = {};
-    if (__system_property_get("debug.armbat.log", value) > 0) {
-        state.file_level.store(static_cast<int>(ParseLevel(value, LogLevel::Info)));
+    const std::string file = ReadSystemProperty("debug.armbat.log");
+    if (!file.empty()) {
+        state.file_level.store(static_cast<int>(ParseLevel(file.c_str(), LogLevel::Info)));
     }
-    value[0] = '\0';
-    if (__system_property_get("debug.armbat.logcat", value) > 0) {
-        state.logcat_level.store(static_cast<int>(ParseLevel(value, LogLevel::Info)));
+    const std::string logcat = ReadSystemProperty("debug.armbat.logcat");
+    if (!logcat.empty()) {
+        state.logcat_level.store(static_cast<int>(ParseLevel(logcat.c_str(), LogLevel::Info)));
     }
     if (const char* env = std::getenv("ARMBAT_LOG_LEVEL"); env != nullptr && *env != '\0') {
         state.file_level.store(static_cast<int>(ParseLevel(env, LogLevel::Info)));
@@ -428,11 +438,8 @@ void ApplyProperties() {
 }
 
 std::string Property(const char* name) {
-    char value[PROP_VALUE_MAX] = {};
-    if (__system_property_get(name, value) <= 0) {
-        return "-";
-    }
-    return value;
+    const std::string value = ReadSystemProperty(name);
+    return value.empty() ? "-" : value;
 }
 
 void WriteHeader(int fd) {
@@ -464,6 +471,16 @@ void WriteHeader(int fd) {
 }
 
 }  // namespace
+
+std::string SystemProperty(const char* name) { return ReadSystemProperty(name); }
+
+bool SystemPropertyEnabled(const char* name, bool default_value) {
+    const std::string value = ReadSystemProperty(name);
+    if (value.empty()) {
+        return default_value;
+    }
+    return value != "0" && value != "false" && value != "off";
+}
 
 bool LogStart(const std::string& directory) {
     State& state = S();

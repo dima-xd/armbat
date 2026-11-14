@@ -40,27 +40,21 @@ constexpr VAddr kSentinelLr = 0xFFFFFFF0u;
 constexpr std::uint32_t kUserModeCpsr = 0x00000010u;
 constexpr std::uint32_t kThumbBit = 0x00000020u;
 
-bool EnvironmentFlag(const char* name) {
-    const char* value = std::getenv(name);
-    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0 &&
-           std::strcmp(value, "false") != 0 && std::strcmp(value, "off") != 0;
-}
-
 std::uint64_t JitSliceTicks() {
-    // A larger slice reduces host/JIT run-loop handbacks while preserving the
-    // periodic halt point used by signal delivery and the hang watchdog.
+    // Keep the previous responsiveness by default. A device-specific override
+    // is available for measured experiments without rebuilding the runtime.
     static const std::uint64_t ticks = [] {
-        constexpr std::uint64_t kDefault = 40'000'000;
+        constexpr std::uint64_t kDefault = 20'000'000;
         constexpr std::uint64_t kMinimum = 1'000'000;
         constexpr std::uint64_t kMaximum = 200'000'000;
-        const char* value = std::getenv("ARMBAT_JIT_SLICE_TICKS");
-        if (value == nullptr || *value == '\0') {
+        const std::string value = SystemProperty("debug.armbat.jit_slice_ticks");
+        if (value.empty()) {
             return kDefault;
         }
         char* end = nullptr;
         errno = 0;
-        const unsigned long long parsed = std::strtoull(value, &end, 10);
-        if (errno == 0 && end != value && *end == '\0' && parsed >= kMinimum &&
+        const unsigned long long parsed = std::strtoull(value.c_str(), &end, 10);
+        if (errno == 0 && end != value.c_str() && *end == '\0' && parsed >= kMinimum &&
             parsed <= kMaximum) {
             return static_cast<std::uint64_t>(parsed);
         }
@@ -181,7 +175,7 @@ class Callbacks final : public Dynarmic::A32::UserCallbacks {
 public:
     Callbacks(GuestArena& arena, std::uint64_t tick_budget)
         : arena_(arena), tick_budget_(tick_budget),
-          trace_recent_pcs_(EnvironmentFlag("ARMBAT_JIT_TRACE")) {}
+          trace_recent_pcs_(SystemPropertyEnabled("debug.armbat.jit_trace", true)) {}
 
     void Attach(Dynarmic::A32::Jit* jit) { jit_ = jit; }
 
@@ -744,8 +738,8 @@ struct A32Machine::Impl {
     // A run is sliced. dynarmic re-reads the halt flag -- and therefore the
     // watchdog's stop request -- only where a block hands control back to it,
     // and a guest loop of linked blocks never does. A finite tick budget forces
-    // that hand-back. The default was raised modestly to reduce Run() handbacks;
-    // ARMBAT_JIT_SLICE_TICKS allows a device-specific latency/throughput tradeoff.
+    // that hand-back. debug.armbat.jit_slice_ticks allows a device-specific
+    // latency/throughput tradeoff, with the previous budget as the default.
 
     // The JIT's run loop: CacheInvalidation is a normal exit path, not a failure.
     std::uint32_t RunJit(Dynarmic::A32::Jit& target) {

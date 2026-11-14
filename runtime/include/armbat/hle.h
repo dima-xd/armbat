@@ -173,11 +173,11 @@ private:
     A32Machine& machine_;
     GuestArena& arena_;
     std::uint32_t stub_base_;
-    // Per-call history and graphics census are useful while debugging, but
-    // their shared atomics sit directly on the SVC/HLE hot path. Opt in with
-    // ARMBAT_HLE_TRACE=1 and ARMBAT_GFX_CENSUS=1 respectively.
-    bool trace_calls_ = false;
-    bool graphics_census_ = false;
+    // Per-call history and graphics census are kept on by default because they
+    // are part of the hang report. Set debug.armbat.hle_trace=0 or
+    // debug.armbat.gfx_census=0 to disable them for a measured experiment.
+    bool trace_calls_ = true;
+    bool graphics_census_ = true;
     std::uint32_t data_cursor_ = 0;
     std::vector<HleEntry> functions_;
     std::unordered_map<std::string, std::uint32_t> by_name_;

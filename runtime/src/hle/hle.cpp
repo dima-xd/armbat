@@ -56,12 +56,6 @@ constexpr std::uint32_t kDataRegionSize = 0x1000000;
 // the data area begins above it.
 constexpr std::uint32_t kStubRegionLimit = 0x100000;
 
-bool EnvironmentFlag(const char* name) {
-    const char* value = std::getenv(name);
-    return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0 &&
-           std::strcmp(value, "false") != 0 && std::strcmp(value, "off") != 0;
-}
-
 // Guest wchar_t is 4 bytes on ARM32. %ls and %lc hand over UTF-32.
 void AppendUtf8(std::string& out, std::uint32_t code) {
     if (code < 0x80) {
@@ -264,8 +258,10 @@ std::byte* HleCall::Mapped(std::uint32_t address, std::size_t length) {
 
 HleRegistry::HleRegistry(A32Machine& machine, GuestArena& arena, std::uint32_t stub_base)
     : machine_(machine), arena_(arena), stub_base_(stub_base),
-      trace_calls_(EnvironmentFlag("ARMBAT_HLE_TRACE")),
-      graphics_census_(EnvironmentFlag("ARMBAT_GFX_CENSUS")) {}
+      // Hang diagnostics stay on unless a device explicitly opts out. They are
+      // needed to distinguish a stalled guest from a stalled renderer/HLE call.
+      trace_calls_(SystemPropertyEnabled("debug.armbat.hle_trace", true)),
+      graphics_census_(SystemPropertyEnabled("debug.armbat.gfx_census", true)) {}
 
 void HleRegistry::Add(std::string name, HleFunction function) {
     HleEntry entry;
@@ -427,8 +423,8 @@ bool HleRegistry::Prepare(std::string* error) {
         std::memcpy(arena_.Ptr(stub_base_ + i * kStubSize), code, sizeof(code));
     }
 
-    // Allocate counters only when requested. In the default performance mode,
-    // graphics dispatch does not touch a shared atomic on every draw call.
+    // Allocate counters only when the census is enabled. When explicitly
+    // disabled, graphics dispatch avoids the shared atomic on every draw call.
     if (graphics_census_ && counts_size_ < functions_.size()) {
         counts_ = std::make_unique<std::atomic<std::uint32_t>[]>(functions_.size());
         for (std::size_t i = 0; i < functions_.size(); ++i) {
