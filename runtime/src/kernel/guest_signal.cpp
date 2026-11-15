@@ -25,7 +25,11 @@ namespace {
 // contexts use (0x00d00000) and the HLE stub region, which nothing else claims.
 constexpr std::uint32_t kFrameBase = 0x00d80000;
 constexpr std::uint32_t kFrameSlotSize = 0x800;
-constexpr std::uint32_t kFrameSlots = 32;
+// One slot per live thread, not one per tid hash: two threads that hash to the
+// same slot overwrite the siginfo and the ucontext the other thread's handler is
+// still reading, and a handler that resumes from a clobbered context resumes
+// nowhere. The range is half a megabyte, so slots are free.
+constexpr std::uint32_t kFrameSlots = 64;
 constexpr std::uint32_t kUcontextOffset = 0x100;
 constexpr std::uint32_t kUcontextSize = 0x400;
 
@@ -69,8 +73,15 @@ constexpr std::uint32_t kSegvMaperr = 1;  // the page is not mapped at all
 constexpr std::uint32_t kThumbCpsr = 0x20;
 
 std::uint32_t FrameForThisThread() {
-    return kFrameBase + (static_cast<std::uint32_t>(::gettid()) & (kFrameSlots - 1)) *
-                           kFrameSlotSize;
+    // The slot is taken once and kept for the life of the thread: the handler is
+    // handed this address, and the thread that is still inside a handler must
+    // find its own frame untouched.
+    static thread_local std::uint32_t slot = kFrameSlots;
+    if (slot == kFrameSlots) {
+        static std::atomic<std::uint32_t> next{0};
+        slot = next.fetch_add(1, std::memory_order_relaxed) % kFrameSlots;
+    }
+    return kFrameBase + slot * kFrameSlotSize;
 }
 
 }  // namespace

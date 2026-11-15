@@ -178,7 +178,24 @@ std::mutex g_live_mutex;
 std::vector<LiveGuestThread> g_live;
 
 // The lock word lives in guest memory; the host view is the same bytes.
+//
+// It also has to be an address the host atomics below can use: 4-byte aligned.
+// An implementation that reads a misaligned word compiles the compare-exchange
+// to LDAXR/STLXR, and the CPU answers a misaligned exclusive access with SIGBUS
+// -- for the whole process, not for the one guest thread that passed the
+// address. A device would deliver that fault to the guest; the container
+// refuses the call (the caller returns EINVAL) and names the address, which is
+// the difference between a report and a dead container.
 std::uint32_t* Word(HleCall& call, std::uint32_t address) {
+    if ((address & (sizeof(std::uint32_t) - 1)) != 0) {
+        static std::atomic<unsigned> reported{0};
+        const unsigned count = reported.fetch_add(1, std::memory_order_relaxed);
+        if (count < 16) {
+            ARMBAT_LOG_ERROR("Armbat", "pthread: unaligned lock word 0x%08x%s", address,
+                                count + 1 == 16 ? " (further reports suppressed)" : "");
+        }
+        return nullptr;
+    }
     return reinterpret_cast<std::uint32_t*>(call.Mapped(address, sizeof(std::uint32_t)));
 }
 

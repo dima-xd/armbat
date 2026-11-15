@@ -27,6 +27,12 @@ std::vector<GuestModule> GuestModules();
 // "libc.so+0x17b44", or "0x20033b44" when no module covers the address.
 std::string DescribeGuestAddress(std::uint32_t address);
 
+// The same description written into the caller's buffer, without allocating and
+// without waiting for the mapping lock. For a crash handler, which has neither
+// the time nor a heap to spare, and which must not hang if the fault happened
+// while the mapping table was being updated.
+bool DescribeGuestAddressInline(std::uint32_t address, char* out, std::size_t size);
+
 // The image covering the address, or null when the address is not inside one.
 bool IsGuestModuleAddress(std::uint32_t address);
 

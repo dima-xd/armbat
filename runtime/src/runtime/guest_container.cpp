@@ -273,10 +273,11 @@ struct GuestContainer::Impl {
         // puts its own SIGSEGV handler on top when a Jit is built -- fastmem
         // needs it to catch an access to a page the container never committed
         // and recompile that site for the callback path -- and it chains to
-        // whatever was installed before it. Ours therefore stays the last word
-        // on a real host crash while a fastmem miss is handled where it is
-        // understood.
-        InstallCrashHandler(nullptr);
+        // whatever was installed before it. Ours is therefore the report for
+        // everything dynarmic does not claim, and it hands the fault on to the
+        // platform (ART recovers from some of them) instead of ending the
+        // process by itself.
+        InstallCrashHandler();
         machine = std::make_unique<A32Machine>(arena);
         SetCrashMachine(machine.get());
         machine->SetSp(kMainStackAddr + kMainStackSize - 64);
@@ -699,6 +700,11 @@ struct GuestContainer::Impl {
         }
         const WorkerContext& context = contexts[index];
         A32Machine* attached_machine = AttachMachine(context.tls, context.sp);
+        // This thread runs guest code from here on, so a host signal has to find
+        // its register file: the machine is thread-local for exactly that, and a
+        // platform thread that never says which machine it borrowed reports a
+        // crash with no guest state at all.
+        SetCrashMachine(attached_machine);
         *slot = index;
         ARMBAT_LOG_INFO("Armbat",
                             "contexts: tid=%d took slot %d tls=0x%08x sp=0x%08x", ::gettid(),
@@ -711,6 +717,7 @@ struct GuestContainer::Impl {
     // JIT code it translated, and the slot returns to the pool for the next Java
     // thread ART hands a native call to.
     void ReleaseContext(int index, A32Machine* attached_machine) {
+        SetCrashMachine(nullptr);
         armbat::UnregisterLiveGuestThread(*attached_machine);
         const std::uint32_t processor = attached_machine->ProcessorId();
         if (const auto monitor = attached_machine->Settings().exclusive_monitor) {

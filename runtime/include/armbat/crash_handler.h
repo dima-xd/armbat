@@ -4,10 +4,16 @@ namespace armbat {
 
 class A32Machine;
 
-// Reports a host signal (SIGILL/SIGSEGV/SIGBUS) with the guest register file, so
-// a crash inside generated code names the guest instruction instead of leaving
-// one anonymous address. Installed once per process; `machine` must outlive it.
-void InstallCrashHandler(A32Machine* machine);
+// Reports a host signal (SIGILL/SIGSEGV/SIGBUS/SIGFPE) with the guest register
+// file and with the host mapping the fault came from, so a crash names the
+// instruction and the module instead of leaving two anonymous addresses.
+//
+// The handler does not own the process: it reports and then hands the fault to
+// the action that was installed before it. ART recovers from the faults a
+// device recovers from -- an implicit null check in compiled Java is a
+// NullPointerException there, a stack overflow is a StackOverflowError -- and
+// that has to keep working inside the container. Installed once per process.
+void InstallCrashHandler();
 
 // The machine the calling thread is running. Guest threads own their machine,
 // so a signal there has to read that one, not the main thread's.

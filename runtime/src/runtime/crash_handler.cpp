@@ -4,7 +4,10 @@
 #include <csignal>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <vector>
+#include <fcntl.h>
+#include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #include <ucontext.h>
@@ -17,48 +20,302 @@
 #include "armbat/log.h"
 
 #include "armbat/a32_machine.h"
+#include "armbat/guest_modules.h"
 
 namespace armbat {
 namespace {
 
-A32Machine* g_machine = nullptr;
+// The platform installs its own handlers for these before the container exists
+// and some of them are not crash reporting at all: ART turns an implicit null
+// check in compiled Java into a NullPointerException, and a stack overflow into
+// a StackOverflowError, by repairing the context this handler is given. Keeping
+// the previous action and handing the fault back is what keeps that working --
+// an unhandled one ends in a tombstone either way.
+struct SignalSlot {
+    int signal = 0;
+    struct sigaction previous {};
+    bool valid = false;
+};
+
+constexpr int kSignals[] = {SIGILL, SIGSEGV, SIGBUS, SIGFPE};
+constexpr std::size_t kSignalCount = sizeof(kSignals) / sizeof(kSignals[0]);
+SignalSlot g_slots[kSignalCount];
+
 thread_local A32Machine* t_machine = nullptr;
-A32Machine* CurrentMachine() { return t_machine != nullptr ? t_machine : g_machine; }
+A32Machine* CurrentMachine() { return t_machine; }
 
-char* AppendText(char* out, const char* text) {
-    while (*text != '\0') {
-        *out++ = *text++;
+// A report is built in place: a crash handler may not allocate, and a handler
+// that needs a std::string is a handler that may not survive the fault it is
+// reporting.
+class Report {
+public:
+    Report(char* buffer, std::size_t size)
+        : begin_(buffer), out_(buffer), end_(buffer + size) {
+        if (size != 0) {
+            *out_ = '\0';
+        }
     }
-    return out;
+
+    Report& Text(const char* text) {
+        while (*text != '\0' && out_ < end_) {
+            *out_++ = *text++;
+        }
+        if (out_ < end_) {
+            *out_ = '\0';
+        }
+        return *this;
+    }
+
+    Report& Hex(std::uintptr_t value) {
+        static const char kDigits[] = "0123456789abcdef";
+        Text("0x");
+        char digits[16];
+        int count = 0;
+        do {
+            digits[count++] = kDigits[value & 0xF];
+            value >>= 4;
+        } while (value != 0);
+        while (count > 0) {
+            Char(digits[--count]);
+        }
+        return *this;
+    }
+
+    Report& Dec(std::uintptr_t value) {
+        char digits[20];
+        int count = 0;
+        do {
+            digits[count++] = static_cast<char>('0' + value % 10);
+            value /= 10;
+        } while (value != 0);
+        while (count > 0) {
+            Char(digits[--count]);
+        }
+        return *this;
+    }
+
+    Report& Char(char value) {
+        if (out_ < end_) {
+            *out_++ = value;
+            *out_ = '\0';
+        }
+        return *this;
+    }
+
+    const char* Begin() const { return begin_; }
+    const char* End() const { return out_; }
+
+private:
+    char* begin_;
+    char* out_;
+    char* end_;
+};
+
+int HexDigit(char value) {
+    if (value >= '0' && value <= '9') {
+        return value - '0';
+    }
+    if (value >= 'a' && value <= 'f') {
+        return value - 'a' + 10;
+    }
+    if (value >= 'A' && value <= 'F') {
+        return value - 'A' + 10;
+    }
+    return -1;
 }
 
-char* AppendHex(char* out, std::uintptr_t value) {
-    static const char kDigits[] = "0123456789abcdef";
-    *out++ = '0';
-    *out++ = 'x';
-    char digits[16];
-    int count = 0;
-    do {
-        digits[count++] = kDigits[value & 0xF];
-        value >>= 4;
-    } while (value != 0);
-    while (count > 0) {
-        *out++ = digits[--count];
+// Parses one line of /proc/self/maps and keeps it when it covers `address`.
+// Layout: start-end perms offset dev inode path.
+bool ParseMapsLine(const char* line, std::uintptr_t address, std::uintptr_t* start,
+                   char* perms, std::size_t perms_size, const char** name) {
+    const char* cursor = line;
+    std::uintptr_t begin = 0;
+    int digit = HexDigit(*cursor);
+    if (digit < 0) {
+        return false;
     }
-    return out;
+    while ((digit = HexDigit(*cursor)) >= 0) {
+        begin = (begin << 4) | static_cast<std::uintptr_t>(digit);
+        ++cursor;
+    }
+    if (*cursor != '-') {
+        return false;
+    }
+    ++cursor;
+    std::uintptr_t finish = 0;
+    while ((digit = HexDigit(*cursor)) >= 0) {
+        finish = (finish << 4) | static_cast<std::uintptr_t>(digit);
+        ++cursor;
+    }
+    if (address < begin || address >= finish) {
+        return false;
+    }
+    while (*cursor == ' ') {
+        ++cursor;
+    }
+    for (std::size_t i = 0; i + 1 < perms_size && cursor[i] != ' ' && cursor[i] != '\0'; ++i) {
+        perms[i] = cursor[i];
+        perms[i + 1] = '\0';
+    }
+    while (*cursor != ' ' && *cursor != '\0') {
+        ++cursor;
+    }
+    // Skip the offset, the device and the inode: the path is what is left, and
+    // it may contain spaces of its own.
+    for (int field = 0; field < 3; ++field) {
+        while (*cursor == ' ') {
+            ++cursor;
+        }
+        while (*cursor != ' ' && *cursor != '\0') {
+            ++cursor;
+        }
+    }
+    while (*cursor == ' ') {
+        ++cursor;
+    }
+    *start = begin;
+    *name = cursor;
+    return true;
 }
 
-char* AppendDec(char* out, std::uintptr_t value) {
-    char digits[20];
-    int count = 0;
-    do {
-        digits[count++] = static_cast<char>('0' + value % 10);
-        value /= 10;
-    } while (value != 0);
-    while (count > 0) {
-        *out++ = digits[--count];
+// What the host has mapped at `address`: a guest crash and a host crash need
+// completely different answers, and a bare pc cannot tell them apart. The maps
+// file is read with open/read, which a signal handler may do; dladdr is not
+// used because it takes locks the faulting thread may already hold.
+void AppendMapping(Report& report, std::uintptr_t address) {
+    const int fd = ::open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        report.Text("<no maps>");
+        return;
     }
-    return out;
+    char chunk[1024];
+    char line[512] = {};
+    std::size_t used = 0;
+    bool found = false;
+    std::uintptr_t start = 0;
+    char perms[8] = {};
+    const char* name = nullptr;
+    for (;;) {
+        const ssize_t count = ::read(fd, chunk, sizeof(chunk));
+        if (count <= 0) {
+            break;
+        }
+        for (ssize_t index = 0; index < count && !found; ++index) {
+            if (chunk[index] != '\n') {
+                if (used + 1 < sizeof(line)) {
+                    line[used++] = chunk[index];
+                    line[used] = '\0';
+                }
+                continue;
+            }
+            used = 0;
+            found = ParseMapsLine(line, address, &start, perms, sizeof(perms), &name);
+        }
+        if (found) {
+            break;
+        }
+    }
+    ::close(fd);
+    if (!found) {
+        report.Text("<unmapped>");
+        return;
+    }
+    std::size_t length = 0;
+    while (name[length] != ' ' && name[length] != '\0' && length < 192) {
+        ++length;
+    }
+    if (length == 0) {
+        // Anonymous memory has no path; the range is all there is to say.
+        report.Text("<anonymous+");
+    } else {
+        for (std::size_t index = 0; index < length; ++index) {
+            report.Char(name[index]);
+        }
+        report.Char('+');
+    }
+    report.Hex(address - start).Text(" ").Text(perms).Text(">");
+}
+
+void AppendThread(Report& report) {
+    char name[32] = {};
+    const int tid = ::gettid();
+    if (::prctl(PR_GET_NAME, name, 0, 0, 0) != 0) {
+        name[0] = '\0';
+    }
+    report.Text(" tid=").Dec(static_cast<std::uintptr_t>(tid)).Text(" comm=");
+    if (name[0] != '\0') {
+        report.Text(name);
+    } else {
+        report.Char('-');
+    }
+}
+
+void AppendGuestRegisters(Report& report) {
+    A32Machine* machine = CurrentMachine();
+    if (machine == nullptr) {
+        // A host thread that never entered the JIT (an ART compiler thread, a
+        // Java thread between calls) has no guest state to print, and printing
+        // another thread's registers would be worse than printing none.
+        report.Text("\nguest: no machine on this thread");
+        return;
+    }
+    report.Text("\nRegs:");
+    for (std::size_t index = 0; index < 16; ++index) {
+        report.Text(" r").Dec(index).Text("=").Hex(machine->Reg(index));
+    }
+    const std::uint32_t guest_pc = machine->Reg(15);
+    // The image and offset are what names the guest code the host thread was
+    // running; a bare 32-bit number leaves the reader to find the module base
+    // first, which is exactly what nobody can do from a single log line.
+    char described[96] = {};
+    if (DescribeGuestAddressInline(guest_pc, described, sizeof(described))) {
+        report.Text("\nguest pc: ").Text(described);
+    }
+    if (DescribeGuestAddressInline(machine->Reg(14), described, sizeof(described))) {
+        report.Text(" lr: ").Text(described);
+    }
+    std::uint32_t instruction = 0;
+    if (machine->ReadGuestWord(guest_pc, &instruction)) {
+        report.Text("\nguest insn at ").Hex(guest_pc).Text(" = ").Hex(instruction);
+        std::uint32_t second = 0;
+        if (machine->ReadGuestWord(guest_pc + 4, &second)) {
+            report.Char(' ').Hex(second);
+        }
+    }
+}
+
+// Hands the fault to whoever handled it before the container existed. A handler
+// that repairs the context (ART) makes this a recovery and never returns here;
+// one that does nothing at all would fault again on the same instruction, which
+// the caller turns into a default action instead of a loop.
+void ChainToPlatform(int signal, siginfo_t* info, void* context) {
+    for (std::size_t index = 0; index < kSignalCount; ++index) {
+        if (g_slots[index].signal != signal || !g_slots[index].valid) {
+            continue;
+        }
+        const struct sigaction& previous = g_slots[index].previous;
+        if ((previous.sa_flags & SA_SIGINFO) != 0) {
+            if (previous.sa_sigaction != nullptr) {
+                previous.sa_sigaction(signal, info, context);
+            }
+            return;
+        }
+        if (previous.sa_handler == SIG_IGN) {
+            return;
+        }
+        if (previous.sa_handler != SIG_DFL && previous.sa_handler != nullptr) {
+            previous.sa_handler(signal);
+            return;
+        }
+        break;
+    }
+    struct sigaction action {};
+    action.sa_handler = SIG_DFL;
+    ::sigemptyset(&action.sa_mask);
+    ::sigaction(signal, &action, nullptr);
+    // Delivered the moment this handler returns, which is the tombstone the
+    // platform expects for a fault nobody claimed.
+    ::raise(signal);
 }
 
 void Handler(int signal, siginfo_t* info, void* context) {
@@ -67,48 +324,51 @@ void Handler(int signal, siginfo_t* info, void* context) {
 #if defined(__aarch64__)
     pc = static_cast<std::uintptr_t>(uc->uc_mcontext.pc);
 #endif
+    const auto address =
+        reinterpret_cast<std::uintptr_t>(info != nullptr ? info->si_addr : nullptr);
 
-    char buffer[640];
-    char* end = buffer;
-    end = AppendText(end, "fatal: host signal ");
-    end = AppendDec(end, static_cast<std::uintptr_t>(signal));
-    end = AppendText(end, " at host pc=");
-    end = AppendHex(end, pc);
-    end = AppendText(end, " addr=");
-    end = AppendHex(end, reinterpret_cast<std::uintptr_t>(info != nullptr ? info->si_addr : nullptr));
-
-    if (A32Machine* machine = CurrentMachine(); machine != nullptr) {
-        end = AppendText(end, "\nRegs:");
-        for (std::size_t i = 0; i < 16; ++i) {
-            const std::uint32_t value = machine->Reg(i);
-            end = AppendText(end, " r");
-            end = AppendDec(end, i);
-            end = AppendText(end, "=");
-            end = AppendHex(end, value);
-        }
-        const std::uint32_t guest_pc = machine->Reg(15);
-        std::uint32_t instruction = 0;
-        if (machine->ReadGuestWord(guest_pc, &instruction)) {
-            end = AppendText(end, "\nguest insn at ");
-            end = AppendHex(end, guest_pc);
-            end = AppendText(end, " = ");
-            end = AppendHex(end, instruction);
-            std::uint32_t second = 0;
-            if (machine->ReadGuestWord(guest_pc + 4, &second)) {
-                *end++ = ' ';
-                end = AppendHex(end, second);
-            }
-        }
+    // A handler that neither repairs the context nor terminates turns the same
+    // instruction into the same fault forever. Three is already one more than a
+    // real report needs.
+    static thread_local std::uintptr_t last_pc = 0;
+    static thread_local int repeats = 0;
+    if (pc != 0 && pc == last_pc) {
+        ++repeats;
+    } else {
+        last_pc = pc;
+        repeats = 0;
     }
-    *end = '\0';
 
-    (void)!::write(2, buffer, static_cast<std::size_t>(end - buffer));
-    armbat::LogPanic(buffer);
+    char buffer[2048];
+    Report report(buffer, sizeof(buffer));
+    report.Text(repeats > 2 ? "fatal: repeating host signal " : "fatal: host signal ")
+        .Dec(static_cast<std::uintptr_t>(signal))
+        .Text(" si_code=")
+        .Dec(static_cast<std::uintptr_t>(info != nullptr ? info->si_code : 0))
+        .Text(" at host pc=")
+        .Hex(pc)
+        .Text(" <");
+    AppendMapping(report, pc);
+    report.Text(" addr=").Hex(address).Text(" <");
+    AppendMapping(report, address);
+    AppendThread(report);
+    AppendGuestRegisters(report);
+    if (repeats > 2) {
+        report.Text("\nthe platform handler neither repaired nor ended this fault");
+    }
 
-    // The report is out; let the default action kill the process the way the
-    // platform expects, so a tombstone is still produced.
-    ::signal(signal, SIG_DFL);
-    ::raise(signal);
+    (void)!::write(2, report.Begin(), static_cast<std::size_t>(report.End() - report.Begin()));
+    armbat::LogPanic(report.Begin());
+
+    if (repeats > 2) {
+        struct sigaction action {};
+        action.sa_handler = SIG_DFL;
+        ::sigemptyset(&action.sa_mask);
+        ::sigaction(signal, &action, nullptr);
+        ::raise(signal);
+        return;
+    }
+    ChainToPlatform(signal, info, context);
 }
 
 }  // namespace
@@ -217,13 +477,27 @@ bool TakeGuestSample() {
     return g_sample.exchange(false);
 }
 
-void InstallCrashHandler(A32Machine* machine) {
-    g_machine = machine;
+void InstallCrashHandler() {
+    // The container starts once per process, but a second start in the same
+    // process would save this handler as its own predecessor and chain to
+    // itself.
+    static bool installed = false;
+    if (installed) {
+        return;
+    }
+    installed = true;
     struct sigaction action {};
     action.sa_sigaction = &Handler;
     action.sa_flags = SA_SIGINFO | SA_ONSTACK;
-    for (int signal : {SIGILL, SIGSEGV, SIGBUS, SIGFPE}) {
-        ::sigaction(signal, &action, nullptr);
+    ::sigemptyset(&action.sa_mask);
+    for (std::size_t index = 0; index < kSignalCount; ++index) {
+        struct sigaction previous {};
+        if (::sigaction(kSignals[index], &action, &previous) != 0) {
+            continue;
+        }
+        g_slots[index].signal = kSignals[index];
+        g_slots[index].previous = previous;
+        g_slots[index].valid = true;
     }
 }
 

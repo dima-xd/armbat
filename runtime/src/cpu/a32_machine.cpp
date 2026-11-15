@@ -473,6 +473,15 @@ private:
             NoteFault(addr, sizeof(T), true);
             return false;
         }
+        // An exclusive access the access size does not divide is an alignment
+        // fault on the device, and the host cannot even attempt it: an atomic on
+        // a misaligned cell compiles to LDAXR/STLXR, which raises SIGBUS for the
+        // whole process instead of a fault for the one guest thread. Report the
+        // fault the guest would have got; the reservation is not taken.
+        if ((addr & (sizeof(T) - 1)) != 0) {
+            NoteFault(addr, sizeof(T), true);
+            return false;
+        }
         // A compare and a store are one step: another guest thread's plain
         // store between them would be lost, and the guest would be told the
         // reservation held when it no longer did.

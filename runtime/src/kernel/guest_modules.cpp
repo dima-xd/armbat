@@ -98,6 +98,45 @@ bool IsGuestModuleAddress(std::uint32_t address) {
     return false;
 }
 
+// The image that covers `address`, as "libc.so+0x17b44", written into a buffer
+// the caller owns. Nothing is allocated and the mapping lock is only taken when
+// it is free: a crash handler cannot wait for a thread that died holding it, and
+// cannot afford an allocation in a heap that may be the thing that faulted, so
+// the lookup is skipped rather than waited for.
+bool DescribeGuestAddressInline(std::uint32_t address, char* out, std::size_t size) {
+    if (out == nullptr || size == 0) {
+        return false;
+    }
+    std::unique_lock<std::mutex> lock(g_mutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        return false;
+    }
+    const std::string* path = nullptr;
+    for (const GuestMapping& mapping : g_mappings) {
+        if (address >= mapping.base && address < mapping.base + mapping.length) {
+            path = &mapping.path;
+            break;
+        }
+    }
+    if (path == nullptr) {
+        return false;
+    }
+    // The image base is the lowest address it was mapped at, which is the rule
+    // the merged view uses as well.
+    std::uint32_t base = address;
+    for (const GuestMapping& mapping : g_mappings) {
+        if (mapping.path == *path && mapping.base < base) {
+            base = mapping.base;
+        }
+    }
+    const char* name = path->c_str();
+    if (const std::size_t slash = path->find_last_of('/'); slash != std::string::npos) {
+        name += slash + 1;
+    }
+    std::snprintf(out, size, "%s+0x%x", name, address - base);
+    return true;
+}
+
 std::string DescribeGuestAddress(std::uint32_t address) {
     std::string path;
     std::uint32_t offset = 0;
