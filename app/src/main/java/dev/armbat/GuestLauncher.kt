@@ -1635,13 +1635,29 @@ class GuestLauncher(private val host: Activity) {
         }
     }
 
+    /**
+     * The platform paused the window the archive draws into.
+     *
+     * A pause stops the archive's engine -- Unity stops its player loop from
+     * the focus change and from onPause, and from then on it neither renders
+     * nor runs the code that answers the network -- so this is the exact point
+     * at which a "the game hung" report either started or did not. The guest's
+     * own onPause is arbitrary application code and may throw or take seconds,
+     * and the previous silent `runCatching` left nothing in the log either
+     * way; the outcome is recorded now because the rest of the session depends
+     * on it.
+     */
     fun pause() {
         val hosted = hosted ?: return
-        runCatching {
+        hosted.resumed = false
+        val start = android.os.SystemClock.uptimeMillis()
+        try {
             windowFocus(hosted.activity, false)
             lifecycle(hosted.activity, "onPause")
+            ArmbatLog.i(TAG, "paused: ${hosted.info.name} in ${since(start)} ms")
+        } catch (error: Throwable) {
+            ArmbatLog.w(TAG, "paused: ${hosted.info.name} failed in ${since(start)} ms: $error")
         }
-        hosted.resumed = false
     }
 
     /** Whether an archive is loaded and holding this process's window. */
@@ -1707,13 +1723,32 @@ class GuestLauncher(private val host: Activity) {
         InputDevice.SOURCE_KEYBOARD,
     )
 
+    /**
+     * The window the archive draws into is in front of the user again.
+     *
+     * The focus is what wakes an engine up -- Unity's player restarts from
+     * the focus event, not from onResume -- and the guest's onResume is again
+     * arbitrary application code. So the focus is delivered even when that
+     * call throws: otherwise one failing callback leaves a paused engine that
+     * keeps the last frame on screen for the rest of the session, with input,
+     * network and rendering all silent and nothing in the log to say why.
+     */
     fun resume() {
         val hosted = hosted ?: return
-        runCatching {
+        val start = android.os.SystemClock.uptimeMillis()
+        var failure: Throwable? = null
+        try {
             lifecycle(hosted.activity, "onResume")
-            windowFocus(hosted.activity, true)
+        } catch (error: Throwable) {
+            failure = error
         }
+        windowFocus(hosted.activity, true)
         hosted.resumed = true
+        if (failure == null) {
+            ArmbatLog.i(TAG, "resumed: ${hosted.info.name} in ${since(start)} ms")
+        } else {
+            ArmbatLog.w(TAG, "resumed: ${hosted.info.name} onResume failed in ${since(start)} ms: $failure")
+        }
     }
 
     /**
@@ -1852,6 +1887,8 @@ class GuestLauncher(private val host: Activity) {
             method.invoke(activity)
         }
     }
+
+    private fun since(start: Long): Long = android.os.SystemClock.uptimeMillis() - start
 
     /**
      * The focus of the window, as the platform reports it to the activity.

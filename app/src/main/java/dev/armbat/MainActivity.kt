@@ -165,6 +165,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
+        ArmbatLog.i("Armbat", "host resume")
         storageReady = GuestStorage.isAvailable()
         guest.resume()
         keepScreenOn()
@@ -197,8 +198,25 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onPause() {
+        // The platform decides when this happens and never says why: a dialog
+        // above us, the shade, the keyguard, the screen going off and a switch
+        // to another application all arrive here the same way, and the guest
+        // stops its engine on every one of them. The line makes the difference
+        // between "the archive froze" and "the archive was paused" readable in
+        // a log that otherwise only carries the archive's own output.
+        ArmbatLog.i("Armbat", "host pause")
         guest.pause()
         super.onPause()
+    }
+
+    /**
+     * A key guard that came and went between two pause/resume pairs can leave
+     * the platform's focus state in the guest's engine ahead of ours, so the
+     * real focus is recorded next to the pause the container synthesises.
+     */
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        ArmbatLog.i("Armbat", "host focus: $hasFocus")
+        super.onWindowFocusChanged(hasFocus)
     }
 
     /**
@@ -235,6 +253,10 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onDestroy() {
+        // The window is going away for good: whatever the guest built dies with
+        // the process, so this is the last point at which the log can say the
+        // app was closed rather than crashed.
+        ArmbatLog.i("Armbat", "host destroy")
         guest.destroy()
         super.onDestroy()
     }

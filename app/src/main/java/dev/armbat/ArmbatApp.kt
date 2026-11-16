@@ -22,7 +22,40 @@ class ArmbatApp : Application() {
         ArmbatLog.init(this)
 		GuestDexRuntime.initialize(this)
         installCrashHandler()
+        installExitRecorder()
         GuestPendingIntents.host = this
+    }
+
+    /**
+     * Records a process exit that the guest asked for.
+     *
+     * A guest is a whole application, and an application may end its own
+     * process: a login SDK finishes its activity and calls System.exit so that
+     * the game starts over with the account it has just received. From outside
+     * that is indistinguishable from a crash -- the window disappears
+     * mid-session and the log simply stops -- and the two need different
+     * answers. A shutdown hook sees every exit that goes through the VM, and
+     * the caller is still parked in Runtime.exit while the hooks run, so the
+     * stack names the code that asked. A process taken by a signal leaves no
+     * line, which is the answer in that case.
+     */
+    private fun installExitRecorder() {
+        Runtime.getRuntime().addShutdownHook(Thread({
+            runCatching {
+                val exiting = Thread.getAllStackTraces().filterValues { frames ->
+                    frames.any { it.className == "java.lang.Shutdown" }
+                }
+                if (exiting.isEmpty()) {
+                    ArmbatLog.i("Armbat", "host exit: no Java caller")
+                }
+                for ((thread, frames) in exiting) {
+                    val callers = frames.take(8)
+                        .joinToString(" ") { "${it.className}.${it.methodName}" }
+                    ArmbatLog.i("Armbat", "host exit: ${thread.name} -> $callers")
+                }
+            }
+            ArmbatLog.flush()
+        }, "armbat-exit"))
     }
 
     private fun installCrashHandler() {
