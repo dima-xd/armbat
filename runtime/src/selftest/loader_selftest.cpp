@@ -23,12 +23,14 @@
 #include "armbat/hle.h"
 #include "armbat/guest_pthread.h"
 #include "armbat/guest_stdio.h"
+#include "armbat/kernel_helpers.h"
 #include "guest_lib.h"
 #include "guest_lib_cpp.h"
 #include "guest_lib_imports.h"
 #include "guest_lib_missing.h"
 #include "guest_lib_needed.h"
 #include "guest_lib_pthread.h"
+#include "guest_lib_signal.h"
 #include "guest_lib_cppstdlib.h"
 #include "guest_libcxx.h"
 #include "guest_apk.h"
@@ -49,7 +51,10 @@ constexpr std::uint32_t kDataAddr = 0x00500000;
 constexpr std::uint32_t kHeapBase = 0x02000000;
 constexpr std::uint32_t kHeapSize = 0x02000000;
 constexpr std::uint32_t kDlopenBase = 0x04000000;
-constexpr std::uint32_t kArenaSize = 0x08000000;
+// The whole 32-bit space, like the container: the kernel helper page lives at
+// 0xffff0000 and an arena smaller than the address space cannot map it, which
+// would leave the atomics suite calling into nothing.
+constexpr std::uint64_t kArenaSize = 0x1'0000'0000ull;
 constexpr std::uint32_t kStackAddr = 0x00800000;
 constexpr std::uint32_t kStackSize = 0x00040000;
 
@@ -82,6 +87,10 @@ SuiteReport RunLoaderSelftest() {
         return finish();
     }
     std::memcpy(arena.Ptr(kTrapAddr), &kHaltInstruction, sizeof(kHaltInstruction));
+    if (!InstallKernelHelpers(arena)) {
+        report.Fail("arena.kernel_helpers", "cannot map the vector page at 0xffff0000");
+        return finish();
+    }
 
     A32Machine machine(arena);
     machine.SetSp(kStackAddr + kStackSize - 64);
@@ -187,8 +196,14 @@ SuiteReport RunLoaderSelftest() {
     report.Pass("hle.prepare", detail::Format("%zu host functions, %u MiB guest heap",
                                               hle.Count(), kHeapSize >> 20));
 
+    // The mmap window cannot be anywhere below 0x02000000 (HLE data), inside the
+    // heap (0x02000000-0x04000000), the images (from kLibBase up) or 0x01000000-
+    // 0x02000000, which the HLE hands out to the guest as strings and asset
+    // buffers: GuestMemory refuses a range someone else has mapped, so a window
+    // over any of them turns every mmap into ENOMEM. The top of the arena is the
+    // only free part, and it is split with brk.
     GuestKernel kernel(machine, arena,
-                       KernelConfig{0x05000000, 0x07000000, 0x07000000, 0x08000000});
+                       KernelConfig{0x07000000, 0x07800000, 0x07800000, 0x08000000});
     std::string kernel_error;
     if (!kernel.Prepare(&kernel_error)) {
         report.Fail("kernel.prepare", kernel_error);
@@ -330,6 +345,10 @@ SuiteReport RunLoaderSelftest() {
             report.Fail(std::string("symbol.") + name, "not exported");
             return 0;
         }
+        // LastError is sticky by design (a caller that runs several entries
+        // decides when to forget one), so it has to be cleared here: otherwise
+        // one faulting call reports itself under the name of every call after it.
+        machine.ClearError();
         const std::uint32_t value = machine.CallFunction(address, args);
         if (!machine.LastError().empty()) {
             report.Fail(std::string("call.") + name, machine.LastError());
@@ -532,7 +551,7 @@ SuiteReport RunLoaderSelftest() {
 
     const std::uint32_t stat_size = call_in(*syscalls, "lib_fstat_size", {syscall_path});
     report.Check("kernel.fstat", stat_size == sizeof(kPayload) - 1,
-                 detail::Format("st_size=%u (32-bit struct stat)", stat_size));
+                 detail::Format("st_size=%u (64-bit-inode struct stat)", stat_size));
 
     const std::uint32_t missing = call_in(*syscalls, "lib_open_missing", {missing_path});
     report.Check("kernel.enoent", static_cast<std::int32_t>(missing) == -2,
@@ -592,6 +611,22 @@ SuiteReport RunLoaderSelftest() {
     const std::uint32_t protect = call_in(*syscalls, "lib_mprotect_probe", {});
     report.Check("kernel.mprotect", protect == 0, detail::Format("mprotect returned %d",
                                                                  static_cast<std::int32_t>(protect)));
+
+    constexpr std::uint32_t kSharedBytes = 64;
+    const std::uint32_t shared = call_in(*syscalls, "lib_mmap_shared_write",
+                                         {syscall_path, kSharedBytes});
+    report.Check("kernel.mmap_shared", static_cast<std::int32_t>(shared) ==
+                                           static_cast<std::int32_t>(kSharedBytes),
+                 detail::Format("64 bytes written through a shared mapping and read back "
+                                "from the file: %d",
+                                static_cast<std::int32_t>(shared)));
+
+    const std::uint32_t synced = call_in(*syscalls, "lib_mmap_msync",
+                                         {syscall_path, kSharedBytes});
+    report.Check("kernel.msync", static_cast<std::int32_t>(synced) ==
+                                     static_cast<std::int32_t>(kSharedBytes),
+                 detail::Format("msync put the shared pages in the file before munmap: %d",
+                                static_cast<std::int32_t>(synced)));
 
     std::remove(temp_path.c_str());
 
@@ -1011,6 +1046,101 @@ SuiteReport RunLoaderSelftest() {
             report.Check("threads.detach", detached == 0,
                          detail::Format("detached thread signalled and returned %d",
                                         static_cast<int>(detached)));
+
+            // --- atomics without a lock ----------------------------------
+            //
+            // A mutex makes a broken ll/sc pair look healthy: every increment
+            // is serialised by the slow path even when the reservation is not
+            // exclusive. These take the lock away, and a short sum is the lost
+            // update that turns a guest's reference count into a use-after-free.
+            const std::uint32_t fetch_add =
+                call_in(*pthread_lib, "lib_atomic_fetch_add", {4, 100000});
+            report.Check("atomics.fetch_add", fetch_add == 400000,
+                         detail::Format("4 threads x 100000 __sync_fetch_and_add = %u",
+                                        fetch_add));
+
+            const std::uint32_t ldrex = call_in(*pthread_lib, "lib_atomic_ldrex", {4, 100000});
+            report.Check("atomics.ldrex", ldrex == 400000,
+                         detail::Format("4 threads x 100000 hand-written LDREX/STREX = %u",
+                                        ldrex));
+
+            const std::uint32_t kuser =
+                call_in(*pthread_lib, "lib_atomic_kuser_cmpxchg", {4, 100000});
+            report.Check("atomics.kuser_cmpxchg", kuser == 400000,
+                         detail::Format("4 threads x 100000 __kernel_cmpxchg = %u", kuser));
+
+            const std::uint32_t cow = call_in(*pthread_lib, "lib_atomic_cow", {4, 20000});
+            report.Check("atomics.cow_refcount", cow == 0,
+                         detail::Format("4 threads copying a COW string 20000 times: %d "
+                                        "(-4 freed early, -5 corrupt, -6 refcount)",
+                                        static_cast<int>(cow)));
+
+            const std::uint32_t conflict =
+                call_in(*pthread_lib, "lib_atomic_exclusive_conflict", {});
+            report.Check("atomics.exclusive_conflict", conflict == 1,
+                         detail::Format("STREX after a foreign store returned %u "
+                                        "(1 = reservation lost, 0 = lost update)",
+                                        conflict));
+
+            // --- a load, cut in half -------------------------------------
+            //
+            // The reported failure is a consumer reading a producer's result
+            // before the producer finished. This is that protocol with no
+            // Unity in it: while the worker is mid-decode the state has to
+            // read "preparing", and only after it signals completion may the
+            // payload be there. Order comes from the mutex, not from sleeps.
+            const std::uint32_t handoff = call_in(*pthread_lib, "lib_thread_handoff", {50});
+            report.Check("threads.handoff", handoff == 0,
+                         detail::Format("50 rounds of decode/hand-off: %u rounds saw a "
+                                        "wrong state or payload",
+                                        handoff));
+
+            // --- short-lived threads on a recycled machine ----------------
+            //
+            // Not a reproduction: the warm pool is a performance fix, and the
+            // old behaviour computes the same values. This guards the two
+            // things reuse can break -- a reset that leaves state behind, and
+            // a pool that hands one machine to two live threads.
+            const std::uint32_t reused = call_in(*pthread_lib, "lib_thread_reuse", {64});
+            report.Check("threads.machine_reuse", reused == 0,
+                         detail::Format("64 threads, one after another, same code: %u disagreed",
+                                        reused));
+
+            // --- the allocator across threads -----------------------------
+            //
+            // After the atomics, the allocator is the next thing a worker
+            // shares: jemalloc changes arena size with mmap/madvise/munmap.
+            const std::uint32_t heap = call_in(*pthread_lib, "lib_heap_churn", {4, 200});
+            report.Check("heap.churn", heap == 800,
+                         detail::Format("4 threads x 200 allocate/check/free = %d "
+                                        "(-5 contents changed under a live block)",
+                                        static_cast<int>(heap)));
+        }
+    }
+
+    // --- Signals: a separate module, not answerable on this path -------------
+    //
+    // The fixture installs a guest SIGSEGV handler, faults, and has another
+    // thread post SIGUSR1 to it: that needs the guest's own sigaction, a real
+    // per-thread mask and pthread_kill. Under HLE pthread_kill does not exist
+    // and sigaction/sigprocmask are stubs that return 0, so the library cannot
+    // even load, and a green check here would verify nothing. It is a separate
+    // ELF so that the missing import no longer stops the pthread library next to
+    // it. Once the HLE signal chain is real, the image loads and the check runs.
+    {
+        std::string signal_error;
+        auto signal_lib = loader.Load(guest_lib_signal::kSignalLibImage,
+                                      guest_lib_signal::kSignalLibSize,
+                                      kLibBase + 0x01100000, &signal_error);
+        if (!signal_lib) {
+            report.Skip("signals.frame_nested",
+                        "requires the Bionic signal path: " + signal_error);
+        } else {
+            const std::uint32_t nested = call_in(*signal_lib, "lib_signal_frame_nested", {});
+            report.Check("signals.frame_nested", nested == 1,
+                         detail::Format("fault handler survived a nested delivery: %u "
+                                        "(0 = its context was overwritten)",
+                                        nested));
         }
     }
 

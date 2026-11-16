@@ -2,6 +2,7 @@ add_library(armbat_core STATIC
     src/armbat/version.cpp
     src/bionic/bionic_boot.cpp
     src/bionic/guest_sysroot.cpp
+    src/bionic/kernel_helpers.cpp
     src/cpu/guest_arena.cpp
     src/cpu/a32_machine.cpp
     src/heap/guest_heap.cpp
@@ -38,10 +39,12 @@ file(MAKE_DIRECTORY "${CMAKE_BINARY_DIR}/generated/armbat")
 configure_file(version.h.in "${CMAKE_BINARY_DIR}/generated/armbat/version_config.h" @ONLY)
 
 target_include_directories(armbat_core PUBLIC include "${CMAKE_BINARY_DIR}/generated")
-# Dynarmic's headers are part of our own public headers; z/log/OpenSLES are
-# implementation details and must not leak into every consumer.
+# Dynarmic's headers are part of our own public headers; z/log/OpenSLES/android are
+# implementation details and must not leak into every consumer. libandroid is where
+# the real AAssetManager lives: the container forwards assets to it instead of
+# reading the archive itself.
 target_link_libraries(armbat_core PUBLIC dynarmic)
-target_link_libraries(armbat_core PRIVATE z log OpenSLES armbat_warnings)
+target_link_libraries(armbat_core PRIVATE z log OpenSLES android armbat_warnings)
 target_compile_features(armbat_core PUBLIC cxx_std_20)
 # The container is linked into one image whose only dynamic entry points are the
 # JNI functions, so dead code and the symbol table can be trimmed at link time.
@@ -398,6 +401,7 @@ set(_guest_lib_real_so "${_guest_lib_dir}/libguesttest_real.so")
 set(_guest_lib_cpp_so "${_guest_lib_dir}/libguesttest_cpp.so")
 set(_guest_lib_stdio_so "${_guest_lib_dir}/libguesttest_stdio.so")
 set(_guest_lib_pthread_so "${_guest_lib_dir}/libguesttest_pthread.so")
+set(_guest_lib_signal_so "${_guest_lib_dir}/libguesttest_signal.so")
 set(_guest_lib_cppstdlib_so "${_guest_lib_dir}/libguesttest_cppstdlib.so")
 set(_guest_lib_dep_so "${_guest_lib_dir}/libguesttest_dep.so")
 set(_guest_libcxx_so "${_guest_lib_dir}/libc++_shared.so")
@@ -412,6 +416,7 @@ set(_guest_lib_real_header "${CMAKE_BINARY_DIR}/generated/guest_lib_real.h")
 set(_guest_lib_cpp_header "${CMAKE_BINARY_DIR}/generated/guest_lib_cpp.h")
 set(_guest_lib_stdio_header "${CMAKE_BINARY_DIR}/generated/guest_lib_stdio.h")
 set(_guest_lib_pthread_header "${CMAKE_BINARY_DIR}/generated/guest_lib_pthread.h")
+set(_guest_lib_signal_header "${CMAKE_BINARY_DIR}/generated/guest_lib_signal.h")
 set(_guest_lib_cppstdlib_header "${CMAKE_BINARY_DIR}/generated/guest_lib_cppstdlib.h")
 set(_guest_libcxx_header "${CMAKE_BINARY_DIR}/generated/guest_libcxx.h")
 set(_guest_test_apk_header "${CMAKE_BINARY_DIR}/generated/guest_apk.h")
@@ -482,6 +487,15 @@ armbat_guest_module("${_guest_lib_pthread_so}" libguesttest_pthread.so
 armbat_embed_binary("${_guest_lib_pthread_so}" "${_guest_lib_pthread_header}"
     guest_lib_pthread kPthreadLib)
 
+# Signals live in their own module: the HLE pthread path has no pthread_kill and
+# sigaction there is a stub, so keeping the test in the pthread library stopped
+# that library from loading and took the atomics suite down with it.
+armbat_guest_module("${_guest_lib_signal_so}" libguesttest_signal.so
+    "${PROJECT_SOURCE_DIR}/tests/guest/native_lib_signal.c"
+    "${CMAKE_C_COMPILER}" "${ARMBAT_GUEST_LINKED_FLAGS}")
+armbat_embed_binary("${_guest_lib_signal_so}" "${_guest_lib_signal_header}"
+    guest_lib_signal kSignalLib)
+
 armbat_guest_module("${_guest_lib_cppstdlib_so}" libguesttest_cppstdlib.so
     "${PROJECT_SOURCE_DIR}/tests/guest/native_lib_cppstdlib.cpp"
     "${CMAKE_CXX_COMPILER}" "${ARMBAT_GUEST_LINKED_STD_FLAGS}")
@@ -545,6 +559,7 @@ add_custom_target(guest_libs DEPENDS
     "${_guest_lib_cpp_header}"
     "${_guest_lib_stdio_header}"
     "${_guest_lib_pthread_header}"
+    "${_guest_lib_signal_header}"
     "${_guest_lib_cppstdlib_header}"
     "${_guest_libcxx_header}"
     "${_guest_test_apk_header}"

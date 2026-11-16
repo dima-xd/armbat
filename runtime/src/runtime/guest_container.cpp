@@ -3,7 +3,9 @@
 #include <chrono>
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <functional>
@@ -15,10 +17,12 @@
 #include <android/log.h>
 
 #include "armbat/log.h"
+#include "armbat/kernel_helpers.h"
 #include <dynarmic/interface/exclusive_monitor.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <array>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -81,19 +85,6 @@ constexpr std::uint64_t kUnlimitedTicks = 1ull << 60;
 // return control instead of freezing the caller.
 constexpr std::uint64_t kInitializerTicks = 4'000'000'000ull;
 
-// The ARM kernel's helper page, at the fixed address every 32-bit process on a
-// 32-bit kernel could reach. It is not a library: the kernel mapped one page at
-// 0xffff0000 and put a handful of routines at its top -- a memory barrier is a
-// `blx 0xffff0fa0`, a compare-and-swap is `blx 0xffff0fc0`. Code compiled for an
-// old ARM ABI calls them, and the archive does: creating a world runs MC's
-// leveldb environment setup, which barriers through that page and then fetches
-// from an address this process never maps.
-//
-// The kernel here is 64-bit and maps no such page, so the container provides it,
-// at the same addresses and with the same contract, as ARM code the JIT runs
-// like any other guest code.
-constexpr std::uint32_t kKuserPageAddr = 0xffff0000;
-
 // The contexts the guest lends to platform threads. They live in guest memory
 // because the lenders write them, and the container reads them through the same
 // mapping; the page is between the main stack and the stub region, which nothing
@@ -113,9 +104,20 @@ struct WorkerContext {
     std::uint32_t tls;
     std::uint32_t sp;
     std::uint32_t park;
+    // The lender's own tid, published before `ready`. Guest code running on a
+    // borrowed context reads this thread's TLS, so every pthread_self() inside
+    // the guest -- and the tid bionic caches in the pthread it returns -- names
+    // the lender, not the platform thread that is actually executing. That is
+    // what the two tables below undo for thread-directed signals.
+    std::uint32_t tid;
 };
 
-static_assert(sizeof(WorkerContext) == 16, "the guest lender stub expects this layout");
+static_assert(sizeof(WorkerContext) == 20, "the guest lender stub expects this layout");
+
+// Slot-indexed: the lender's guest tid, and the tid of the platform thread that
+// is running guest code on the lender's stack right now (0 when nobody is).
+std::atomic<std::uint32_t> g_lender_tid[kWorkerSlots];
+std::atomic<std::uint32_t> g_borrower_tid[kWorkerSlots];
 static_assert(kWorkerSlots * sizeof(WorkerContext) <= 0x1000, "the contexts must fit one page");
 // The pthread_t outputs live in the same page, right after the contexts. They used
 // to start at a fixed 0x100, which is inside the array: pthread_create wrote its
@@ -135,49 +137,6 @@ struct PendingOnLoad {
     std::string soname;
     std::uint32_t entry = 0;
 };
-
-bool InstallKernelHelpers(GuestArena& arena) {
-    if (!arena.Map(kKuserPageAddr, 0x1000)) {
-        return false;
-    }
-    std::vector<std::uint32_t> page(0x1000 / 4, 0);
-    const auto put = [&page](std::uint32_t address, std::initializer_list<std::uint32_t> words) {
-        std::uint32_t offset = (address - kKuserPageAddr) / 4;
-        for (const std::uint32_t word : words) {
-            if (offset < page.size()) {
-                page[offset++] = word;
-            }
-        }
-    };
-    // __kuser_memory_barrier: the barrier, then the return.
-    put(0xffff0fa0, {0xF57FF05F /* dmb sy */, 0xE12FFF1E /* bx lr */});
-    // __kuser_cmpxchg(oldval = r0, newval = r1, ptr = r2), 0 on success and 1
-    // when the value had changed. The arguments are the kernel's, not an
-    // invented order: libgcc and old bionic call this page as
-    // `__kernel_cmpxchg(oldval, newval, ptr)`, so a helper that reads through r0
-    // dereferences the old value as a pointer -- address zero for every
-    // compare-against-null, which is exactly how a 2012 game touches this page.
-    put(0xffff0fc0, {
-        0xE1923F9F,  // ldrex r3, [r2]
-        0xE1530000,  // cmp   r3, r0
-        0x1A000002,  // bne   0xffff0fd8
-        0xE1823F91,  // strex r3, r1, [r2]
-        0xE3530000,  // cmp   r3, #0
-        0x03A00000,  // moveq r0, #0
-        0x13A00001,  // movne r0, #1
-        0xE12FFF1E,  // bx    lr
-    });
-    // __kuser_get_tls: the thread pointer, the register bionic's own __get_tls
-    // reads.
-    put(0xffff0fe0, {0xEE1D0F70 /* mrc p15, 0, r0, c13, c0, 3 */, 0xE12FFF1E /* bx lr */});
-    // __kuser_helper_version: the highest helper this page implements.
-    put(0xffff0ff0, {5});
-    std::memcpy(arena.Ptr(kKuserPageAddr), page.data(), page.size() * sizeof(std::uint32_t));
-    ARMBAT_LOG_INFO("Armbat",
-                        "kernel helpers: barrier, cmpxchg and tls at 0x%08x",
-                        kKuserPageAddr);
-    return true;
-}
 
 // Reads a whole file into memory. Used to inspect an application library's
 // dynamic symbols: on the bionic path the guest's linker owns the mapping, so
@@ -247,7 +206,13 @@ bool WriteTextFile(const std::string& path, const std::string& text) {
 std::atomic<void*> g_context_owner{nullptr};
 
 struct GuestContainer::Impl {
-    ~Impl() { g_context_owner.store(nullptr, std::memory_order_release); }
+    ~Impl() {
+        // The builder reads `machine` and `arena`: it has to be gone before they
+        // are, and a container that is torn down while a spare is being built
+        // would otherwise finish the build on freed state.
+        StopSpareBuilder();
+        g_context_owner.store(nullptr, std::memory_order_release);
+    }
 
     bool Start(std::string* error) {
         if (ready) {
@@ -372,6 +337,7 @@ struct GuestContainer::Impl {
         kernel->SetThreadSpawner([this](const GuestKernel::CloneStart& start) -> std::uint32_t {
             A32Machine::Config config = machine->Settings();
             std::uint32_t processor = 0;
+            std::shared_ptr<A32Machine> reused;
             {
                 const std::lock_guard lock(processor_mutex);
                 if (!free_processors.empty()) {
@@ -386,9 +352,27 @@ struct GuestContainer::Impl {
                         return 0;
                     }
                 }
+                NoteProcessorTaken(processor);
+                // Same as TakeProcessor: tell the builder a spare is gone.
+                processor_cv.notify_one();
+                // The slot is recycled, so the thread that ran on it last left
+                // its translations behind: same libraries, same decoder.
+                if (const auto warm = warm_machines.find(processor); warm != warm_machines.end()) {
+                    reused = warm->second;
+                    warm_machines.erase(warm);
+                }
             }
             config.processor_id = processor;
-            auto child = std::make_shared<A32Machine>(arena, config);
+            std::shared_ptr<A32Machine> child;
+            if (reused != nullptr) {
+                child = reused;
+                child->ResetForThread();
+            } else {
+                // See AttachMachine: a cold build here means the pool was empty
+                // when a guest thread needed one.
+                ARMBAT_LOG_INFO("Armbat", "machine: built for slot %u (pool miss)", processor);
+                child = std::make_shared<A32Machine>(arena, config);
+            }
             child->SetTickBudget(kUnlimitedTicks);
             child->CopySvcHandlersFrom(*machine);
             child->CopySafePointHandlerFrom(*machine);
@@ -420,10 +404,12 @@ struct GuestContainer::Impl {
                 }
                 kernel->FinishThread();
                 // The thread is gone: hand its exclusive-monitor slot back and
-                // drop the container's reference, which is what releases the
-                // machine with its JIT code cache. Without this a game that
-                // replaces worker threads keeps every dead thread's translated
-                // code resident and eventually runs out of monitor slots.
+                // park the machine on the slot it ran on. The next thread that
+                // takes this slot starts with that thread's translations, which
+                // is what makes a short-lived worker cost milliseconds instead
+                // of the time to translate everything it touches. The pool is
+                // capped: a game that never reuses a slot must not keep every
+                // dead thread's code cache resident forever.
                 {
                     const std::uint32_t processor = child->ProcessorId();
                     if (const auto monitor = child->Settings().exclusive_monitor) {
@@ -440,7 +426,12 @@ struct GuestContainer::Impl {
                     }
                     {
                         const std::lock_guard lock(processor_mutex);
+                        NoteProcessorReturned(processor);
                         free_processors.push_back(processor);
+                        if (warm_machines.size() < kWarmMachineLimit &&
+                            warm_machines.find(processor) == warm_machines.end()) {
+                            warm_machines.emplace(processor, child);
+                        }
                     }
                 }
                 // The thread may have called into the framework, which attaches
@@ -449,6 +440,12 @@ struct GuestContainer::Impl {
             }).detach();
             return tid.get();
         });
+
+        // Nothing runs yet: the machines the first burst of guest threads will
+        // need are built now, not while a thread waits for one. The builder
+        // keeps the pool stocked afterwards.
+        PrewarmMachines();
+        StartSpareBuilder();
 
         jni = std::make_unique<JniBridge>(*owner);
         std::string jni_error;
@@ -546,6 +543,33 @@ struct GuestContainer::Impl {
                 machine->SampleNow();
             }
         }).detach();
+
+        // The guest ended its own process: a native archive's _exit(), an
+        // Application.Quit() that goes all the way down, or abort() after a
+        // runtime decided it could not go on. The platform's answer to a process
+        // that is gone is to end the session, and this container cannot outlive
+        // its guest world anyway -- the next launch starts from a fresh process.
+        // Until that happens the window keeps asking the guest to paint, and a
+        // frame from a torn-down runtime looks exactly like a slow load, so the
+        // check runs on its own short tick rather than the watchdog's five
+        // seconds.
+        std::thread([this] {
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                if (kernel == nullptr || !kernel->ProcessExited()) {
+                    continue;
+                }
+                const int signal = kernel->ExitSignal();
+                if (signal != 0) {
+                    ARMBAT_LOG_WARN("Armbat", "guest process: ended by signal %d", signal);
+                } else {
+                    ARMBAT_LOG_INFO("Armbat", "guest process: exited with code %d",
+                                        kernel->ExitCode());
+                }
+                armbat::LogFlush();
+                ::_exit(signal != 0 ? 128 + signal : kernel->ExitCode());
+            }
+        }).detach();
         return true;
     }
 
@@ -566,12 +590,19 @@ struct GuestContainer::Impl {
         if (!free_processors.empty()) {
             const std::uint32_t processor = free_processors.back();
             free_processors.pop_back();
+            NoteProcessorTaken(processor);
+            // A spare left the pool: let the builder refill it while this thread
+            // is still translating. Notifying under the lock is what makes the
+            // builder's predicate check and its wait a single step.
+            processor_cv.notify_one();
             return processor;
         }
         const std::uint32_t processor = next_processor_id.fetch_add(1);
         if (processor >= A32Machine::Config::kProcessorLimit) {
             return A32Machine::Config::kProcessorLimit;
         }
+        NoteProcessorTaken(processor);
+        processor_cv.notify_one();
         return processor;
     }
 
@@ -596,6 +627,12 @@ struct GuestContainer::Impl {
         const std::uint32_t libc = bionic->Dlopen("libc.so", 2 /*RTLD_NOW*/);
         const std::uint32_t create =
             libc != 0 ? bionic->Dlsym(libc, "pthread_create") : 0;
+        const std::uint32_t attr_init =
+            libc != 0 ? bionic->Dlsym(libc, "pthread_attr_init") : 0;
+        const std::uint32_t attr_setstack =
+            libc != 0 ? bionic->Dlsym(libc, "pthread_attr_setstacksize") : 0;
+        const std::uint32_t attr_destroy =
+            libc != 0 ? bionic->Dlsym(libc, "pthread_attr_destroy") : 0;
         if (lender == 0 || create == 0) {
             ARMBAT_LOG_ERROR("Armbat",
                                 "contexts: lender=0x%08x pthread_create=0x%08x", lender, create);
@@ -607,19 +644,50 @@ struct GuestContainer::Impl {
         }
         auto* contexts = reinterpret_cast<WorkerContext*>(arena.Ptr(kWorkerJobsAddr));
         std::memset(contexts, 0, kWorkerSlots * sizeof(WorkerContext));
+        // A platform thread that reaches a native method has the stack the
+        // platform gave it, and for the thread the framework runs the
+        // application on that is eight megabytes. A lender created with bionic's
+        // default got one, so code that runs deep on that thread -- reading a
+        // bundle walks a long chain of frames -- came within a few pages of the
+        // bottom of a stack a phone never comes close to using, and nothing
+        // enforced the guard page under it either: the overflow went into the
+        // stack of the thread mapped below instead of stopping the thread that
+        // was wrong. The contexts exist to stand in for platform threads, so
+        // they ask bionic for their stacks too.
+        constexpr std::uint32_t kLenderStackSize = 8u * 1024u * 1024u;
+        const std::uint32_t attr_address = kWorkerJobsAddr + 0x1000;
+        std::uint32_t attr = 0;
+        if (attr_init != 0 && attr_setstack != 0 && arena.Map(attr_address, 0x1000)) {
+            std::memset(arena.Ptr(attr_address), 0, 0x1000);
+            Invoke(attr_init, {attr_address});
+            const std::int32_t sized = static_cast<std::int32_t>(
+                Invoke(attr_setstack, {attr_address, kLenderStackSize}));
+            if (sized == 0) {
+                attr = attr_address;
+            } else {
+                ARMBAT_LOG_WARN("Armbat", "contexts: bionic refused a %u MiB stack, %d",
+                                    kLenderStackSize >> 20, sized);
+            }
+        }
+        if (attr == 0) {
+            ARMBAT_LOG_WARN("Armbat", "contexts: lending bionic's default thread stack");
+        }
         // pthread_t outputs, above the contexts in the same page.
         const std::uint32_t thread_ids = kWorkerJobsAddr + kWorkerThreadIds;
         int started = 0;
         for (std::uint32_t i = 0; i < kWorkerSlots; ++i) {
             const std::uint32_t context = kWorkerJobsAddr + i * sizeof(WorkerContext);
             const std::uint32_t answer =
-                Invoke(create, {thread_ids + i * 4, 0, lender, context});
+                Invoke(create, {thread_ids + i * 4, attr, lender, context});
             if (static_cast<std::int32_t>(answer) != 0) {
                 ARMBAT_LOG_ERROR("Armbat",
                                     "contexts: pthread_create failed, %d", static_cast<int>(answer));
                 break;
             }
             ++started;
+        }
+        if (attr != 0 && attr_destroy != 0) {
+            Invoke(attr_destroy, {attr});
         }
         contexts_addr = kWorkerJobsAddr;
         // The lender publishes its pointers from its own thread, so a context is
@@ -638,6 +706,9 @@ struct GuestContainer::Impl {
             }
         }
         context_count = ready;
+        for (int i = 0; i < context_count; ++i) {
+            g_lender_tid[i].store(contexts[i].tid, std::memory_order_release);
+        }
         {
             const std::lock_guard lock(context_mutex);
             free_contexts.clear();
@@ -649,13 +720,137 @@ struct GuestContainer::Impl {
                             context_count, contexts_addr);
     }
 
+    // A machine that is built while the guest waits is tens of milliseconds of
+    // latency: the Jit allocates its 128 MiB code cache and its tables. Platform
+    // threads attach and detach for every native call, and the engine creates a
+    // worker per bundle, so the cost lands exactly where the guest measures time.
+    // The slots are numbered in advance anyway, so the next few machines are
+    // built at startup and parked where a recycled one is looked for.
+    void PrewarmMachines() {
+        constexpr std::uint32_t kPrewarm = 3;
+        std::vector<std::uint32_t> processors;
+        {
+            const std::lock_guard lock(processor_mutex);
+            for (std::uint32_t i = 0; i < kPrewarm; ++i) {
+                if (warm_machines.size() + processors.size() >= kWarmMachineLimit) {
+                    break;
+                }
+                const std::uint32_t processor = next_processor_id.fetch_add(1);
+                if (processor >= A32Machine::Config::kProcessorLimit) {
+                    break;
+                }
+                processors.push_back(processor);
+            }
+        }
+        std::vector<std::shared_ptr<A32Machine>> built;
+        built.reserve(processors.size());
+        for (const std::uint32_t processor : processors) {
+            A32Machine::Config config = machine->Settings();
+            config.processor_id = processor;
+            auto spare = std::make_shared<A32Machine>(arena, config);
+            spare->SetTickBudget(kUnlimitedTicks);
+            built.push_back(std::move(spare));
+        }
+        const std::lock_guard lock(processor_mutex);
+        for (std::size_t i = 0; i < processors.size(); ++i) {
+            free_processors.push_back(processors[i]);
+            warm_machines.emplace(processors[i], std::move(built[i]));
+        }
+    }
+
+    // Keeps the spare machines coming while the guest runs. A machine is a 128
+    // MiB code cache and its tables; building it on the thread-start path is
+    // what made a burst of guest threads pay tens of milliseconds each.
+    void StartSpareBuilder() {
+        if (spare_builder.joinable()) {
+            return;
+        }
+        spare_stop.store(false, std::memory_order_relaxed);
+        spare_builder = std::thread([this] { SpareBuilderLoop(); });
+    }
+
+    void StopSpareBuilder() {
+        {
+            // Set under the lock the builder waits on, so the wakeup cannot be
+            // lost between its predicate check and its wait.
+            const std::lock_guard lock(processor_mutex);
+            spare_stop.store(true, std::memory_order_relaxed);
+        }
+        processor_cv.notify_all();
+        if (spare_builder.joinable()) {
+            spare_builder.join();
+        }
+    }
+
+    void SpareBuilderLoop() {
+        std::unique_lock lock(processor_mutex);
+        while (!spare_stop.load(std::memory_order_relaxed)) {
+            if (warm_machines.size() >= kSpareTarget ||
+                next_processor_id.load(std::memory_order_relaxed) >=
+                    A32Machine::Config::kProcessorLimit) {
+                // The pool is stocked: sleep until a thread takes one. The
+                // timeout only covers a wakeup that never came; a poll would
+                // keep a core out of idle for the whole session.
+                processor_cv.wait_for(lock, std::chrono::milliseconds(250));
+                continue;
+            }
+            // The id is reserved under the lock, so the slot a spare belongs to
+            // is decided before the machine is built; a spare that is never used
+            // only keeps its slot, it cannot be handed out twice.
+            const std::uint32_t processor = next_processor_id.fetch_add(1);
+            lock.unlock();
+            A32Machine::Config config = machine->Settings();
+            config.processor_id = processor;
+            auto spare = std::make_shared<A32Machine>(arena, config);
+            spare->SetTickBudget(kUnlimitedTicks);
+            lock.lock();
+            if (spare_stop.load(std::memory_order_relaxed)) {
+                break;
+            }
+            free_processors.push_back(processor);
+            warm_machines.emplace(processor, std::move(spare));
+        }
+    }
+
     // A machine for a platform thread, built on a lent context. Its own machine
     // is what keeps two platform threads from re-entering one, and the lent
     // stack and TLS are what make its ARM frames legal.
     A32Machine* AttachMachine(std::uint32_t tls, std::uint32_t sp) {
+        // TakeProcessor answers the limit itself when every slot is in use, and
+        // the exclusive monitor indexes its arrays by this id: a machine built on
+        // that answer would write past the end of them instead of refusing the
+        // call. A platform thread that cannot get a slot is reported, not run.
+        const std::uint32_t processor = TakeProcessor();
+        if (processor >= A32Machine::Config::kProcessorLimit) {
+            ARMBAT_LOG_ERROR("Armbat", "contexts: no exclusive-monitor slot for tid=%d",
+                                ::gettid());
+            return nullptr;
+        }
         A32Machine::Config config = machine->Settings();
-        config.processor_id = TakeProcessor();
-        auto attached_machine = std::make_shared<A32Machine>(arena, config);
+        config.processor_id = processor;
+        // The wakeup signal is per host thread: an attached platform thread
+        // inherits whatever mask it was created with, and a thread on which it
+        // stays blocked cannot be interrupted out of a blocking syscall.
+        UnblockGuestSignalWakeup();
+        std::shared_ptr<A32Machine> attached_machine;
+        {
+            const std::lock_guard lock(processor_mutex);
+            if (const auto warm = warm_machines.find(processor); warm != warm_machines.end()) {
+                attached_machine = warm->second;
+                warm_machines.erase(warm);
+            }
+        }
+        if (attached_machine != nullptr) {
+            // Same slot, same libraries: the translations the last thread on it
+            // left behind are the ones this call is about to need.
+            attached_machine->ResetForThread();
+        } else {
+            // A miss is the number the pool is judged by, and it is rare enough
+            // to name: a run that builds nothing on this path means the spares
+            // arrived before the guest asked.
+            ARMBAT_LOG_INFO("Armbat", "machine: built for slot %u (pool miss)", processor);
+            attached_machine = std::make_shared<A32Machine>(arena, config);
+        }
         attached_machine->SetTickBudget(kUnlimitedTicks);
         attached_machine->CopySvcHandlersFrom(*machine);
         attached_machine->CopySafePointHandlerFrom(*machine);
@@ -664,8 +859,8 @@ struct GuestContainer::Impl {
         attached_machine->SetSp(sp);
         A32Machine* result = attached_machine.get();
         // The watchdog reports what a parked guest thread was doing; a machine
-        // that a platform thread runs is one of those threads for as long as the
-        // process lives, so it is registered and never handed back.
+        // that a platform thread runs is one of those threads for the duration of
+        // the call, and ReleaseContext unregisters it when the call returns.
         RegisterLiveGuestThread(*result);
         {
             const std::lock_guard lock(context_mutex);
@@ -699,7 +894,17 @@ struct GuestContainer::Impl {
             return nullptr;
         }
         const WorkerContext& context = contexts[index];
+        // Published before the machine exists: from here on, this thread is the
+        // one a signal addressed to the lender has to reach.
+        g_borrower_tid[index].store(static_cast<std::uint32_t>(::gettid()),
+                                    std::memory_order_release);
         A32Machine* attached_machine = AttachMachine(context.tls, context.sp);
+        if (attached_machine == nullptr) {
+            g_borrower_tid[index].store(0, std::memory_order_release);
+            const std::lock_guard lock(context_mutex);
+            free_contexts.push_back(index);
+            return nullptr;
+        }
         // This thread runs guest code from here on, so a host signal has to find
         // its register file: the machine is thread-local for exactly that, and a
         // platform thread that never says which machine it borrowed reports a
@@ -712,10 +917,10 @@ struct GuestContainer::Impl {
         return attached_machine;
     }
 
-    // A platform thread that exits gives its context back. The machine is that
-    // thread's alone -- nothing else ever ran on it -- so it is dropped with the
-    // JIT code it translated, and the slot returns to the pool for the next Java
-    // thread ART hands a native call to.
+    // A platform thread that exits gives its context back. The machine goes back
+    // to the slot it ran on, translations included: ART attaches a thread for
+    // every native call, so rebuilding the machine here means rebuilding it again
+    // a moment later.
     void ReleaseContext(int index, A32Machine* attached_machine) {
         SetCrashMachine(nullptr);
         armbat::UnregisterLiveGuestThread(*attached_machine);
@@ -723,22 +928,36 @@ struct GuestContainer::Impl {
         if (const auto monitor = attached_machine->Settings().exclusive_monitor) {
             monitor->ClearProcessor(processor);
         }
+        std::shared_ptr<A32Machine> parked;
         {
             const std::lock_guard lock(context_mutex);
             for (auto it = attached.begin(); it != attached.end(); ++it) {
                 if (it->get() == attached_machine) {
+                    parked = std::move(*it);
                     attached.erase(it);
                     break;
                 }
             }
             if (index >= 0 && index < context_count) {
+                // Cleared before the slot is free: once another thread owns the
+                // context, a signal for the lender must not reach this one.
+                g_borrower_tid[index].store(0, std::memory_order_release);
                 free_contexts.push_back(index);
             }
         }
         {
             const std::lock_guard lock(processor_mutex);
             if (processor < A32Machine::Config::kProcessorLimit) {
+                NoteProcessorReturned(processor);
                 free_processors.push_back(processor);
+                // Platform threads attach for every native call, so a machine
+                // destroyed here is a machine built again a moment later. It goes
+                // back to the slot it ran on, with its translations, like a guest
+                // thread's machine does.
+                if (parked != nullptr && warm_machines.size() < kWarmMachineLimit &&
+                    warm_machines.find(processor) == warm_machines.end()) {
+                    warm_machines.emplace(processor, std::move(parked));
+                }
             }
         }
     }
@@ -1005,6 +1224,48 @@ struct GuestContainer::Impl {
     // run out of them in a long session; they are handed back here instead.
     std::mutex processor_mutex;
     std::vector<std::uint32_t> free_processors;
+    // Wakes the spare builder when a thread takes a machine out of the pool, so
+    // it refills right away instead of on a timer.
+    std::condition_variable processor_cv;
+    // Machines whose guest thread exited, keyed by the processor slot they ran
+    // on. Guest threads are short: a Unity download worker lives for a hundred
+    // milliseconds and spends almost all of it translating the same library
+    // code its predecessor translated an instant earlier, so the cache is worth
+    // more than the memory it holds. Kept bounded -- a game that creates a
+    // thread per request for ever must not pin a cache per dead thread.
+    std::unordered_map<std::uint32_t, std::shared_ptr<A32Machine>> warm_machines;
+    static constexpr std::size_t kWarmMachineLimit = 32;
+    // How many machines the background builder keeps ready. A build costs tens
+    // of milliseconds, and the guest asks for threads in bursts: the pool is
+    // refilled while nothing waits for it, so a burst finds machines instead of
+    // paying for one per thread.
+    static constexpr std::size_t kSpareTarget = 3;
+    std::thread spare_builder;
+    std::atomic<bool> spare_stop{false};
+    // A processor id is the index at which the exclusive monitor keeps that
+    // thread's reservation. Two live threads on one id would see each other's
+    // reservations, which is the one way this container could make a lock-free
+    // structure in the guest lose a store, so ownership is tracked from
+    // hand-out to hand-back and a slot handed out twice is named in the log.
+    std::array<std::int32_t, A32Machine::Config::kProcessorLimit> processor_owner{};
+
+    void NoteProcessorTaken(std::uint32_t processor) {  // processor_mutex held
+        if (processor >= processor_owner.size()) {
+            return;
+        }
+        if (processor_owner[processor] != 0) {
+            ARMBAT_LOG_ERROR("Armbat",
+                             "monitor: slot %u handed to tid=%d while tid=%d holds it",
+                             processor, ::gettid(), processor_owner[processor]);
+        }
+        processor_owner[processor] = ::gettid();
+    }
+
+    void NoteProcessorReturned(std::uint32_t processor) {  // processor_mutex held
+        if (processor < processor_owner.size()) {
+            processor_owner[processor] = 0;
+        }
+    }
 
     // Guest contexts lent to platform threads: the stacks and TLS blocks of
     // guest threads that do nothing but park, plus the machines the container
@@ -1062,7 +1323,8 @@ GuestContainer::GuestContainer() : impl_(std::make_unique<Impl>()) {
 }
 
 GuestContainer::~GuestContainer() {
-    // That thread runs on the arena, so it has to be gone before the arena is.
+    // The guest call thread runs on the arena, so it has to be gone before the
+    // arena is.
     StopGuestCallThread();
     SetGuestCallRunner(nullptr);
 	SetGuestKernel(nullptr);
@@ -1453,7 +1715,6 @@ std::string GuestContainer::LoadApk(const std::string& apk_path, const std::stri
     report += "abi: " + apk.AbiDirectory() + "\n";
 
     impl_->apk = std::move(apk_holder);
-    SetGuestApk(impl_->apk.get());
 
 #if ARMBAT_GUEST_RUNTIME_BIONIC
     if (!impl_->StartBionic(cache_dir, target_sdk, error)) {
@@ -1693,6 +1954,29 @@ std::string GuestContainer::LoadApk(const std::string& apk_path, const std::stri
         *error = load_error;
     }
     return report;
+}
+
+// A thread-directed signal names a guest thread, and a borrowed context's guest
+// identity is the lender: bionic caches that tid in the pthread it returns from
+// pthread_self(), and raise(), pthread_kill() and a collector's stop-the-world
+// all address it. What has to receive the signal is the platform thread running
+// on that context. Suspending the parked lender instead leaves the thread that
+// really holds the heap running, and the collector then collects objects that
+// are still in use.
+std::uint32_t BorrowingThreadForLender(std::uint32_t tid) {
+    if (tid == 0) {
+        return tid;
+    }
+    for (std::uint32_t i = 0; i < kWorkerSlots; ++i) {
+        if (g_lender_tid[i].load(std::memory_order_acquire) != tid) {
+            continue;
+        }
+        const std::uint32_t borrower = g_borrower_tid[i].load(std::memory_order_acquire);
+        // A lender nobody borrowed is parked in the container's own stub and has
+        // no guest state a signal could mean anything on.
+        return borrower != 0 ? borrower : tid;
+    }
+    return tid;
 }
 
 }  // namespace armbat

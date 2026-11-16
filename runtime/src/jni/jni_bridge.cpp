@@ -1,4 +1,4 @@
-﻿#include "armbat/jni_bridge.h"
+#include "armbat/jni_bridge.h"
 
 #include <android/log.h>
 
@@ -7,14 +7,19 @@
 
 #include <atomic>
 #include <sys/mman.h>
+#include <sys/stat.h>
 
 #include <algorithm>
 #include <array>
+#include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
@@ -28,7 +33,9 @@
 #include "armbat/guest_arena.h"
 #include "armbat/guest_container.h"
 #include "armbat/guest_heap.h"
+#include "armbat/guest_kernel.h"
 #include "armbat/guest_modules.h"
+#include "armbat/guest_pthread.h"
 #include "armbat/hle.h"
 
 namespace armbat {
@@ -41,9 +48,12 @@ constexpr std::uint32_t kJniVmBase = 0x9000;
 
 constexpr std::uint32_t kJniTableSize = 240;
 
-// One arm64 trampoline is 72 bytes; the stride keeps them 16-byte aligned so the
-// literal pools stay aligned as well.
-constexpr std::size_t kTrampolineStride = 96;
+// One trampoline occupies a page of its own. A slot that shares a page with an
+// already registered one cannot be written without taking the execute
+// permission away from that neighbour, and a thread that calls it in that window
+// faults. One page per slot costs address space (the pool is never touched beyond
+// the slots that are used) and makes every publication a page of its own.
+constexpr std::size_t kTrampolineStride = 4096;
 // The pool does not grow, so it has to fit the greediest guest: the Google Play
 // Games C++ SDK alone registers about a thousand natives. Running out used to put
 // a null function pointer in the table, which the guest then called and faulted
@@ -87,6 +97,79 @@ thread_local std::vector<std::uint32_t> g_thread_refs;
 
 void Log(const std::string& line) {
     ARMBAT_LOG_TEXT(LogLevel::Info, "Armbat", line);
+}
+
+// TEMPORARY, for the audio crackle report. The mixer hands PCM to the platform
+// through AudioTrack.write, once per buffer; the device underruns when the gap
+// between two writes is longer than the buffer it has been given, and a write
+// that blocks for a long time says the queue was still full. Both numbers are
+// the whole diagnosis, so they are measured here and printed once every two
+// seconds. Remove with the report.
+void NoteAudioWrite(std::chrono::steady_clock::time_point start,
+                    std::chrono::steady_clock::time_point end, std::int32_t written) {
+    static std::mutex mutex;
+    static std::uint64_t window_start_ns = 0;
+    static std::uint64_t last_call_ns = 0;
+    static std::uint64_t calls = 0;
+    static std::uint64_t bytes = 0;
+    static std::uint64_t gap_sum_ns = 0;
+    static std::uint64_t gap_max_ns = 0;
+    static std::uint64_t block_sum_ns = 0;
+    static std::uint64_t block_max_ns = 0;
+    static std::uint64_t long_gaps = 0;
+    const auto ns = [](std::chrono::steady_clock::time_point point) {
+        return static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(point.time_since_epoch())
+                .count());
+    };
+    const std::uint64_t now = ns(end);
+    std::string line;
+    {
+        const std::lock_guard lock(mutex);
+        if (window_start_ns == 0) {
+            window_start_ns = ns(start);
+            last_call_ns = ns(start);
+        }
+        const std::uint64_t gap = now - last_call_ns;
+        last_call_ns = now;
+        const std::uint64_t block = ns(end) - ns(start);
+        ++calls;
+        bytes += written > 0 ? static_cast<std::uint64_t>(written) : 0;
+        gap_sum_ns += gap;
+        gap_max_ns = std::max(gap_max_ns, gap);
+        block_sum_ns += block;
+        block_max_ns = std::max(block_max_ns, block);
+        if (gap > 30000000ULL) {
+            ++long_gaps;
+        }
+        const std::uint64_t span = now - window_start_ns;
+        if (span >= 2000000000ULL) {
+            char text[256];
+            std::snprintf(text, sizeof(text),
+                          "audio: %llu writes in %llu ms, %llu KiB, gap avg=%.1f max=%.1f ms "
+                          "(>30 ms: %llu), block avg=%.2f max=%.2f ms",
+                          static_cast<unsigned long long>(calls),
+                          static_cast<unsigned long long>(span / 1000000ULL),
+                          static_cast<unsigned long long>(bytes / 1024ULL),
+                          static_cast<double>(gap_sum_ns) / 1e6 / static_cast<double>(calls),
+                          static_cast<double>(gap_max_ns) / 1e6,
+                          static_cast<unsigned long long>(long_gaps),
+                          static_cast<double>(block_sum_ns) / 1e6 / static_cast<double>(calls),
+                          static_cast<double>(block_max_ns) / 1e6);
+            line = text;
+            window_start_ns = now;
+            calls = 0;
+            bytes = 0;
+            gap_sum_ns = 0;
+            gap_max_ns = 0;
+            block_sum_ns = 0;
+            block_max_ns = 0;
+            long_gaps = 0;
+        }
+    }
+    if (!line.empty()) {
+        ARMBAT_LOG_INFO("Armbat", "%s", line.c_str());
+    }
 }
 
 JNIEnv* HostEnv() {
@@ -205,11 +288,56 @@ std::string BinaryName(const std::string& descriptor) {
     return name;
 }
 
+// `_0XXXX` names one UTF-16 code unit by its four hex digits. The name travels
+// in modified UTF-8, so a unit below U+0080 is one byte, below U+0800 two and
+// anything else three -- the encoding a surrogate half gets as well, which is
+// how the name is stored in the class file.
+bool DecodeUnitEscape(const std::string& text, std::size_t i, std::string* out,
+                      std::size_t* used) {
+    if (i + 6 > text.size() || text[i] != '_' || text[i + 1] != '0') {
+        return false;
+    }
+    std::uint32_t unit = 0;
+    for (std::size_t k = i + 2; k < i + 6; ++k) {
+        const char c = text[k];
+        unit <<= 4;
+        if (c >= '0' && c <= '9') {
+            unit |= static_cast<std::uint32_t>(c - '0');
+        } else if (c >= 'a' && c <= 'f') {
+            unit |= static_cast<std::uint32_t>(c - 'a' + 10);
+        } else if (c >= 'A' && c <= 'F') {
+            unit |= static_cast<std::uint32_t>(c - 'A' + 10);
+        } else {
+            return false;
+        }
+    }
+    if (unit == 0 || unit > 0xFFFFu) {
+        return false;
+    }
+    if (unit < 0x80) {
+        *out += static_cast<char>(unit);
+    } else if (unit < 0x800) {
+        *out += static_cast<char>(0xC0 | (unit >> 6));
+        *out += static_cast<char>(0x80 | (unit & 0x3F));
+    } else {
+        *out += static_cast<char>(0xE0 | (unit >> 12));
+        *out += static_cast<char>(0x80 | ((unit >> 6) & 0x3F));
+        *out += static_cast<char>(0x80 | (unit & 0x3F));
+    }
+    *used = 6;
+    return true;
+}
+
 std::string DecodeMangled(const std::string& text) {
     std::string out;
     for (std::size_t i = 0; i < text.size(); ++i) {
         if (text[i] != '_') {
             out += text[i];
+            continue;
+        }
+        std::size_t used = 0;
+        if (DecodeUnitEscape(text, i, &out, &used)) {
+            i += used - 1;   // the loop's ++i lands past the escape
             continue;
         }
         if (i + 1 < text.size()) {
@@ -253,6 +381,11 @@ bool SplitJavaSymbol(const std::string& symbol, std::vector<std::string>* segmen
             continue;
         }
         if (i + 1 < symbol.size()) {
+            std::size_t used = 0;
+            if (DecodeUnitEscape(symbol, i, &current, &used)) {
+                i += used;
+                continue;
+            }
             const char next = symbol[i + 1];
             if (next == '1') {
                 current += '_';
@@ -355,6 +488,10 @@ struct JniBridge::Impl {
         // A reference the guest keeps using survives; one it made and left
         // behind is dropped on the second pass.
         mutable bool touched = false;
+        // The reference belongs to a native call's frame, so that frame releases
+        // it when the call returns. The budget never touches these: dropping one
+        // early is what turns a handle the guest still holds into a null.
+        bool frame_owned = false;
         // Shallow Java size this reference keeps alive, when it is known. Arrays
         // are the ones that matter: a decoded image is a quarter of a megabyte.
         std::uint32_t bytes = 0;
@@ -394,20 +531,34 @@ struct JniBridge::Impl {
     std::atomic<std::size_t> local_ref_count{0};
     std::atomic<std::size_t> local_ref_history{0};
     std::atomic<std::size_t> local_ref_bytes{0};
-    std::vector<MethodRef> method_refs;
+    // What the last budget pass left behind: the walk only runs again once the
+    // table grew past it. Guarded by refs_mutex.
+    std::size_t trim_live_watermark = 0;
+    std::size_t trim_bytes_watermark = 0;
+    // A registered method or field is published one entry at a time through an
+    // atomic slot. A caller reads the signature it marshals arguments by while
+    // another thread may be registering the next method, so the entries may
+    // neither move nor be read half-written.
+    static constexpr std::size_t kMaxMethods = 16384;
+    static constexpr std::size_t kMaxFields = 4096;
+    std::unique_ptr<std::atomic<MethodRef*>[]> method_slots;
+    std::unique_ptr<std::atomic<FieldRef*>[]> field_slots;
+    std::atomic<std::uint32_t> method_count{0};
+    std::atomic<std::uint32_t> field_count{0};
     // Real JNI answers the same jmethodID for the same method for the life of the
     // VM. Callers key their own caches by it (Unity's proxy bridge does), so a
     // fresh index per call turns a cached method into an unknown one.
     std::unordered_map<jmethodID, std::uint32_t> method_ids;
-    std::vector<FieldRef> field_refs;
 
     jobject loader = nullptr;
     jmethodID loader_load_class = nullptr;
 
     std::vector<std::function<void(HleCall&)>> jni_calls;
     std::vector<std::function<void(HleCall&)>> vm_calls;
-    std::vector<bool> warned;
-    std::vector<bool> seen;
+    // Guest threads reach these at the same time, and a vector<bool> packs eight
+    // flags into one word: even writes to different indexes would race there.
+    std::unique_ptr<std::atomic_bool[]> warned;
+    std::unique_ptr<std::atomic_bool[]> seen;
     int main_calls = 0;
 
     std::uint32_t env_pointer = 0;
@@ -415,14 +566,16 @@ struct JniBridge::Impl {
 
     std::uint8_t* trampolines = nullptr;
     std::size_t trampolines_used = 0;
-    bool trampolines_sealed = false;
-    // A deque, not a vector: a native method that is running can make its own
-    // library register more natives (Unity's libunity does exactly this the
-    // second time JNI_OnLoad runs), and a vector reallocation would leave the
-    // caller holding a reference to freed storage. Registration then decided
-    // the return convention from a dangling string and ART received 0 instead
-    // of the guest's answer.
-    std::deque<NativeMethod> natives;
+    // Appended to while the guest runs: libunity registers more natives the
+    // second time JNI_OnLoad runs, and another thread may be calling a method
+    // registered earlier at that moment. The storage is reserved for the whole
+    // pool up front, so an append never moves an entry a caller is reading, and
+    // the count is published after the entry is complete: a reader only ever
+    // indexes a slot the writer has finished. A deque would keep element
+    // addresses stable but not its own block map, which a concurrent read also
+    // walks.
+    std::vector<NativeMethod> natives;
+    std::atomic<std::uint32_t> natives_published{0};
 
     // A direct buffer Java allocated lives in host memory that only the JVM can
     // address, while the guest can address nothing but the arena. The guest
@@ -431,19 +584,46 @@ struct JniBridge::Impl {
     // address: it names the memory itself, so a buffer the collector frees and a
     // later one reuses the same block still maps to the right contents.
     struct DirectMirror {
+        // The Java buffer, kept alive for as long as the guest can still reach
+        // this copy: without the reference the collector may free the memory the
+        // flush writes into.
+        jobject ref = nullptr;
         std::byte* host = nullptr;
         std::uint32_t guest = 0;
         std::uint64_t capacity = 0;
+        // Handed to the guest since the last flush. Only these are written back.
+        // A mirror the guest did not ask for holds whatever Java had when it was
+        // last read, and Java refills a buffer between two native calls: writing
+        // that copy back would restore bytes Java has already replaced.
+        //
+        // A guest that caches the address and writes into it without asking
+        // again is the one case this cannot see; the next refresh then replaces
+        // its bytes with Java's. Native code that fills a buffer for Java asks
+        // for the address on the call that fills it, which is the path this
+        // keeps fast: the copy happens once per boundary, not once per buffer.
+        bool handed_out = false;
     };
     std::vector<DirectMirror> mirrors;
     std::mutex mirrors_mutex;
+    // Buffers are pinned, so every one of them holds its memory until the world
+    // ends: the table is capped rather than grown without limit. A guest that
+    // asks for more distinct buffers than this is doing something the mirror
+    // cannot serve, and the log says so once.
+    static constexpr std::size_t kMirrorLimit = 256;
     // Read without the lock on every JNI call: the answer to "is there anything
     // to write back" is no nearly always, and a lock there would sit on the path
     // every guest JNI call takes.
     std::atomic<std::size_t> mirror_count{0};
+    std::atomic<std::size_t> mirror_pending{0};
     bool mirror_refused = false;
 
-    std::mutex mutex;
+    // Re-entrant on one thread. RegisterExports binds Java_* symbols by asking
+    // the guest loader for their classes, and Class.forName runs static
+    // initializers: an app whose initializer calls System.loadLibrary comes back
+    // into the bridge from the same thread, through libraryLoaded and the
+    // library's own JNIEnv->RegisterNatives. A plain mutex parks that thread on
+    // itself, which is what a Marmalade title did at its first class initializer.
+    std::recursive_mutex mutex;
 
     // Guest threads call JNI concurrently: the reference tables are shared, and
     // an unsynchronized push_back here reallocates host memory under another
@@ -598,6 +778,27 @@ struct JniBridge::Impl {
         }
     }
 
+    // Hands a freshly inserted local handle its lifetime: the native call's
+    // frame when there is one, the thread's exit list otherwise. Only a handle
+    // that no frame owns can ever be retired by the budget.
+    //
+    // Caller holds refs_mutex.
+    void TrackLocal(std::uint32_t handle) {
+        const bool framed = !g_local_frames.empty();
+        if (framed) {
+            g_local_frames.back().push_back(
+                PendingRef{handle, refs[handle - 1].generation, false});
+        } else {
+            // Nothing else will hand it back: the guest runs its own loop and
+            // never returns to Java, so only the thread's exit can release it.
+            g_thread_refs.push_back(handle);
+        }
+        refs[handle - 1].frame_owned = framed;
+        local_refs.push_back(handle);
+        local_ref_count.fetch_add(1, std::memory_order_relaxed);
+        local_ref_history.store(local_refs.size(), std::memory_order_relaxed);
+    }
+
     // `own_local` says whether the caller obtained `object` from a JNI call it
     // made (and so may delete the local reference ART made for it). A reference
     // ART passes into a native method belongs to the Java frame and is left
@@ -675,19 +876,7 @@ struct JniBridge::Impl {
             refs[handle - 1].bytes = tracked;
             local_ref_bytes.fetch_add(tracked, std::memory_order_relaxed);
         }
-        if (!g_local_frames.empty()) {
-            // The frame owns it: ReleaseLocalFrame hands it back when the native
-            // call that made it returns.
-            g_local_frames.back().push_back(
-                PendingRef{handle, refs[handle - 1].generation, false});
-        } else {
-            // Nothing else will hand it back: the guest runs its own loop and
-            // never returns to Java, so only the thread's exit can release it.
-            g_thread_refs.push_back(handle);
-        }
-        local_refs.push_back(handle);
-        local_ref_count.fetch_add(1, std::memory_order_relaxed);
-        local_ref_history.store(local_refs.size(), std::memory_order_relaxed);
+        TrackLocal(handle);
         if (own_local) {
             ReleaseIfLocal(env, object);
         }
@@ -823,8 +1012,17 @@ struct JniBridge::Impl {
         // of them sit far below the count budget and still fill the heap.
         const bool over_bytes =
             local_ref_bytes.load(std::memory_order_relaxed) > kLocalRefBytes;
-        if (!over_budget && !over_bytes &&
-            local_ref_history.load(std::memory_order_relaxed) <= kListLimit) {
+        const bool over_list =
+            local_ref_history.load(std::memory_order_relaxed) > kListLimit;
+        if (!over_budget && !over_bytes && !over_list) {
+            return;
+        }
+        // A pass that dropped nothing left the list where it was, and running
+        // the walk again on the next call would cost the whole list for an
+        // answer that cannot change until something is added to it.
+        if (!over_list &&
+            local_ref_count.load(std::memory_order_relaxed) <= trim_live_watermark &&
+            local_ref_bytes.load(std::memory_order_relaxed) <= trim_bytes_watermark) {
             return;
         }
         std::size_t kept_count = 0;
@@ -847,6 +1045,14 @@ struct JniBridge::Impl {
                 if (entry.object == nullptr || entry.guest_owned) {
                     continue;   // already released by the guest
                 }
+                if (entry.frame_owned) {
+                    // The native call that made it owns it and hands it back when
+                    // it returns. Retiring it here would answer the guest's next
+                    // use of that handle with a null, which is how a file the
+                    // guest has already read turns into garbage in its parser.
+                    local_refs[write++] = handle;
+                    continue;
+                }
                 // A compaction pass drops nothing: only a table over budget may
                 // retire a reference the guest has not resolved lately.
                 if ((!over_budget && !over_bytes) || i >= recent_from || entry.touched) {
@@ -864,6 +1070,8 @@ struct JniBridge::Impl {
             dropped_count = dropped_refs_.size();
             local_ref_count.store(kept_count, std::memory_order_relaxed);
             local_ref_history.store(kept_count, std::memory_order_relaxed);
+            trim_live_watermark = kept_count;
+            trim_bytes_watermark = local_ref_bytes.load(std::memory_order_relaxed);
             // A reference the guest released itself leaves a dead handle in this
             // thread's exit list. Compact it so a long session does not keep a
             // word per handle it ever made.
@@ -958,6 +1166,17 @@ struct JniBridge::Impl {
         return refs[handle - 1].object;
     }
 
+    // What kind of reference a guest handle names. Every handle the bridge hands
+    // out is backed by a global reference, so the answer is the kind the guest
+    // asked for: a global when it made one itself, a local otherwise.
+    jint RefType(std::uint32_t handle) const {
+        const std::lock_guard lock(refs_mutex);
+        if (handle == 0 || handle > refs.size() || refs[handle - 1].object == nullptr) {
+            return JNIInvalidRefType;
+        }
+        return refs[handle - 1].guest_owned ? JNIGlobalRefType : JNILocalRefType;
+    }
+
     // ---- guest tables -----------------------------------------------------
 
     std::uint32_t MakeTrap(std::uint32_t svc) {
@@ -1017,13 +1236,31 @@ struct JniBridge::Impl {
         if (bytes_needed == 0 || bytes_needed > 0x7fffffffULL) {
             return 0;
         }
+        static std::atomic<int> big{0};
+        if (bytes_needed >= 65536 && big.fetch_add(1, std::memory_order_relaxed) < 8) {
+            ARMBAT_LOG_INFO("Armbat", "jni: direct buffer mirror %llu bytes",
+                            static_cast<unsigned long long>(bytes_needed));
+        }
         const std::lock_guard lock(mirrors_mutex);
-        for (const DirectMirror& mirror : mirrors) {
+        for (DirectMirror& mirror : mirrors) {
             if (mirror.host != host || mirror.capacity != bytes_needed) {
                 continue;
             }
+            if (!mirror.handed_out) {
+                mirror.handed_out = true;
+                mirror_pending.fetch_add(1, std::memory_order_relaxed);
+            }
             std::memcpy(arena.Ptr(mirror.guest), host, mirror.capacity);
             return mirror.guest;
+        }
+        if (mirrors.size() >= kMirrorLimit) {
+            if (!mirror_refused) {
+                mirror_refused = true;
+                ARMBAT_LOG_WARN("Armbat",
+                                "jni: %zu direct buffers are mirrored, not adding another",
+                                mirrors.size());
+            }
+            return 0;
         }
         const std::uint32_t guest = container.Heap().Allocate(static_cast<std::uint32_t>(bytes_needed));
         if (guest == 0) {
@@ -1037,9 +1274,18 @@ struct JniBridge::Impl {
             }
             return 0;
         }
+        // The buffer is held for as long as its copy is reachable: the collector
+        // frees the host memory as soon as the Java side lets go of it, and the
+        // flush writes straight into that memory.
+        jobject kept = env->NewGlobalRef(buffer);
+        if (kept == nullptr) {
+            container.Heap().Release(guest);
+            return 0;
+        }
         std::memcpy(arena.Ptr(guest), host, static_cast<std::size_t>(bytes_needed));
-        mirrors.push_back(DirectMirror{host, guest, bytes_needed});
+        mirrors.push_back(DirectMirror{kept, host, guest, bytes_needed, true});
         mirror_count.store(mirrors.size(), std::memory_order_release);
+        mirror_pending.fetch_add(1, std::memory_order_relaxed);
         return guest;
     }
 
@@ -1071,25 +1317,56 @@ struct JniBridge::Impl {
         return elements * width;
     }
 
-    // Writes every mirrored buffer back into Java's memory. Called where control
-    // passes to Java: at the end of a native method Java called and before a
-    // Java method the guest calls. Without a boundary the guest's writes would
-    // stay in the arena copy and Java would read the data from before them.
+    // Writes back the mirrored buffers the guest was handed since the last
+    // flush. Called where control passes to Java: at the end of a native method
+    // Java called and before a Java method the guest calls. Without a boundary
+    // the guest's writes would stay in the arena copy and Java would read the
+    // data from before them; a buffer nobody asked for since the last boundary
+    // is left alone, because Java may have refilled it in the meantime.
     void FlushDirectBuffers() {
+        if (mirror_pending.load(std::memory_order_acquire) == 0) {
+            return;
+        }
+        const std::lock_guard lock(mirrors_mutex);
+        for (DirectMirror& mirror : mirrors) {
+            if (!mirror.handed_out) {
+                continue;
+            }
+            std::memcpy(mirror.host, arena.Ptr(mirror.guest), mirror.capacity);
+            mirror.handed_out = false;
+        }
+        mirror_pending.store(0, std::memory_order_release);
+    }
+
+    // Refreshes the arena copies from Java's memory. Called where control passes
+    // back to the guest: Java refills a direct buffer between two native calls,
+    // and a guest that cached the address of a mirror would otherwise keep
+    // reading the bytes from before the refill forever. A mirror the guest wrote
+    // into since the last flush is left alone -- its contents are newer than
+    // Java's -- so this only ever costs a copy of what Java changed.
+    void RefreshDirectBuffers() {
         if (mirror_count.load(std::memory_order_acquire) == 0) {
             return;
         }
         const std::lock_guard lock(mirrors_mutex);
-        for (const DirectMirror& mirror : mirrors) {
-            std::memcpy(mirror.host, arena.Ptr(mirror.guest), mirror.capacity);
+        for (DirectMirror& mirror : mirrors) {
+            if (mirror.handed_out) {
+                continue;
+            }
+            std::memcpy(arena.Ptr(mirror.guest), mirror.host, mirror.capacity);
         }
     }
 
     bool Prepare(std::string* error) {
         jni_calls.assign(kJniTableSize, nullptr);
-        seen.assign(kJniTableSize, false);
+        seen = std::make_unique<std::atomic_bool[]>(kJniTableSize);
         vm_calls.assign(8, nullptr);
-        warned.assign(kJniTableSize, false);
+        warned = std::make_unique<std::atomic_bool[]>(kJniTableSize);
+        // The native table's storage is fixed here: every entry the guest can call
+        // is then in place for good, and registration only fills the next slot.
+        natives.reserve(kTrampolineCount);
+        method_slots = std::make_unique<std::atomic<MethodRef*>[]>(kMaxMethods);
+        field_slots = std::make_unique<std::atomic<FieldRef*>[]>(kMaxFields);
 
         const std::uint32_t env_table = BuildTable(kJniEnvBase, kJniTableSize);
         if (env_table == 0) {
@@ -1146,6 +1423,28 @@ struct JniBridge::Impl {
                 ARMBAT_LOG_INFO("Armbat", "jni: no class %s", name.c_str());
             }
             call.Return(Handle(HostEnv(), type));
+        });
+
+        // Defining a class from a guest byte array needs the guest's own class
+        // loader to accept it, which this bridge cannot do: the loader lives on
+        // the Java side and the bytes are the guest's. Answering null is what a
+        // refused definition does, and the guest gets an exception-free failure
+        // it can see.
+        add(JNI_IDX(DefineClass), [](HleCall& call) {
+            static std::atomic<bool> reported{false};
+            if (!reported.exchange(true)) {
+                ARMBAT_LOG_WARN("Armbat", "jni: DefineClass is not supported, answering null");
+            }
+            call.Return(0);
+        });
+
+        // JNI has no return value here and neither does the platform: the process
+        // ends. Doing the same keeps a guest that reports an unrecoverable state
+        // from continuing on top of whatever it corrupted.
+        add(JNI_IDX(FatalError), [](HleCall& call) {
+            const std::string message = ArgString(call, call.Arg(1));
+            ARMBAT_LOG_ERROR("Armbat", "jni: FatalError: %s", message.c_str());
+            std::abort();
         });
 
         add(JNI_IDX(GetObjectClass), [this](HleCall& call) {
@@ -1209,7 +1508,28 @@ struct JniBridge::Impl {
             call.Return(handle);
         });
         add(JNI_IDX(NewLocalRef), [this](HleCall& call) {
-            call.Return(Handle(HostEnv(), Resolve(call.Arg(1))));
+            // A JNI reference has a lifetime of its own: deleting the one this
+            // was made from must not take it with it. Handle() keys its table by
+            // object and would answer with the very handle the guest passed in,
+            // so the copy gets an entry and a global reference of its own.
+            JNIEnv* env = HostEnv();
+            jobject object = Resolve(call.Arg(1));
+            if (object == nullptr) {
+                call.Return(0);
+                return;
+            }
+            jobject copy = env->NewGlobalRef(object);
+            if (copy == nullptr) {
+                call.Return(0);
+                return;
+            }
+            const std::lock_guard lock(refs_mutex);
+            const std::uint32_t handle = InsertRef(copy, false);
+            // Not registered in ref_ids on purpose: that table answers one
+            // handle per host reference, and this entry owns a reference of its
+            // own that its own release has to delete.
+            TrackLocal(handle);
+            call.Return(handle);
         });
         add(JNI_IDX(DeleteGlobalRef), [this](HleCall& call) {
             MarkDeleted(call.Arg(1), true);
@@ -1217,13 +1537,44 @@ struct JniBridge::Impl {
         add(JNI_IDX(DeleteLocalRef), [this](HleCall& call) {
             MarkDeleted(call.Arg(1), false);
         });
-        add(JNI_IDX(EnsureLocalCapacity), [](HleCall& call) { call.Return(0); });
+        // A weak reference that never clears still satisfies the contract: the
+        // cost of answering with a strong one is that the object lives until the
+        // guest deletes it, and nothing here can observe the difference.
+        add(JNI_IDX(NewWeakGlobalRef), [this](HleCall& call) {
+            JNIEnv* env = HostEnv();
+            jobject object = Resolve(call.Arg(1));
+            if (object == nullptr) {
+                call.Return(0);
+                return;
+            }
+            jobject global = env->NewGlobalRef(object);
+            if (global == nullptr) {
+                call.Return(0);
+                return;
+            }
+            const std::lock_guard lock(refs_mutex);
+            const std::uint32_t handle = InsertRef(global, true);
+            ref_ids.emplace(global, handle);
+            call.Return(handle);
+        });
+        add(JNI_IDX(DeleteWeakGlobalRef), [this](HleCall& call) {
+            MarkDeleted(call.Arg(1), true);
+        });
+        add(JNI_IDX(GetObjectRefType), [this](HleCall& call) {
+            call.Return(static_cast<std::uint32_t>(RefType(call.Arg(1))));
+        });
+        add(JNI_IDX(EnsureLocalCapacity), [](HleCall& call) {
+            // The table is a map of host globals, not ART's fixed local table, so
+            // nothing has to be reserved; answering JNI_OK is the truth here.
+            call.Return(static_cast<std::uint32_t>(JNI_OK));
+        });
         add(JNI_IDX(PushLocalFrame), [](HleCall& call) {
             // A frame of the guest's own: everything it creates until the pop is
             // released there, the way ART releases it. Without it a routine that
             // counts on the frame -- native input code builds a couple of arrays
             // per event and relies on exactly this -- leaves every reference
-            // behind until the global table overflows.
+            // behind until the global table overflows. The requested capacity is
+            // not needed: the frame grows with what the guest makes.
             g_local_frames.emplace_back();
             call.Return(static_cast<std::uint32_t>(JNI_OK));
         });
@@ -1231,13 +1582,25 @@ struct JniBridge::Impl {
             // PopLocalFrame returns the object it was asked to keep, and that one
             // must outlive the frame it came from: it is handed back in the frame
             // below, which is where a device puts it too.
+            JNIEnv* env = HostEnv();
             jobject kept = Resolve(call.Arg(1));
             if (g_local_frames.empty()) {
                 call.Return(call.Arg(1));
                 return;
             }
+            // The entry that owns `kept` is one of the references the pop is
+            // about to release, and a deleted reference cannot be referenced
+            // again: the object has to be kept while the frame is still up.
+            jobject strong = kept == nullptr ? nullptr : env->NewGlobalRef(kept);
             ReleaseLocalFrame(g_local_frames.size() - 1);
-            call.Return(kept == nullptr ? 0u : Handle(HostEnv(), kept));
+            if (strong == nullptr) {
+                call.Return(0);
+                return;
+            }
+            const std::lock_guard lock(refs_mutex);
+            const std::uint32_t handle = InsertRef(strong, false);
+            TrackLocal(handle);
+            call.Return(handle);
         });
 
         add(JNI_IDX(NewStringUTF), [this](HleCall& call) {
@@ -1357,6 +1720,38 @@ struct JniBridge::Impl {
         add(JNI_IDX(ReleaseStringChars), [this](HleCall& call) {
             imports.ReleaseData(call.Arg(2));
         });
+        // A critical section buys native code a pointer it promises not to block
+        // on. This bridge never hands out a pointer into Java's own string, so the
+        // block is a copy either way and the promise costs nothing; isCopy says
+        // so, and ReleaseStringCritical is where the block comes back.
+        add(JNI_IDX(GetStringCritical), [this](HleCall& call) {
+            JNIEnv* env = HostEnv();
+            const jstring text = static_cast<jstring>(Resolve(call.Arg(1)));
+            if (text == nullptr) {
+                call.Return(0);
+                return;
+            }
+            const jsize length = env->GetStringLength(text);
+            const std::uint32_t block =
+                imports.AllocateData(static_cast<std::uint32_t>((length + 1) * sizeof(jchar)));
+            if (block == 0) {
+                call.Return(0);
+                return;
+            }
+            auto* chars = reinterpret_cast<jchar*>(arena.Ptr(block));
+            if (length > 0) {
+                env->GetStringRegion(text, 0, length, chars);
+            }
+            chars[length] = 0;
+            if (call.Arg(2) != 0) {
+                const std::uint8_t is_copy = 1;
+                call.CopyOut(call.Arg(2), &is_copy, 1);
+            }
+            call.Return(block);
+        });
+        add(JNI_IDX(ReleaseStringCritical), [this](HleCall& call) {
+            imports.ReleaseData(call.Arg(2));
+        });
         add(JNI_IDX(GetStringRegion), [this](HleCall& call) {
             JNIEnv* env = HostEnv();
             const jstring text = static_cast<jstring>(Resolve(call.Arg(1)));
@@ -1375,8 +1770,28 @@ struct JniBridge::Impl {
             const jstring text = static_cast<jstring>(Resolve(call.Arg(1)));
             const jsize start = static_cast<jsize>(call.Arg(2));
             const jsize length = static_cast<jsize>(call.Arg(3));
-            if (text == nullptr || start < 0 || length < 0 ||
-                (length > 0 && !arena.IsMapped(call.Arg(4), static_cast<std::uint64_t>(length)))) {
+            if (text == nullptr || start < 0 || length < 0) {
+                return;
+            }
+            const jsize total = env->GetStringLength(text);
+            if (start > total || length > total - start) {
+                // The host throws for a region outside the string, and it has
+                // already written part of the buffer by then.
+                return;
+            }
+            // `length` counts UTF-16 units while the copy is modified UTF-8, in
+            // which one unit takes one, two or three bytes. The whole string's
+            // UTF-8 length bounds what this write can need, which is what the
+            // destination mapping has to hold.
+            const std::uint64_t bytes =
+                static_cast<std::uint64_t>(env->GetStringUTFLength(text));
+            if (bytes > 0 && !arena.IsMapped(call.Arg(4), bytes)) {
+                if (LogAllowed("jni-utfregion-short", 4)) {
+                    ARMBAT_LOG_ERROR("Armbat",
+                                     "jni: GetStringUTFRegion needs %llu bytes at 0x%08x, the "
+                                     "mapping does not hold them",
+                                     static_cast<unsigned long long>(bytes), call.Arg(4));
+                }
                 return;
             }
             env->GetStringUTFRegion(text, start, length,
@@ -1412,17 +1827,13 @@ struct JniBridge::Impl {
             JNIEnv* env = HostEnv();
             const jclass type = static_cast<jclass>(Resolve(call.Arg(1)));
             const std::uint32_t method_id = call.Arg(2);
-            if (type == nullptr || method_id == 0 || method_id > method_refs.size()) {
-                call.Return(0);
-                return;
-            }
-            const MethodRef& ref = method_refs[method_id - 1];
-            if (ref.method == nullptr) {
+            const MethodRef* ref = MethodAt(method_id);
+            if (type == nullptr || ref == nullptr || ref->method == nullptr) {
                 call.Return(0);
                 return;
             }
             jobject reflected =
-                env->ToReflectedMethod(type, ref.method, ref.is_static ? JNI_TRUE : JNI_FALSE);
+                env->ToReflectedMethod(type, ref->method, ref->is_static ? JNI_TRUE : JNI_FALSE);
             if (reflected == nullptr) {
                 env->ExceptionClear();
                 call.Return(0);
@@ -1455,9 +1866,8 @@ struct JniBridge::Impl {
                 call.Return(0);
                 return;
             }
-            const std::lock_guard lock(refs_mutex);
-            field_refs.push_back(FieldRef{field, signature, is_static});
-            call.Return(static_cast<std::uint32_t>(field_refs.size()));
+            const std::uint32_t id = AddField(field, signature, is_static);
+            call.Return(id);
         });
 
         add(JNI_IDX(ToReflectedField), [this](HleCall& call) {
@@ -1466,17 +1876,13 @@ struct JniBridge::Impl {
             JNIEnv* env = HostEnv();
             const jclass type = static_cast<jclass>(Resolve(call.Arg(1)));
             const std::uint32_t field_id = call.Arg(2);
-            if (type == nullptr || field_id == 0 || field_id > field_refs.size()) {
-                call.Return(0);
-                return;
-            }
-            const FieldRef& ref = field_refs[field_id - 1];
-            if (ref.field == nullptr) {
+            const FieldRef* ref = FieldAt(field_id);
+            if (type == nullptr || ref == nullptr || ref->field == nullptr) {
                 call.Return(0);
                 return;
             }
             jobject reflected =
-                env->ToReflectedField(type, ref.field, ref.is_static ? JNI_TRUE : JNI_FALSE);
+                env->ToReflectedField(type, ref->field, ref->is_static ? JNI_TRUE : JNI_FALSE);
             if (reflected == nullptr) {
                 env->ExceptionClear();
                 call.Return(0);
@@ -1537,9 +1943,7 @@ struct JniBridge::Impl {
                 call.Return(0);
                 return;
             }
-            const std::lock_guard lock(refs_mutex);
-            field_refs.push_back(FieldRef{field, signature, false});
-            call.Return(static_cast<std::uint32_t>(field_refs.size()));
+            call.Return(AddField(field, signature, false));
         });
 
         add(JNI_IDX(GetStaticFieldID), [this](HleCall& call) {
@@ -1558,9 +1962,7 @@ struct JniBridge::Impl {
                 call.Return(0);
                 return;
             }
-            const std::lock_guard lock(refs_mutex);
-            field_refs.push_back(FieldRef{field, signature, true});
-            call.Return(static_cast<std::uint32_t>(field_refs.size()));
+            call.Return(AddField(field, signature, true));
         });
 
         add(JNI_IDX(ExceptionCheck), [](HleCall& call) {
@@ -1724,8 +2126,15 @@ struct JniBridge::Impl {
             const std::uint32_t address = call.Arg(1);
             const std::uint64_t capacity = static_cast<std::uint64_t>(call.Arg(2));
             if (capacity != 0 && !arena.IsMapped(address, capacity)) {
+                ARMBAT_LOG_ERROR("Armbat", "jni: direct buffer 0x%08x %llu bytes is not mapped",
+                                 address, static_cast<unsigned long long>(capacity));
                 call.Return(0);
                 return;
+            }
+            static std::atomic<int> big{0};
+            if (capacity >= 65536 && big.fetch_add(1, std::memory_order_relaxed) < 8) {
+                ARMBAT_LOG_INFO("Armbat", "jni: guest direct buffer 0x%08x %llu bytes", address,
+                                static_cast<unsigned long long>(capacity));
             }
             call.Return(Handle(env, env->NewDirectByteBuffer(arena.Ptr(address),
                                                              static_cast<jlong>(capacity))));
@@ -1815,18 +2224,60 @@ struct JniBridge::Impl {
         add_vm(JNI_VM_IDX(DestroyJavaVM), [](HleCall& call) { call.Return(0); });
     }
 
+    // The entry a guest handle names, or null when no such handle was ever
+    // published. Reading the slot is what makes the table safe to grow while
+    // other threads are calling into it.
+    MethodRef* MethodAt(std::uint32_t id) const {
+        if (id == 0 || id > method_count.load(std::memory_order_acquire)) {
+            return nullptr;
+        }
+        return method_slots[id - 1].load(std::memory_order_acquire);
+    }
+
+    FieldRef* FieldAt(std::uint32_t id) const {
+        if (id == 0 || id > field_count.load(std::memory_order_acquire)) {
+            return nullptr;
+        }
+        return field_slots[id - 1].load(std::memory_order_acquire);
+    }
+
     std::uint32_t AddMethod(JNIEnv* env, jmethodID method, const std::string& name,
                             const std::string& signature, bool is_static) {
         // The host method id is not usable from the guest, so the table position
         // is what the guest gets back.
+        (void)env;
         const std::lock_guard lock(refs_mutex);
         if (const auto found = method_ids.find(method); found != method_ids.end()) {
             return found->second;
         }
-        method_refs.push_back(MethodRef{method, name, signature, is_static});
-        const std::uint32_t id = static_cast<std::uint32_t>(method_refs.size());
-        method_ids.emplace(method, id);
-        return id;
+        const std::uint32_t count = method_count.load(std::memory_order_relaxed);
+        if (count >= kMaxMethods) {
+            static std::atomic<int> reported{0};
+            if (reported.fetch_add(1, std::memory_order_relaxed) < 4) {
+                ARMBAT_LOG_ERROR("Armbat", "jni: method table is full, %s%s is not callable",
+                                 name.c_str(), signature.c_str());
+            }
+            return 0;
+        }
+        method_slots[count].store(new MethodRef{method, name, signature, is_static},
+                                  std::memory_order_relaxed);
+        method_ids.emplace(method, count + 1);
+        // The count is the publication: an id the guest already holds names a
+        // finished entry even while the next one is being written.
+        method_count.store(count + 1, std::memory_order_release);
+        return count + 1;
+    }
+
+    std::uint32_t AddField(jfieldID field, const std::string& signature, bool is_static) {
+        const std::lock_guard lock(refs_mutex);
+        const std::uint32_t count = field_count.load(std::memory_order_relaxed);
+        if (count >= kMaxFields) {
+            return 0;
+        }
+        field_slots[count].store(new FieldRef{field, signature, is_static},
+                                 std::memory_order_relaxed);
+        field_count.store(count + 1, std::memory_order_release);
+        return count + 1;
     }
 
     // JNI descriptor of a Class object. The reflected name of a primitive is its
@@ -2131,7 +2582,8 @@ struct JniBridge::Impl {
         if (block == 0) {
             return;
         }
-        if (call.Arg(3) != JNI_ABORT && array != nullptr) {
+        const std::uint32_t mode = call.Arg(3);
+        if (mode != JNI_ABORT && array != nullptr) {
             const jsize length = env->GetArrayLength(array);
             const std::uint64_t bytes = static_cast<std::uint64_t>(length) * sizeof(T);
             if (length > 0 && arena.IsMapped(block, bytes)) {
@@ -2139,7 +2591,27 @@ struct JniBridge::Impl {
                                       reinterpret_cast<const T*>(arena.Ptr(block)));
             }
         }
-        imports.ReleaseData(block);
+        // JNI_COMMIT asks for the contents and keeps the buffer: the caller goes
+        // on using the same pointer and releases it again later. Returning the
+        // block here hands it to the next AllocateData, so another array's bytes
+        // land in this one -- or the caller writes into whatever now owns it.
+        if (mode != JNI_COMMIT) {
+            imports.ReleaseData(block);
+        }
+    }
+
+    // A guest block is only safe to hand to a host memcpy up to the end of the
+    // pages that are committed writable: since the guest's mprotect is applied to
+    // the arena, a page it protected read-only is host-immutable, and a host
+    // memcpy into it faults in the middle of an HLE call.
+    std::uint32_t MappedSpan(const GuestArena& arena, std::uint32_t block,
+                             std::uint64_t bytes) {
+        if (bytes == 0) {
+            return 0;
+        }
+        const std::uint64_t end = arena.AccessibleEnd(block);
+        const std::uint64_t room = end > block ? end - block : 0;
+        return static_cast<std::uint32_t>(std::min<std::uint64_t>(room, bytes));
     }
 
     template <typename T>
@@ -2150,12 +2622,31 @@ struct JniBridge::Impl {
         const jsize length = static_cast<jsize>(call.Arg(3));
         const std::uint32_t block = call.Arg(4);
         const std::uint64_t bytes = static_cast<std::uint64_t>(length) * sizeof(T);
-        if (array == nullptr || start < 0 || length < 0 || block == 0 || length == 0 ||
-            !arena.IsMapped(block, bytes)) {
+        if (array == nullptr || start < 0 || length < 0 || block == 0 || length == 0) {
+            // A skipped copy leaves the caller's buffer untouched, so a
+            // destination or a length that cannot be served turns into a body
+            // the guest parses as garbage with nothing in the log to say why.
+            if (array != nullptr && LogAllowed("jni-region-empty", 16)) {
+                ARMBAT_LOG_WARN("Armbat",
+                                "jni: region skipped dest=0x%08x start=%d len=%d handle=%u",
+                                block, static_cast<int>(start), static_cast<int>(length),
+                                call.Arg(1));
+            }
             return;
         }
-        HostGetArrayRegion<T>(env, array, start, length,
-                              reinterpret_cast<T*>(arena.Ptr(block)));
+        const jsize elements = static_cast<jsize>(MappedSpan(arena, block, bytes) / sizeof(T));
+        if (elements < length && LogAllowed("jni-region-short", 8)) {
+            ARMBAT_LOG_ERROR("Armbat",
+                             "jni: GetArrayRegion of %d elements, %d fit the mapping", length,
+                             elements);
+        }
+        if (elements > 0) {
+            HostGetArrayRegion<T>(env, array, start, elements,
+                                  reinterpret_cast<T*>(arena.Ptr(block)));
+            if (env->ExceptionCheck() && LogAllowed("jni-region-threw", 8)) {
+                ARMBAT_LOG_ERROR("Armbat", "jni: GetArrayRegion of %d elements threw", length);
+            }
+        }
     }
 
     template <typename T>
@@ -2166,12 +2657,19 @@ struct JniBridge::Impl {
         const jsize length = static_cast<jsize>(call.Arg(3));
         const std::uint32_t block = call.Arg(4);
         const std::uint64_t bytes = static_cast<std::uint64_t>(length) * sizeof(T);
-        if (array == nullptr || start < 0 || length < 0 || block == 0 || length == 0 ||
-            !arena.IsMapped(block, bytes)) {
+        if (array == nullptr || start < 0 || length < 0 || block == 0 || length == 0) {
             return;
         }
-        HostSetArrayRegion<T>(env, array, start, length,
-                              reinterpret_cast<const T*>(arena.Ptr(block)));
+        const jsize elements = static_cast<jsize>(MappedSpan(arena, block, bytes) / sizeof(T));
+        if (elements < length && LogAllowed("jni-setregion-short", 8)) {
+            ARMBAT_LOG_ERROR("Armbat",
+                             "jni: SetArrayRegion of %d elements, %d fit the mapping", length,
+                             elements);
+        }
+        if (elements > 0) {
+            HostSetArrayRegion<T>(env, array, start, elements,
+                                  reinterpret_cast<const T*>(arena.Ptr(block)));
+        }
     }
 
     template <typename T>
@@ -2219,8 +2717,10 @@ struct JniBridge::Impl {
         }
         // ClassLoader.loadClass cannot resolve array descriptors ([B,
         // [Ljava/lang/String;), while Class.forName can, and it takes the
-        // dotted binary name that BinaryName produces. initialize=false keeps
-        // class initializers from running at lookup time, like FindClass.
+        // dotted binary name that BinaryName produces. JNI's FindClass loads,
+        // links *and* initializes the class, so the static initializer has to run
+        // here as well: a guest that looks a class up and then uses its statics
+        // relies on it.
         jclass class_class = env->FindClass("java/lang/Class");
         if (class_class == nullptr) {
             env->ExceptionClear();
@@ -2234,7 +2734,7 @@ struct JniBridge::Impl {
             return nullptr;
         }
         jstring text = env->NewStringUTF(BinaryName(name).c_str());
-        jobject type = env->CallStaticObjectMethod(class_class, for_name, text, JNI_FALSE, loader);
+        jobject type = env->CallStaticObjectMethod(class_class, for_name, text, JNI_TRUE, loader);
         env->DeleteLocalRef(text);
         env->DeleteLocalRef(class_class);
         if (env->ExceptionCheck()) {
@@ -2248,11 +2748,10 @@ struct JniBridge::Impl {
     // array is a guest JNINativeMethod triple of guest pointers.
     std::uint32_t RegisterGuestNatives(HleCall& call) {
         JNIEnv* env = HostEnv();
-        // Registration happens from the guest's JNI_OnLoad, i.e. after the
-        // startup sweep sealed the trampolines, and several guest threads may
-        // do it at once: hold the bridge and keep the region writable.
+        // Registration happens from the guest's JNI_OnLoad, and several guest
+        // threads may do it at once: one registration at a time keeps the native
+        // table's numbering and the trampoline slots in step.
         const std::lock_guard lock(mutex);
-        UnsealTrampolines();
         const jclass type = static_cast<jclass>(Resolve(call.Arg(1)));
         const std::uint32_t count = call.Arg(3);
         std::vector<JNINativeMethod> table;
@@ -2264,7 +2763,6 @@ struct JniBridge::Impl {
         for (std::uint32_t i = 0; i < count; ++i) {
             std::uint32_t entry[3] = {};
             if (!call.CopyIn(call.Arg(2) + i * 12, entry, sizeof(entry))) {
-                SealTrampolines();
                 return JNI_ERR;
             }
             names.push_back(ArgString(call, entry[0]));
@@ -2288,11 +2786,14 @@ struct JniBridge::Impl {
                 natives.pop_back();
                 continue;
             }
+            // The trampoline exists and is executable, so the entry can now be
+            // reached: publish it before ART is given the pointer.
+            natives_published.store(static_cast<std::uint32_t>(natives.size()),
+                                    std::memory_order_release);
             table.push_back(JNINativeMethod{const_cast<char*>(names[i].c_str()),
                                             const_cast<char*>(signatures[i].c_str()), trampoline});
         }
         const jint result = env->RegisterNatives(type, table.data(), static_cast<jint>(table.size()));
-        SealTrampolines();
         return static_cast<std::uint32_t>(result);
     }
 
@@ -2308,14 +2809,20 @@ struct JniBridge::Impl {
                (static_cast<std::uint32_t>(rt2) << 10) | (31u << 5) | static_cast<std::uint32_t>(rt);
     }
 
-    // Writes a dispatcher stub into the next free slot. The region has to be
-    // writable: see UnsealTrampolines. Returns nullptr when the slots run out.
+    // Writes a dispatcher stub into the next free slot. The slot is made writable
+    // for the write and executable immediately after, so no other trampoline is
+    // ever non-executable. Returns nullptr when the slots run out.
     void* MakeTrampoline(std::uint32_t id) {
         if (trampolines == nullptr || trampolines_used >= kTrampolineCount) {
             return nullptr;
         }
-        auto* code = reinterpret_cast<std::uint32_t*>(trampolines + trampolines_used * kTrampolineStride);
+        auto* slot = trampolines + trampolines_used * kTrampolineStride;
+        auto* code = reinterpret_cast<std::uint32_t*>(slot);
         ++trampolines_used;
+        if (mprotect(slot, kTrampolineStride, PROT_READ | PROT_WRITE) != 0) {
+            ARMBAT_LOG_ERROR("Armbat", "jni: trampoline slot is not writable (%d)", errno);
+            return nullptr;
+        }
 
         code[0] = 0xD10243FFu;  // sub sp, sp, #0x90
         code[1] = StpX(0, 1, 0);
@@ -2355,31 +2862,20 @@ struct JniBridge::Impl {
         code[19] = 0xF94043FEu;                      // ldr x30, [sp, #128]
         code[20] = 0x910243FFu;                      // add sp, sp, #0x90
         code[21] = 0xD65F03C0u;                      // ret
-        return code;
+        // The guest may call the slot as soon as ART has the address, which is
+        // before this function returns to the registration site.
+        __builtin___clear_cache(reinterpret_cast<char*>(slot),
+                                reinterpret_cast<char*>(slot) + kTrampolineStride);
+        if (mprotect(slot, kTrampolineStride, PROT_READ | PROT_EXEC) != 0) {
+            ARMBAT_LOG_ERROR("Armbat", "jni: trampoline slot is not executable (%d)", errno);
+            return nullptr;
+        }
+        return slot;
     }
 
     static std::uint64_t ArmBatNativeDispatch(std::uint64_t* frame, std::uint64_t* stack_args,
                                               std::uint32_t id);
     std::uint64_t Dispatch(std::uint64_t* frame, std::uint64_t* stack_args, std::uint32_t id);
-
-    void UnsealTrampolines() {
-        if (trampolines == nullptr || !trampolines_sealed) {
-            return;
-        }
-        // The guest's own JNI_OnLoad registers natives long after the startup
-        // sweep walked Java_* symbols and sealed the region executable, so a new
-        // trampoline has to be writable again before MakeTrampoline touches it.
-        mprotect(trampolines, kTrampolineStride * kTrampolineCount, PROT_READ | PROT_WRITE);
-        trampolines_sealed = false;
-    }
-
-    void SealTrampolines() {
-        if (trampolines == nullptr) {
-            return;
-        }
-        mprotect(trampolines, kTrampolineStride * kTrampolineCount, PROT_READ | PROT_EXEC);
-        trampolines_sealed = true;
-    }
 
     // ---- guest calls into the framework ------------------------------------
 
@@ -2664,14 +3160,14 @@ struct JniBridge::Impl {
             object = Resolve(call.Arg(1));
             method_id = call.Arg(2);
         }
-        if (method_id == 0 || method_id > method_refs.size()) {
-            ARMBAT_LOG_ERROR("Armbat",
-                                "jni: call with method id %u of %zu", method_id,
-                                method_refs.size());
+        const MethodRef* found = MethodAt(method_id);
+        if (found == nullptr) {
+            ARMBAT_LOG_ERROR("Armbat", "jni: call with method id %u of %u", method_id,
+                             method_count.load(std::memory_order_relaxed));
             call.Return(0);
             return;
         }
-        const MethodRef& ref = method_refs[method_id - 1];
+        const MethodRef& ref = *found;
         if (ref.method == nullptr || (family == 2 ? type == nullptr : object == nullptr)) {
             ARMBAT_LOG_ERROR("Armbat",
                                 "jni: call %s on null receiver (family=%d)", ref.signature.c_str(),
@@ -2716,11 +3212,28 @@ struct JniBridge::Impl {
                                     call.Machine().Reg(2), call.Machine().Reg(3));
             }
         }
+        // TEMPORARY, for the audio crackle report: the mixer's only call that
+        // hands PCM to the device.
+        const bool audio_write =
+            ref.name == "write" &&
+            (ref.signature.compare(0, 5, "([BII") == 0 ||
+             ref.signature.compare(0, 5, "([SII") == 0 ||
+             ref.signature.compare(0, 22, "(Ljava/nio/ByteBuffer;") == 0);
+        const auto audio_start =
+            audio_write ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const std::string previous = current_call;
         current_call = ref.name + ref.signature;
         InvokeCall(call, returns, family == 2, family == 1, object, type, ref.method,
                    values.empty() ? nullptr : values.data(), result_descriptor);
         current_call = previous;
+        if (audio_write) {
+            NoteAudioWrite(audio_start, std::chrono::steady_clock::now(),
+                           static_cast<std::int32_t>(call.Machine().Reg(0)));
+        }
+        if (ref.name == "getMinBufferSize" && LogAllowed("audio-minbuf", 4)) {
+            ARMBAT_LOG_INFO("Armbat", "audio: getMinBufferSize%s = %d", ref.signature.c_str(),
+                                static_cast<std::int32_t>(call.Machine().Reg(0)));
+        }
     }
 
     // Reads or writes one field. The field id carries the signature, so all
@@ -2733,14 +3246,14 @@ struct JniBridge::Impl {
         JNIEnv* env = HostEnv();
         const jclass type = static_cast<jclass>(Resolve(call.Arg(1)));
         const std::uint32_t method_id = call.Arg(2);
-        if (type == nullptr || method_id == 0 || method_id > method_refs.size()) {
-            ARMBAT_LOG_ERROR("Armbat",
-                                "jni: NewObject with constructor id %u of %zu", method_id,
-                                method_refs.size());
+        const MethodRef* found = MethodAt(method_id);
+        if (type == nullptr || found == nullptr) {
+            ARMBAT_LOG_ERROR("Armbat", "jni: NewObject with constructor id %u of %u", method_id,
+                             method_count.load(std::memory_order_relaxed));
             call.Return(0);
             return;
         }
-        const MethodRef& ref = method_refs[method_id - 1];
+        const MethodRef& ref = *found;
         if (ref.method == nullptr) {
             call.Return(0);
             return;
@@ -2778,13 +3291,14 @@ struct JniBridge::Impl {
             object = Resolve(call.Arg(1));
             id = call.Arg(2);
         }
-        if (id == 0 || id > field_refs.size()) {
+        const FieldRef* found = FieldAt(id);
+        // A null receiver is what a failed call upstream leaves behind; the
+        // host would dereference it, so answer with zero instead.
+        if (found == nullptr) {
             call.Return(0);
             return;
         }
-        const FieldRef& ref = field_refs[id - 1];
-        // A null receiver is what a failed call upstream leaves behind; the
-        // host would dereference it, so answer with zero instead.
+        const FieldRef& ref = *found;
         if (ref.field == nullptr || (is_static ? type == nullptr : object == nullptr)) {
             ARMBAT_LOG_ERROR("Armbat",
                                 "jni: field %s on null receiver (static=%d)", ref.signature.c_str(),
@@ -2974,8 +3488,7 @@ struct JniBridge::Impl {
             TrimLocalRefs();
         }
         HleCall call(machine_ref, arena);
-        if (index < jni_calls.size() && !seen[index]) {
-            seen[index] = true;
+        if (index < jni_calls.size() && !seen[index].exchange(true, std::memory_order_relaxed)) {
             ARMBAT_LOG_INFO("Armbat",
                                 "env call #%zu tid=%d r0=0x%08x r1=0x%08x r2=0x%08x r3=0x%08x", index,
                                 ::gettid(), machine_ref.Reg(0), machine_ref.Reg(1),
@@ -2994,8 +3507,7 @@ struct JniBridge::Impl {
             FlushDirectBuffers();
             jni_calls[index](call);
         } else {
-            if (!warned[index]) {
-                warned[index] = true;
+            if (!warned[index].exchange(true, std::memory_order_relaxed)) {
                 // The entry answers 0 to everything the guest asks, which looks
                 // like missing platform data rather than a gap in the bridge;
                 // name it so a missing entry is readable straight from a log.
@@ -3030,11 +3542,6 @@ struct JniBridge::Impl {
         std::string report;
         std::size_t registered = 0;
         std::size_t skipped = 0;
-
-        // A library's JNI_OnLoad may already have registered natives and sealed
-        // the region again before this sweep runs, so it has to be unsealed for
-        // the whole walk and sealed once at the end.
-        UnsealTrampolines();
 
         std::unordered_map<std::string, jclass> classes;
         // One Java_* entry point. It can come from a library the HLE loader
@@ -3147,9 +3654,14 @@ struct JniBridge::Impl {
                                       const_cast<char*>(signature.c_str()), trampoline};
                 if (env->RegisterNatives(type, &entry, 1) != JNI_OK) {
                     env->ExceptionClear();
+                    natives.pop_back();
                     ++skipped;
                     continue;
                 }
+                // Registered with ART, so a call can arrive on any thread from
+                // now on: the entry has to be published before the pointer is.
+                natives_published.store(static_cast<std::uint32_t>(natives.size()),
+                                        std::memory_order_release);
                 ++registered;
             }
             (void)type_name;
@@ -3167,7 +3679,6 @@ struct JniBridge::Impl {
             consider(entry.symbol, entry.address);
         }
 
-        SealTrampolines();
         report += "natives: " + std::to_string(registered) + " registered, " +
                   std::to_string(skipped) + " skipped\n";
         return report;
@@ -3225,12 +3736,16 @@ JniBridge::Impl* JniBridge::Impl::current = nullptr;
 
 std::uint64_t JniBridge::Impl::ArmBatNativeDispatch(std::uint64_t* frame,
                                                     std::uint64_t* stack_args, std::uint32_t id) {
-    return current->Dispatch(frame, stack_args, id);
+    Impl* bridge = current;
+    if (bridge == nullptr) {
+        return 0;
+    }
+    return bridge->Dispatch(frame, stack_args, id);
 }
 
 std::uint64_t JniBridge::Impl::Dispatch(std::uint64_t* frame, std::uint64_t* stack_args,
                                         std::uint32_t id) {
-    if (id >= natives.size()) {
+    if (id >= natives_published.load(std::memory_order_acquire)) {
         return 0;
     }
     NativeMethod& method = natives[id];
@@ -3238,6 +3753,10 @@ std::uint64_t JniBridge::Impl::Dispatch(std::uint64_t* frame, std::uint64_t* sta
     if (env == nullptr) {
         return 0;
     }
+
+    // Control is about to pass to the guest, so a direct buffer Java refilled
+    // since the last native call has to be in the arena copy before it runs.
+    RefreshDirectBuffers();
 
     // ART reads a reference the native returns only after this function is gone,
     // so that one handle is released by the next native call on this thread.
@@ -3412,6 +3931,9 @@ std::uint64_t JniBridge::Impl::Dispatch(std::uint64_t* frame, std::uint64_t* sta
     // Java reads a direct buffer as soon as this method returns, so anything the
     // guest wrote into the arena copy has to be in Java's own memory by then.
     FlushDirectBuffers();
+    // ...and the guest reads it after this call returns, so what Java wrote in
+    // the meantime has to be in the arena copy.
+    RefreshDirectBuffers();
 
     // The guest answered in its own ABI: int in r0, long/double in r0:r1, an
     // object as one of our handles. ART, on the other side, wants a host jobject
@@ -3454,6 +3976,11 @@ JniBridge::JniBridge(GuestContainer& container) : impl_(std::make_unique<Impl>(c
 JniBridge::~JniBridge() {
     if (g_bridge.load(std::memory_order_acquire) == this) {
         g_bridge.store(nullptr, std::memory_order_release);
+    }
+    // A trampoline reaches the bridge through this pointer, and a pointer to a
+    // destroyed bridge is what ART would call if a native method outlives it.
+    if (Impl::current == impl_.get()) {
+        Impl::current = nullptr;
     }
     if (impl_->trampolines != nullptr) {
         munmap(impl_->trampolines, kTrampolineStride * kTrampolineCount);

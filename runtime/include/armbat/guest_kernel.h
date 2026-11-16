@@ -4,8 +4,10 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -94,6 +96,17 @@ public:
     std::uint64_t Calls() const { return calls_; }
     std::uint64_t LastNumber() const { return last_number_; }
 
+    // The guest ended its own process: exit_group(), or a signal it raised with
+    // the action the kernel gives that signal by default. What the host does
+    // about it is the container's call, but the guest is not resumed: bionic's
+    // abort() ends in exit_group precisely because the runtime it was running on
+    // is already gone, and a process that asked to die and kept going is an
+    // archive that holds its own locks from a half-torn-down runtime, makes no
+    // further progress and leaves the window on its last frame for ever.
+    bool ProcessExited() const { return exited_.load(std::memory_order_relaxed); }
+    int ExitCode() const { return exit_code_.load(std::memory_order_relaxed); }
+    int ExitSignal() const { return exit_signal_.load(std::memory_order_relaxed); }
+
     // The guest's address-space manager. A subsystem outside the kernel that
     // has to hand the guest a buffer of its own -- a whole APK asset, which is
     // megabytes -- allocates it here, where the guest's mmap does, instead of
@@ -123,15 +136,47 @@ private:
     void ForwardLogRecord(const void* data, std::size_t size);
     void TracePath(const std::string& guest_path, const std::string& host_path, int result);
 
+    // Module naming for the fault report. A file the guest maps is only a
+    // candidate: it becomes a module when the guest is allowed to execute out of
+    // it, which the linker does with a later mprotect.
+    struct PendingModule {
+        std::uint32_t base;
+        std::uint32_t length;
+        std::string path;
+    };
+    void NoteFileMapping(std::uint32_t base, std::uint32_t length, int fd, bool executable);
+    void PromoteExecutable(std::uint32_t address, std::uint32_t length);
+    void ForgetPendingModules(std::uint32_t address, std::uint32_t length);
+
     // Descriptor ownership. A guest descriptor is the host's descriptor number,
     // and the two spaces overlap: a guest that closes a number it was never
     // handed closes a socket the host still holds -- liblog's, a Java stream, a
     // surface's -- and the container either goes silent or dies in fdsan with
     // nothing of the guest left in the record. Only the numbers the guest opened
     // are closable by it, which is also what a real kernel says: EBADF.
-    void TrackGuestFd(int fd);
+    //
+    // Each descriptor also carries the open file description it stands on, so
+    // that a second descriptor made by dup() or fcntl(F_DUPFD) can share it. The
+    // description, not the number, owns the file position, and the container
+    // answers a regular-file read with several host reads when the storage
+    // returns a short one -- two threads on one description would interleave
+    // there and each would read a stream shifted by the other's bytes.
+    using DescriptionLock = std::shared_ptr<std::mutex>;
+    void TrackGuestFd(int fd, DescriptionLock description = nullptr);
     void ForgetGuestFd(int fd);
     bool IsGuestFd(int fd) const;
+    DescriptionLock DescriptionOf(int fd) const;
+
+    // read() and pread() as the guest's kernel answers them. Members because the
+    // read has to hold the open file description still while it completes.
+    std::int32_t ReadInto(int fd, std::uint32_t buffer, std::uint32_t count);
+    std::int32_t PreadInto(int fd, std::uint32_t buffer, std::uint32_t count,
+                           std::uint64_t offset);
+
+    // Records that the guest's process is over. Every thread that reads this
+    // afterwards stops asking the guest for anything; the container ends the
+    // session.
+    void EndProcess(int code, int signal);
 
     A32Machine& machine_;
     GuestArena& arena_;
@@ -141,8 +186,18 @@ private:
     std::function<void(std::uint32_t)> boot_ready_;
     std::unordered_set<int> log_sockets_;
     mutable std::mutex fds_mutex_;
-    std::unordered_set<int> guest_fds_;
+    std::unordered_map<int, DescriptionLock> guest_fds_;
+    // Descriptions for descriptors the guest did not open: they take part in the
+    // position lock but must never look closable to the guest.
+    mutable std::unordered_map<int, DescriptionLock> fallback_descriptions_;
+    // Every guest thread reaches open/stat/mkdir, and the last few translations
+    // are read by the watchdog: an unlocked push_back here is two threads
+    // resizing the same vector, which is a corrupted host heap and a report
+    // that cannot be trusted.
+    mutable std::mutex paths_mutex_;
     std::vector<std::string> path_traces_;
+    std::mutex modules_mutex_;
+    std::vector<PendingModule> pending_modules_;
     ThreadSpawner thread_spawner_;
     // Startup visibility: the first time each syscall number is used, and the
     // first few clone() attempts. A launch that stalls is almost always a
@@ -155,6 +210,9 @@ private:
     static constexpr std::size_t kTraceNumbers = 512;
     static constexpr std::size_t kTracePrivate = 512;
     std::atomic<bool> traced_syscalls_[kTraceNumbers + kTracePrivate]{};
+    std::atomic<bool> exited_{false};
+    std::atomic<int> exit_code_{0};
+    std::atomic<int> exit_signal_{0};
     int clone_logs_ = 0;
     std::uint64_t calls_ = 0;
     std::uint64_t last_number_ = 0;

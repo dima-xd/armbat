@@ -30,6 +30,8 @@ struct armbat_context {
     uint32_t sp;
     /* Stays 0 for the life of the thread and is what the park waits on. */
     uint32_t park;
+    /* This thread's tid, the identity the guest addresses a signal to. */
+    uint32_t tid;
 };
 
 /* Keep the park's frames clear of the stack a borrowed call starts on. */
@@ -64,6 +66,14 @@ static void armbat_park(uint32_t *address) {
                          : "memory");
 }
 
+/* This thread's id, inline for the same reason as the park below. */
+static uint32_t armbat_gettid(void) {
+    register long r0 __asm__("r0");
+    register long r7 __asm__("r7") = 224; /* __NR_gettid */
+    __asm__ __volatile__("svc #0" : "=r"(r0) : "r"(r7) : "memory");
+    return (uint32_t)r0;
+}
+
 /* Thread entry point. The container creates it through bionic's pthread_create. */
 void *armbat_lender(void *argument) {
     struct armbat_context *context = (struct armbat_context *)argument;
@@ -71,6 +81,7 @@ void *armbat_lender(void *argument) {
     /* The frames of this loop sit at the top of the stack; a call that starts
      * 32 KiB lower grows down from there and can never reach them. */
     context->sp = ((uint32_t)__builtin_frame_address(0) - ARMBAT_CONTEXT_MARGIN) & ~7u;
+    context->tid = armbat_gettid();
     __atomic_store_n(&context->ready, 1, __ATOMIC_RELEASE);
     for (;;) {
         armbat_park(&context->park);

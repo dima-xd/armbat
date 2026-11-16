@@ -69,7 +69,7 @@ bool GuestArena::Map(std::uint32_t addr, std::uint64_t len) {
     // Announced after the protection changed: a reader that sees a page as
     // mapped must be able to touch it.
     for (std::uint64_t index = start / page; index < end / page; ++index) {
-        pages_[index].store(1, std::memory_order_release);
+        pages_[index].store(kPageReadWrite, std::memory_order_release);
     }
     {
         const std::unique_lock lock(ranges_mutex_);
@@ -108,11 +108,17 @@ bool GuestArena::Unmap(std::uint32_t addr, std::uint64_t len) {
     // Withdrawn before the protection changes, so no reader is told a page is
     // usable while it is already PROT_NONE.
     for (std::uint64_t index = start / page; index < end / page; ++index) {
-        pages_[index].store(0, std::memory_order_release);
+        pages_[index].store(kPageFree, std::memory_order_release);
     }
     if (mprotect(base_ + start, static_cast<std::size_t>(end - start), PROT_NONE) != 0) {
         return false;
     }
+    // Handing the pages back is not bookkeeping. Unmapping a few hundred
+    // megabytes of unpacked assets otherwise leaves them resident, because
+    // PROT_NONE still keeps the physical pages, and the host's low-memory killer
+    // settles on the container. MADV_DONTNEED leaves them reading as zero, which
+    // is what Map() promises for a recycled range.
+    ::madvise(base_ + start, static_cast<std::size_t>(end - start), MADV_DONTNEED);
 
     std::vector<std::pair<std::uint64_t, std::uint64_t>> kept;
     kept.reserve(mapped_.size() + 1);
@@ -136,8 +142,124 @@ bool GuestArena::Unmap(std::uint32_t addr, std::uint64_t len) {
     return true;
 }
 
-std::uint64_t GuestArena::MappedEnd(std::uint32_t addr) const {
-    const std::uint64_t point = addr;
+bool GuestArena::Protect(std::uint32_t addr, std::uint64_t len, int prot) {
+    if (!Ok() || len == 0) {
+        return false;
+    }
+    const std::uint64_t page = page_size_;
+    const std::uint64_t start = addr & ~(page - 1);
+    const std::uint64_t end = (static_cast<std::uint64_t>(addr) + len + page - 1) & ~(page - 1);
+    if (end > size_) {
+        return false;
+    }
+    // Host protection is the guest's, minus execute: guest instructions are
+    // fetched through the JIT's callbacks and never executed by the host, so a
+    // page the guest calls executable only has to stay readable.
+    constexpr int kProtWrite = 0x2;
+    constexpr int kProtExec = 0x4;
+    const bool writable = (prot & kProtWrite) != 0;
+    const bool accessible = (prot & (0x1 | kProtWrite | kProtExec)) != 0;
+    int host = PROT_NONE;
+    if (writable) {
+        host = PROT_READ | PROT_WRITE;
+    } else if (accessible) {
+        host = PROT_READ;
+    }
+    const std::uint8_t state = !accessible ? kPageGuard
+                                           : (writable ? kPageReadWrite : kPageReadOnly);
+    // How much a state lets a guest do. The numeric order of the states means
+    // nothing: read-only is 3 and read-write is 1.
+    const auto rank = [](std::uint8_t value) {
+        switch (value) {
+            case kPageReadWrite:
+                return 2;
+            case kPageReadOnly:
+                return 1;
+            default:
+                return 0;
+        }
+    };
+
+    // The kernel answers ENOMEM for a range with a hole in it, and a caller that
+    // got zero instead would go on to rely on protection that is not there.
+    const std::uint64_t first_index = start / page;
+    const std::uint64_t last_index = end / page;
+    bool downgrade = false;
+    for (std::uint64_t index = first_index; index < last_index; ++index) {
+        const std::uint8_t current = pages_[index].load(std::memory_order_relaxed);
+        if (current == kPageFree) {
+            return false;
+        }
+        downgrade = downgrade || rank(current) > rank(state);
+    }
+    // Publication order follows the direction of the change. A reader that sees
+    // a page as accessible must be able to touch it, so a range that gains
+    // access is announced after the host protection grew. A range that loses it
+    // is the other way round: announcing afterwards leaves a window in which the
+    // page is already read-only or gone while the table still says a write will
+    // work, and a guest thread writing in that window faults in the host instead
+    // of the guest.
+    std::vector<std::uint8_t> previous;
+    if (downgrade) {
+        previous.resize(static_cast<std::size_t>(last_index - first_index));
+        for (std::uint64_t index = first_index; index < last_index; ++index) {
+            const std::uint8_t current = pages_[index].load(std::memory_order_relaxed);
+            previous[static_cast<std::size_t>(index - first_index)] = current;
+            if (rank(current) > rank(state)) {
+                pages_[index].store(state, std::memory_order_relaxed);
+            }
+        }
+    }
+    if (mprotect(base_ + start, static_cast<std::size_t>(end - start), host) != 0) {
+        // Nothing was actually changed, so the table must not claim it was.
+        for (std::size_t index = 0; index < previous.size(); ++index) {
+            pages_[first_index + index].store(previous[index], std::memory_order_relaxed);
+        }
+        return false;
+    }
+    // Announced after the protection changed: a reader that sees a page as
+    // accessible must be able to touch it.
+    for (std::uint64_t index = first_index; index < last_index; ++index) {
+        pages_[index].store(state, std::memory_order_release);
+    }
+    return true;
+}
+
+std::uint64_t GuestArena::AccessibleEnd(std::uint32_t addr) const {
+    if (pages_ == nullptr || addr >= size_) {
+        return 0;
+    }
+    const std::uint64_t count = size_ / page_size_;
+    std::uint64_t index = static_cast<std::uint64_t>(addr) >> page_shift_;
+    if (index >= count || pages_[index].load(std::memory_order_acquire) == kPageFree) {
+        return 0;
+    }
+    while (index < count) {
+        const std::uint8_t state = pages_[index].load(std::memory_order_acquire);
+        if (state != kPageReadWrite) {
+            break;
+        }
+        ++index;
+    }
+    return index * page_size_;
+}
+
+bool GuestArena::IsCommitted(std::uint32_t addr, std::uint64_t len) const {
+    const std::uint64_t end = static_cast<std::uint64_t>(addr) + len;
+    if (len == 0 || end > size_ || pages_ == nullptr) {
+        return false;
+    }
+    const std::uint64_t first = static_cast<std::uint64_t>(addr) >> page_shift_;
+    const std::uint64_t last = (end - 1) >> page_shift_;
+    for (std::uint64_t index = first; index <= last; ++index) {
+        if (pages_[index].load(std::memory_order_acquire) == kPageFree) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::uint64_t GuestArena::MappedEnd(std::uint32_t addr) const {    const std::uint64_t point = addr;
     if (point >= size_) {
         return 0;
     }

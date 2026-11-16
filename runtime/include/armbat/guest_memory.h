@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -37,6 +38,12 @@ public:
     GuestMemory(const GuestMemory&) = delete;
     GuestMemory& operator=(const GuestMemory&) = delete;
 
+    // The arena behind the guest address space. A guest address is an offset into
+    // it, so a platform call that needs a host pointer for a guest buffer -- the
+    // NDK asset reader is the one -- gets one from here instead of a copy through
+    // a staging buffer.
+    GuestArena& Arena() const { return arena_; }
+
     // Returns the mapped address, or 0 with *error = -errno.
     std::uint32_t Map(std::uint32_t address, std::uint32_t length, int flags, int fd,
                       std::uint32_t page_offset, std::int32_t* error);
@@ -57,25 +64,54 @@ public:
     // range that is partly unmapped is ENOMEM.
     std::int32_t Advise(std::uint32_t address, std::uint32_t length, int advice);
 
+    // msync: writes the shared file mappings in the range back to their files,
+    // and with MS_INVALIDATE re-reads them instead. Private mappings are left
+    // alone: their pages are the guest's private copies and were never meant to
+    // reach the file. 0 or -errno.
+    std::int32_t Sync(std::uint32_t address, std::uint32_t length, int flags);
+
     // Returns the program break after the call, following Linux brk semantics.
     std::uint32_t Break(std::uint32_t requested);
 
 private:
+    // A descriptor kept open for a shared file mapping. The guest is free to
+    // close its own copy right after mmap, and the kernel keeps the mapping
+    // writable through the file anyway, so the container has to hold a
+    // descriptor of its own until the last piece of the mapping is gone.
+    struct FileHandle {
+        int fd{-1};
+        ~FileHandle();
+    };
     struct Segment {
         std::uint64_t end;
         bool anonymous;
+        // MAP_SHARED from a file: what the guest writes has to reach the file.
+        bool shared{false};
+        std::shared_ptr<FileHandle> file;
+        // Byte offset of this segment's first byte in the file.
+        std::uint64_t file_offset{0};
     };
-    struct Range {
+    // A piece of a segment that a carve took out, with everything needed to
+    // write it back: the piece's own address range and where the piece starts
+    // inside the segment (which is where its file offset comes from).
+    struct Piece {
         std::uint64_t start;
         std::uint64_t end;
+        std::uint64_t segment_start;
+        Segment segment;
     };
 
     bool Overlaps(std::uint64_t start, std::uint64_t end) const;
     bool HasForeignMapping(std::uint64_t start, std::uint64_t end) const;
     bool AnyMapped(std::uint64_t start, std::uint64_t end) const;
-    void Carve(std::uint64_t start, std::uint64_t end, std::vector<Range>* removed);
+    void Carve(std::uint64_t start, std::uint64_t end, std::vector<Piece>* removed);
     std::uint64_t FindGap(std::uint64_t length) const;
     void PurgeToZero(std::uint64_t start, std::uint64_t length);
+    // Pushes a shared piece out to its file. Must run while the pages are still
+    // accessible: the flush reads guest memory through the arena.
+    void Flush(const Piece& piece);
+    // Drops a shared piece's pages and reads the file's current contents back.
+    void Invalidate(const Piece& piece);
 
     GuestArena& arena_;
     mutable std::mutex mutex_;

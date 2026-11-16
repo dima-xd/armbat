@@ -350,7 +350,7 @@ public:
             }
             return;
         }
-        if (svc_handlers != nullptr) {
+        if (svc_handlers != nullptr && machine != nullptr) {
             for (auto& handler : *svc_handlers) {
                 if (handler && handler(svc, *machine)) {
                     // A blocking syscall is where a parked thread learns it was
@@ -375,11 +375,13 @@ public:
 
     void ExceptionRaised(VAddr pc, Dynarmic::A32::Exception exception) override {
         std::uint32_t word = 0;
-        (void)machine->ReadGuestWord(pc, &word);
+        if (machine != nullptr) {
+            (void)machine->ReadGuestWord(pc, &word);
+        }
         std::string around;
         for (std::uint32_t offset : {16u, 12u, 8u, 4u}) {
             std::uint32_t previous = 0;
-            if (machine->ReadGuestWord(pc - offset, &previous)) {
+            if (machine != nullptr && machine->ReadGuestWord(pc - offset, &previous)) {
                 around += " " + Hex(previous);
             }
         }
@@ -431,6 +433,11 @@ public:
     std::uint64_t CallbackWrites() const { return writes_; }
     void ResetTicks() { ticks_ = 0; }
     void ResetCounters() const { reads_ = 0; writes_ = 0; }
+    // The fault trace keeps the last addresses the JIT fetched. A machine handed
+    // to the next thread would otherwise open its trace with the previous
+    // thread's code, which reads as evidence for a fault it has nothing to do
+    // with. Specialised dispatch only needs the count back at zero.
+    void ResetRecentPcs() { recent_count_ = 0; }
 
     const std::string& Error() const { return error_; }
     void ClearError() { error_.clear(); }
@@ -441,9 +448,11 @@ private:
     // signal handler is what turns it into an exception -- Mono converts a read
     // of a near-null address into a NullReferenceException and resumes at its
     // own thrower -- so the container reports the fault and stops the run at
-    // the instruction that caused it instead of inventing a zero. A run that
-    // carries on with a zero dies somewhere else entirely, which is a game that
-    // quits and a stack that names nothing.
+    // the instruction that caused it. The zero returned below never reaches the
+    // guest: the halt is checked before the loaded value is used, which is what
+    // makes the run stop at the faulting instruction and not at the end of the
+    // block. A run that carried the zero on would die somewhere else entirely,
+    // and its stack would name nothing.
     template <typename T>
     T Read(VAddr addr) {
         ++reads_;
@@ -537,46 +546,16 @@ private:
             DumpGuestTrace(pc, regs[14], regs[13], regs[11]);
             DumpRecentBlocks();
             DumpRecentCalls();
-            // TEMP: Subway Surfers 1.0.4 faults inside a stream reader and
-            // the reader's own fields say where its position stopped, which
-            // is the one fact the registers do not carry. Remove with the
-            // fix.
-            for (std::uint32_t base : {regs[4], regs[5]}) {
-                if (!arena_.IsMapped(base, 32)) {
-                    continue;
-                }
-                std::uint32_t words[8];
-                std::memcpy(words, arena_.Ptr(base), sizeof(words));
-                ARMBAT_LOG_ERROR("Armbat",
-                                 "fault words: %08x: %08x %08x %08x %08x %08x %08x %08x %08x",
-                                 base, words[0], words[1], words[2], words[3], words[4],
-                                 words[5], words[6], words[7]);
-                // The reader's own fields look like {position, buffer, end}:
-                // the buffer's first and last words say which asset this is
-                // and whether the position is where the format says it is.
-                for (std::uint32_t sample :
-                     {words[1], words[0] >= 0x20 ? words[0] - 0x20 : 0}) {
-                    if (sample == 0 || !arena_.IsMapped(sample, 64)) {
-                        continue;
-                    }
-                    std::uint32_t peek[16];
-                    std::memcpy(peek, arena_.Ptr(sample), sizeof(peek));
-                    std::string dump;
-                    char cell[16];
-                    for (std::uint32_t word : peek) {
-                        std::snprintf(cell, sizeof(cell), "%08x ", word);
-                        dump += cell;
-                    }
-                    ARMBAT_LOG_ERROR("Armbat", "fault data: %08x: %s", sample,
-                                     dump.c_str());
-                }
-            }
         }
         // A fault has to stop the block. Running it again would re-execute
         // the same bad access forever: a load from an unmapped page returns
         // a value, and a store that cannot complete turns an atomic loop
         // into a spin that never reports anything.
-        if (jit_ != nullptr) {
+        //
+        // Only while a block is running. The memory-abort path reports after
+        // Run() has returned, and a halt flag set there is not a stop of the
+        // current run but of the next one, at its first block boundary.
+        if (jit_ != nullptr && jit_->IsExecuting()) {
             jit_->HaltExecution(Dynarmic::HaltReason::UserDefined1);
         }
         // The report is the reason this run is being read at all, and the
@@ -628,10 +607,22 @@ namespace {
 // translations of code that no longer existed, and which thread held the stale
 // block decided whether the guest worked at all.
 //
-// The lock also covers adding a nested Jit, because a flush from another thread
-// walks the list that add grows.
+// A flush from another thread walks the Jit list of every machine, and Mono
+// asks for one after every compiled C# method. Holding the registry lock for the
+// whole walk made every thread that rewrote code stop every other thread, so a
+// flush snapshots the registry and does the work outside the lock.
+//
+// The snapshot cannot hold raw pointers: a machine may be destroyed while the
+// snapshot is being walked. Each machine is registered through a link that owns
+// the lock both sides take -- the flush holds it while it walks the machine, the
+// destructor holds it to mark the machine gone.
+struct MachineLink {
+    std::mutex mutex;
+    A32Machine* machine = nullptr;
+};
+
 std::mutex g_machines_mutex;
-std::vector<A32Machine*> g_machines;
+std::vector<std::shared_ptr<MachineLink>> g_machines;
 
 }  // namespace
 
@@ -653,10 +644,43 @@ struct A32Machine::Impl {
             config.exclusive_monitor =
                 std::make_shared<Dynarmic::ExclusiveMonitor>(Config::kProcessorLimit);
         }
+        // Nesting deeper than this is a bug, not a call shape: every level needs
+        // its own Jit and its own 16 MiB code cache.
+        stack.reserve(kMaxDepth);
+        jits.reserve(kMaxDepth);
+        callback_set.reserve(kMaxDepth);
         stack.push_back(AddJit(kMainCodeCache));
         // jits.front() is never replaced, so another thread may halt it without
         // walking the vector that nested calls grow.
         base_jit = jits.front().get();
+        active_jit.store(base_jit, std::memory_order_release);
+        active_depth.store(1, std::memory_order_release);
+    }
+
+    static constexpr std::size_t kMaxDepth = 32;
+    // The same value guest_container passes as "no budget".
+    static constexpr std::uint64_t kNoBudget = 1ull << 60;
+
+    // The Jit that owns this thread's register file, and how deep the nesting is.
+    // Written by the owning thread whenever `stack` changes, read by the threads
+    // that halt this machine (Stop, RequestSignal, the watchdog sample). `stack`
+    // itself must never be read from another thread: nested calls grow it, and a
+    // grown vector frees the buffer a reader would be looking at. The Jit objects
+    // live in `jits` and are never destroyed before the machine, so a pointer
+    // read here stays valid.
+    std::atomic<Dynarmic::A32::Jit*> active_jit{nullptr};
+    std::atomic<std::size_t> active_depth{0};
+
+    void PushJit(Dynarmic::A32::Jit* jit) {
+        stack.push_back(jit);
+        active_depth.store(stack.size(), std::memory_order_release);
+        active_jit.store(jit, std::memory_order_release);
+    }
+
+    void PopJit() {
+        stack.pop_back();
+        active_depth.store(stack.size(), std::memory_order_release);
+        active_jit.store(stack.empty() ? base_jit : stack.back(), std::memory_order_release);
     }
 
     // A Jit cannot be re-entered (dynarmic asserts on it), so a guest call made
@@ -665,7 +689,7 @@ struct A32Machine::Impl {
     // the result and the thread-local state, which lives outside the register
     // file anyway.
     Dynarmic::A32::Jit* AddJit(std::size_t code_cache_size) {
-        auto callbacks = std::make_unique<Callbacks>(arena, tick_budget);
+        auto callbacks = std::make_unique<Callbacks>(arena, tick_budget.load(std::memory_order_relaxed));
 
         Dynarmic::A32::UserConfig user_config{};
         user_config.callbacks = callbacks.get();
@@ -698,11 +722,30 @@ struct A32Machine::Impl {
         callbacks->machine = owner;
         callback_set.push_back(std::move(callbacks));
         // A flush on another thread walks this list, so it grows under the same
-        // lock that a flush holds. A Jit added after a flush cannot be stale:
-        // its cache is empty.
-        const std::lock_guard lock(g_machines_mutex);
+        // per-machine lock that a flush holds. A Jit added after a flush cannot
+        // be stale: its cache is empty.
+        const std::lock_guard lock(jits_mutex);
         jits.push_back(std::move(jit));
         return jits.back().get();
+    }
+
+    // A range the guest rewrote: every Jit of this machine has to drop its
+    // translations of it before any thread runs them again. Dynarmic only queues
+    // the range and raises HaltReason::CacheInvalidation; a machine that is not
+    // executing consumes the queue on its next Run, before it retires anything,
+    // so a sleeping or pooled machine needs no extra bookkeeping here.
+    void InvalidateJitRanges(std::uint32_t address, std::size_t length) {
+        const std::lock_guard lock(jits_mutex);
+        for (auto& jit : jits) {
+            jit->InvalidateCacheRange(address, length);
+        }
+    }
+
+    void ClearJitCaches() {
+        const std::lock_guard lock(jits_mutex);
+        for (auto& jit : jits) {
+            jit->ClearCache();
+        }
     }
 
     Dynarmic::A32::Jit& Current() { return *stack.back(); }
@@ -723,17 +766,36 @@ struct A32Machine::Impl {
         RunningMachine running(owner, &running_tid);
         auto& regs = target.Regs();
         regs.fill(0);
-        regs[13] = stack_pointer;
         fault.pending = false;
+
+        // AAPCS puts arguments five and up in the caller's argument area, which
+        // lies at the callee's SP -- the caller allocates it below its own SP.
+        // Writing them above the SP we were given put them into the frame of
+        // whatever called the container, and on a fresh thread stack the top few
+        // words are not even mapped, so the arguments were dropped in silence.
+        std::uint32_t callee_sp = stack_pointer;
+        const std::size_t stacked = args.size() > 4 ? args.size() - 4 : 0;
+        if (stacked != 0) {
+            callee_sp = (stack_pointer - static_cast<std::uint32_t>(4 * stacked)) & ~7u;
+        }
+        regs[13] = callee_sp;
 
         std::size_t index = 0;
         for (std::uint32_t arg : args) {
             if (index < 4) {
                 regs[index] = arg;
             } else {
-                const std::uint32_t slot = stack_pointer + static_cast<std::uint32_t>(4 * (index - 4));
+                const std::uint32_t slot =
+                    callee_sp + static_cast<std::uint32_t>(4 * (index - 4));
                 if (arena.IsMapped(slot, 4)) {
                     std::memcpy(arena.Ptr(slot), &arg, sizeof(arg));
+                } else {
+                    // Silent here means a callee reading a garbage argument,
+                    // which is several hours of looking at the wrong function.
+                    ARMBAT_LOG_ERROR("Armbat",
+                                     "run: argument %zu at 0x%08x is not mapped "
+                                     "(entry=0x%08x sp=0x%08x args=%zu)",
+                                     index, slot, entry, stack_pointer, args.size());
                 }
             }
             ++index;
@@ -771,16 +833,46 @@ struct A32Machine::Impl {
                "unmapped guest address " + address;
     }
 
+    // The callback set that owns `target`. A report has to come from the Jit
+    // whose register file it describes: after a nested run the base one holds
+    // r0 of the outer frame, not the pc that faulted.
+    Callbacks* CallbacksOf(Dynarmic::A32::Jit& target) {
+        for (std::size_t index = 0; index < jits.size(); ++index) {
+            if (jits[index].get() == &target) {
+                return callback_set[index].get();
+            }
+        }
+        return callback_set.front().get();
+    }
+
     // The JIT's run loop: CacheInvalidation is a normal exit path, not a failure.
     std::uint32_t RunJit(Dynarmic::A32::Jit& target) {
         RunningMachine running(owner, &running_tid);
+        Callbacks* const source = CallbacksOf(target);
+        // SetTickBudget caps what this run may retire. It is measured in this
+        // Jit's own ticks, and it has to be applied here: a slice budget set once
+        // per iteration used to overwrite it, which left every caller of
+        // SetTickBudget with a limit that never took effect.
+        const std::uint64_t budget = tick_budget.load(std::memory_order_relaxed);
+        const std::uint64_t started = source->RetiredTicks();
         // A run that keeps faulting without making progress is a handler that
         // resumes somewhere that faults again; the report is worth more than
         // the answer it would eventually give.
         int delivered = 0;
         for (;;) {
+            std::uint64_t slice = kSliceTicks;
+            if (budget != kNoBudget) {
+                const std::uint64_t used = source->RetiredTicks() - started;
+                if (used >= budget) {
+                    halt_reason = HaltReason{};
+                    source->NoteError("run stopped after " + std::to_string(budget) +
+                                      " guest ticks (tick budget)");
+                    break;
+                }
+                slice = std::min(slice, budget - used);
+            }
             for (auto& callbacks : callback_set) {
-                callbacks->SetTickBudget(kSliceTicks);
+                callbacks->SetTickBudget(slice);
             }
             halt_reason = target.Run();
             if ((static_cast<std::uint32_t>(halt_reason) &
@@ -806,14 +898,6 @@ struct A32Machine::Impl {
                 fault.pending = false;
                 // Report through the callbacks of the Jit that faulted: the pc
                 // and the register file in the report are that run's.
-                Callbacks* const source = [&] {
-                    for (std::size_t index = 0; index < jits.size(); ++index) {
-                        if (jits[index].get() == &target) {
-                            return callback_set[index].get();
-                        }
-                    }
-                    return callback_set.front().get();
-                }();
                 source->NoteError(DescribeFault(failed));
                 break;
             }
@@ -827,6 +911,14 @@ struct A32Machine::Impl {
                     owner->RunSafePoint();
                 }
                 continue;
+            }
+            if ((static_cast<std::uint32_t>(halt_reason) &
+                 static_cast<std::uint32_t>(HaltReason::UserDefined3)) != 0) {
+                // Stop(). The bit is left set on purpose: a stop that arrived
+                // while the machine was idle has to end the next run before it
+                // retires anything, and one that arrived during this run means
+                // the machine is finished, not merely between slices.
+                break;
             }
             if (halt_reason == HaltReason::CacheInvalidation) {
                 target.ClearHalt(HaltReason::CacheInvalidation);
@@ -863,14 +955,18 @@ struct A32Machine::Impl {
     std::atomic<const char*> hle_call{nullptr};
     std::atomic<std::uint32_t> last_syscall{0};
     std::atomic<std::uint64_t> syscall_count{0};
-    std::uint64_t tick_budget = 1ull << 60;
+    std::atomic<std::uint64_t> tick_budget{kNoBudget};
     std::uint32_t sp = 0;
     std::uint32_t tls_base = 0;
     std::uint32_t return_trap = 0;
     Fault fault;
     std::vector<A32Machine::SvcHandler> svc_handlers;
     std::vector<std::unique_ptr<Callbacks>> callback_set;
+    // Serialises growing `jits` against a flush that walks it.
+    std::mutex jits_mutex;
     std::vector<std::unique_ptr<Dynarmic::A32::Jit>> jits;
+    // Registry handle; the destructor clears `machine` under `link->mutex`.
+    std::shared_ptr<MachineLink> link;
     std::vector<Dynarmic::A32::Jit*> stack;
     HaltReason halt_reason{};
 };
@@ -883,14 +979,24 @@ A32Machine::A32Machine(GuestArena& arena, Config config)
     for (auto& callbacks : impl_->callback_set) {
         callbacks->machine = this;
     }
+    auto link = std::make_shared<MachineLink>();
+    link->machine = this;
+    impl_->link = link;
     const std::lock_guard lock(g_machines_mutex);
-    g_machines.push_back(this);
+    g_machines.push_back(std::move(link));
 }
 
 A32Machine::~A32Machine() {
-    {
+    // The link outlives the machine in a snapshot another thread may be holding,
+    // so the machine is detached under the link's own lock: a flush that already
+    // took the link waits here until it is done, and one that took it afterwards
+    // sees `machine == nullptr`.
+    const std::shared_ptr<MachineLink> link = impl_->link;
+    if (link != nullptr) {
+        const std::lock_guard held(link->mutex);
+        link->machine = nullptr;
         const std::lock_guard lock(g_machines_mutex);
-        g_machines.erase(std::remove(g_machines.begin(), g_machines.end(), this),
+        g_machines.erase(std::remove(g_machines.begin(), g_machines.end(), link),
                          g_machines.end());
     }
 }
@@ -921,7 +1027,11 @@ void A32Machine::SetReturnTrap(std::uint32_t addr) {
 }
 
 void A32Machine::Stop() {
-    impl_->Current().HaltExecution(HaltReason::UserDefined1);
+    // The Jit that is running now, not stack.back(): this is called from another
+    // thread during teardown, and nested calls grow `stack` on the owning thread.
+    if (Dynarmic::A32::Jit* const running = impl_->active_jit.load(std::memory_order_acquire)) {
+        running->HaltExecution(HaltReason::UserDefined3);
+    }
 }
 
 void A32Machine::AddSvcHandler(SvcHandler handler) {
@@ -948,44 +1058,19 @@ std::uint32_t A32Machine::CallFunction(std::uint32_t entry,
 
 std::uint32_t A32Machine::CallNested(std::uint32_t entry,
                                      std::initializer_list<std::uint32_t> args) {
-    if (impl_->return_trap == 0) {
-        impl_->callback_set.front()->NoteError("return trap is not configured");
-        return 0;
-    }
-
-    // The outer run is suspended on the host stack, so the nested call needs its
-    // own Jit: dynarmic refuses to re-enter one.
-    const std::size_t depth = impl_->stack.size();
-    if (impl_->jits.size() <= depth) {
-        impl_->AddJit(Impl::kNestedCodeCache);
-    }
-    Dynarmic::A32::Jit& outer = impl_->Current();
-    Dynarmic::A32::Jit& nested = *impl_->jits[depth];
-    nested.Regs() = outer.Regs();
-    nested.SetCpsr(outer.Cpsr());
-
-    // Start below the outer frame: the stack grows down, so reusing the base
-    // pointer would overwrite the caller's locals.
-    const std::uint32_t nested_sp = (nested.Regs()[13] - 64u) & ~7u;
-    impl_->stack.push_back(&nested);
-    const std::uint32_t result =
-        impl_->Invoke(nested, impl_->return_trap, entry, std::vector<std::uint32_t>(args),
-                      nested_sp);
-    impl_->stack.pop_back();
-
-    nested.ClearHalt(HaltReason::UserDefined1);
-    nested.ClearHalt(HaltReason::CacheInvalidation);
-    outer.Regs()[0] = result;
-    outer.Regs()[1] = nested.Regs()[1];  // 64-bit results live in r0:r1
-    return result;
+    return CallNested(entry, std::vector<std::uint32_t>(args));
 }
 
 bool A32Machine::Executing() const {
-    return t_current_machine == this && !impl_->stack.empty() && impl_->stack.front()->IsExecuting();
+    return t_current_machine == this && Busy();
 }
 
 bool A32Machine::Busy() const {
-    return !impl_->stack.empty() && impl_->stack.front()->IsExecuting();
+    // base_jit, not stack: this is asked from other threads, and `stack` is
+    // grown by nested calls on the owning thread. The base Jit is still running
+    // while a nested one is: a nested run happens inside a callback of a base
+    // run, so the base is suspended in its own Run(), not finished.
+    return impl_->base_jit != nullptr && impl_->base_jit->IsExecuting();
 }
 
 std::uint32_t A32Machine::BusyThread() const {
@@ -1016,9 +1101,19 @@ std::uint32_t A32Machine::MemoryFaultAddress() const { return impl_->fault.addre
 
 void A32Machine::ClearMemoryFault() { impl_->fault.pending = false; }
 
-std::uint32_t A32Machine::Cpsr() const { return impl_->Current().Cpsr(); }
+std::uint32_t A32Machine::Cpsr() const {
+    Dynarmic::A32::Jit* const jit = impl_->active_jit.load(std::memory_order_acquire);
+    return jit != nullptr ? jit->Cpsr() : kUserModeCpsr;
+}
 
-void A32Machine::SetCpsr(std::uint32_t value) { impl_->Current().SetCpsr(value); }
+void A32Machine::SetCpsr(std::uint32_t value) {
+    // The running Jit, which is the one whose register file a signal context
+    // describes; `stack.back()` is the same thing unless another thread is
+    // looking, and then it is the vector, not the state, that gets read.
+    if (Dynarmic::A32::Jit* const jit = impl_->active_jit.load(std::memory_order_acquire)) {
+        jit->SetCpsr(value);
+    }
+}
 
 A32Machine* CurrentGuestMachine() { return t_current_machine; }
 
@@ -1028,20 +1123,36 @@ std::uint32_t A32Machine::CallNested(std::uint32_t entry,
         impl_->callback_set.front()->NoteError("return trap is not configured");
         return 0;
     }
+    // The outer run is suspended on the host stack, so the nested call needs its
+    // own Jit: dynarmic refuses to re-enter one.
     const std::size_t depth = impl_->stack.size();
+    if (depth >= Impl::kMaxDepth) {
+        impl_->callback_set.front()->NoteError(
+            "nested guest call deeper than " + std::to_string(Impl::kMaxDepth) + " levels");
+        return 0;
+    }
     if (impl_->jits.size() <= depth) {
         impl_->AddJit(Impl::kNestedCodeCache);
     }
     Dynarmic::A32::Jit& outer = impl_->Current();
     Dynarmic::A32::Jit& nested = *impl_->jits[depth];
-    nested.Regs() = outer.Regs();
-    nested.SetCpsr(outer.Cpsr());
 
-    const std::uint32_t nested_sp = (nested.Regs()[13] - 64u) & ~7u;
-    impl_->stack.push_back(&nested);
+    // Start below the outer frame: the stack grows down, so reusing the base
+    // pointer would overwrite the caller's locals.
+    const std::uint32_t nested_sp = (outer.Regs()[13] - 64u) & ~7u;
+    impl_->PushJit(&nested);
     const std::uint32_t result = impl_->Invoke(nested, impl_->return_trap, entry, args, nested_sp);
-    impl_->stack.pop_back();
+    impl_->PopJit();
 
+    // A stop asked of the machine while the nested run was going has to end the
+    // outer run as well: Stop() names the machine, not one Jit. The bit is taken
+    // out of the nested Jit because that Jit is reused, and left in place it
+    // would end the next nested call before it ran anything.
+    if ((static_cast<std::uint32_t>(impl_->halt_reason) &
+         static_cast<std::uint32_t>(HaltReason::UserDefined3)) != 0) {
+        nested.ClearHalt(HaltReason::UserDefined3);
+        outer.HaltExecution(HaltReason::UserDefined3);
+    }
     nested.ClearHalt(HaltReason::UserDefined1);
     nested.ClearHalt(HaltReason::CacheInvalidation);
     outer.Regs()[0] = result;
@@ -1050,7 +1161,7 @@ std::uint32_t A32Machine::CallNested(std::uint32_t entry,
 }
 
 bool A32Machine::Thumb() const {
-    return (impl_->Current().Cpsr() & kThumbBit) != 0;
+    return (Cpsr() & kThumbBit) != 0;
 }
 
 std::uint32_t A32Machine::CallNestedPreservingRegisters(
@@ -1060,6 +1171,11 @@ std::uint32_t A32Machine::CallNestedPreservingRegisters(
         return 0;
     }
     const std::size_t depth = impl_->stack.size();
+    if (depth >= Impl::kMaxDepth) {
+        impl_->callback_set.front()->NoteError(
+            "nested guest call deeper than " + std::to_string(Impl::kMaxDepth) + " levels");
+        return 0;
+    }
     if (impl_->jits.size() <= depth) {
         impl_->AddJit(Impl::kNestedCodeCache);
     }
@@ -1071,11 +1187,16 @@ std::uint32_t A32Machine::CallNestedPreservingRegisters(
     const std::uint32_t saved_cpsr = outer.Cpsr();
 
     const std::uint32_t nested_sp = (saved_regs[13] - 64u) & ~7u;
-    impl_->stack.push_back(&nested);
+    impl_->PushJit(&nested);
     const std::uint32_t result =
         impl_->Invoke(nested, impl_->return_trap, entry, args, nested_sp);
-    impl_->stack.pop_back();
+    impl_->PopJit();
 
+    if ((static_cast<std::uint32_t>(impl_->halt_reason) &
+         static_cast<std::uint32_t>(HaltReason::UserDefined3)) != 0) {
+        nested.ClearHalt(HaltReason::UserDefined3);
+        outer.HaltExecution(HaltReason::UserDefined3);
+    }
     nested.ClearHalt(HaltReason::UserDefined1);
     nested.ClearHalt(HaltReason::UserDefined2);
     nested.ClearHalt(HaltReason::CacheInvalidation);
@@ -1098,7 +1219,13 @@ void A32Machine::RequestSignal(std::uint32_t signal) {
     impl_->signal_ticket.fetch_add(1, std::memory_order_release);
     ::syscall(SYS_futex, &impl_->signal_ticket, FUTEX_WAKE, INT_MAX, nullptr, nullptr, 0);
     // The halt flag is atomic inside dynarmic; it is read where a block hands
-    // control back to the dispatcher, which is a safe point.
+    // control back to the dispatcher, which is a safe point. Both the running
+    // Jit and the base one are halted: a signal that arrives while the guest
+    // sits in a nested call has to reach that call's blocks, and one that
+    // arrives between a nested call and the outer run has to reach the outer's.
+    if (Dynarmic::A32::Jit* const running = impl_->active_jit.load(std::memory_order_acquire)) {
+        running->HaltExecution(HaltReason::UserDefined2);
+    }
     if (impl_->base_jit != nullptr) {
         impl_->base_jit->HaltExecution(HaltReason::UserDefined2);
     }
@@ -1111,6 +1238,11 @@ bool A32Machine::HasPendingSignal() const {
 
 std::uint64_t A32Machine::BlockedSignals() const {
     return impl_->blocked_signals.load(std::memory_order_acquire);
+}
+
+std::uint64_t A32Machine::PendingSignals() const {
+    const std::uint64_t blocked = impl_->blocked_signals.load(std::memory_order_acquire);
+    return impl_->pending_signals.load(std::memory_order_acquire) & ~blocked;
 }
 
 void A32Machine::SetBlockedSignals(std::uint64_t mask) {
@@ -1183,19 +1315,58 @@ std::uint32_t A32Machine::EnterClonedThread(const std::array<std::uint32_t, 16>&
     return impl_->RunJit(target);
 }
 
+void A32Machine::ResetForThread() {
+    // Nothing else refers to this machine: its thread stored it in the pool and
+    // is gone. Only its own state has to be put back, the code cache stays.
+    impl_->stack.resize(1);
+    impl_->active_depth.store(1, std::memory_order_release);
+    impl_->active_jit.store(impl_->base_jit, std::memory_order_release);
+    // A flush from another thread may be walking this machine right now: a
+    // pooled machine is still in the registry. The ranges it queues are kept by
+    // dynarmic itself and are applied before the next run, so a reset must not
+    // drop them -- only the register file and the thread's own state are reset.
+    const std::lock_guard jits_lock(impl_->jits_mutex);
+    for (auto& jit : impl_->jits) {
+        // Clears the register file, CPSR, halt flags and the exclusive state.
+        jit->Reset();
+    }
+    impl_->fault = {};
+    impl_->halt_reason = HaltReason{};
+    impl_->pending_signals.store(0, std::memory_order_relaxed);
+    impl_->blocked_signals.store(0, std::memory_order_relaxed);
+    impl_->signal_ticket.store(0, std::memory_order_relaxed);
+    impl_->running_tid.store(0, std::memory_order_relaxed);
+    impl_->hle_call.store(nullptr, std::memory_order_relaxed);
+    impl_->last_syscall.store(0, std::memory_order_relaxed);
+    impl_->syscall_count.store(0, std::memory_order_relaxed);
+    impl_->tick_budget.store(Impl::kNoBudget, std::memory_order_relaxed);
+    impl_->sp = 0;
+    impl_->tls_base = 0;
+    ClearError();
+    ResetStats();
+}
+
 void A32Machine::SampleNow() {
-    if (impl_->stack.empty()) {
+    Dynarmic::A32::Jit* const running = impl_->active_jit.load(std::memory_order_acquire);
+    if (running == nullptr) {
         return;
     }
-    Dynarmic::A32::Jit* running = impl_->stack.back();
+    const std::size_t depth = impl_->active_depth.load(std::memory_order_acquire);
     ARMBAT_LOG_INFO("Armbat", "sample: depth=%zu jit=%p pc=0x%08x sp=0x%08x",
-                        impl_->stack.size(), static_cast<void*>(running), running->Regs()[15],
+                        depth, static_cast<void*>(running), running->Regs()[15],
                         running->Regs()[13]);
-    running->ClearCache();
+    // The register file is the whole point of a sample, and reading it needs no
+    // cache flush. Clearing one here used to drop every translated block every
+    // five seconds, so the next five seconds were spent recompiling what the
+    // previous five had already compiled.
 }
 
 std::uint32_t A32Machine::Reg(std::size_t index) const {
-    return impl_->stack.back()->Regs().at(index);
+    // active_jit, not stack.back(): the watchdog prints the registers of a
+    // machine owned by another thread, and `stack` is grown by nesting on the
+    // thread that owns it.
+    Dynarmic::A32::Jit* const jit = impl_->active_jit.load(std::memory_order_acquire);
+    return jit != nullptr ? jit->Regs().at(index) : 0;
 }
 
 bool A32Machine::ReadGuestWord(std::uint32_t address, std::uint32_t* value) const {
@@ -1236,8 +1407,11 @@ std::vector<std::uint32_t> A32Machine::GuestReturnAddresses(std::uint32_t sp,
 }
 
 void A32Machine::SetReg(std::size_t index, std::uint32_t value) {
-    if (index < 16) {
-        impl_->stack.back()->Regs()[index] = value;
+    if (index >= 16) {
+        return;
+    }
+    if (Dynarmic::A32::Jit* const jit = impl_->active_jit.load(std::memory_order_acquire)) {
+        jit->Regs()[index] = value;
     }
 }
 
@@ -1246,29 +1420,57 @@ void A32Machine::SetTlsBase(std::uint32_t base) { impl_->tls_base = base; }
 std::uint32_t A32Machine::TlsBase() const { return impl_->tls_base; }
 
 std::uint64_t A32Machine::RetiredTicks() const {
-    return impl_->callback_set.front()->RetiredTicks();
+    // Summed over every Jit: work done in a nested run (a Java callback that
+    // came back into a guest image) is work this thread retired.
+    std::uint64_t ticks = 0;
+    for (const auto& callbacks : impl_->callback_set) {
+        ticks += callbacks->RetiredTicks();
+    }
+    return ticks;
 }
 
 void A32Machine::ResetStats() {
-    impl_->callback_set.front()->ResetTicks();
-    impl_->callback_set.front()->ResetCounters();
+    for (const auto& callbacks : impl_->callback_set) {
+        callbacks->ResetTicks();
+        callbacks->ResetCounters();
+        callbacks->ResetRecentPcs();
+    }
 }
 
 std::uint64_t A32Machine::CallbackReads() const {
-    return impl_->callback_set.front()->CallbackReads();
+    std::uint64_t reads = 0;
+    for (const auto& callbacks : impl_->callback_set) {
+        reads += callbacks->CallbackReads();
+    }
+    return reads;
 }
 
 std::uint64_t A32Machine::CallbackWrites() const {
-    return impl_->callback_set.front()->CallbackWrites();
+    std::uint64_t writes = 0;
+    for (const auto& callbacks : impl_->callback_set) {
+        writes += callbacks->CallbackWrites();
+    }
+    return writes;
 }
 
 const std::string& A32Machine::LastError() const {
+    // A fault inside a nested run is noted on that run's callbacks. Reporting
+    // only the base one lost it, and left the base's empty error looking like a
+    // clean run.
+    for (const auto& callbacks : impl_->callback_set) {
+        if (!callbacks->Error().empty()) {
+            return callbacks->Error();
+        }
+    }
     return impl_->callback_set.front()->Error();
 }
 
 void A32Machine::ClearError() {
-    if (!impl_->callback_set.empty()) {
-        impl_->callback_set.front()->ClearError();
+    // Every callbacks object, not only the base one: a stale error on a nested
+    // set keeps its own "first error" flag false, and every later fault from
+    // there loses the trace and register dump that explains it.
+    for (const auto& callbacks : impl_->callback_set) {
+        callbacks->ClearError();
     }
 }
 
@@ -1289,6 +1491,9 @@ std::string A32Machine::LastHaltReasonName() const {
     if (impl_->halt_reason == HaltReason::UserDefined1) {
         return "svc";
     }
+    if (impl_->halt_reason == HaltReason::UserDefined3) {
+        return "stop";
+    }
     if (impl_->halt_reason == HaltReason::CacheInvalidation) {
         return "cache-invalidation";
     }
@@ -1305,26 +1510,39 @@ void A32Machine::InvalidateCacheRange(std::uint32_t addr, std::size_t len) {
     if (len == 0) {
         return;
     }
-    const std::lock_guard lock(g_machines_mutex);
-    for (A32Machine* machine : g_machines) {
-        for (auto& jit : machine->impl_->jits) {
-            jit->InvalidateCacheRange(addr, len);
+    std::vector<std::shared_ptr<MachineLink>> snapshot;
+    {
+        const std::lock_guard lock(g_machines_mutex);
+        snapshot = g_machines;
+    }
+    // Outside the registry lock: another thread's flush may run at the same
+    // time, and holding the lock for the walk is what made every code rewrite
+    // stop every thread.
+    for (const std::shared_ptr<MachineLink>& link : snapshot) {
+        const std::lock_guard held(link->mutex);
+        if (link->machine != nullptr) {
+            link->machine->impl_->InvalidateJitRanges(addr, len);
         }
     }
 }
 
 void A32Machine::SetTickBudget(std::uint64_t ticks) {
-    impl_->tick_budget = ticks;
-    for (auto& callbacks : impl_->callback_set) {
-        callbacks->SetTickBudget(ticks);
-    }
+    // RunJit reads this at the start of a run and hands each slice the part of
+    // it that is left. Setting the callbacks' budget here as well used to be
+    // overwritten by the slice budget on the first iteration.
+    impl_->tick_budget.store(ticks, std::memory_order_relaxed);
 }
 
 void A32Machine::ClearCache() {
-    const std::lock_guard lock(g_machines_mutex);
-    for (A32Machine* machine : g_machines) {
-        for (auto& jit : machine->impl_->jits) {
-            jit->ClearCache();
+    std::vector<std::shared_ptr<MachineLink>> snapshot;
+    {
+        const std::lock_guard lock(g_machines_mutex);
+        snapshot = g_machines;
+    }
+    for (const std::shared_ptr<MachineLink>& link : snapshot) {
+        const std::lock_guard held(link->mutex);
+        if (link->machine != nullptr) {
+            link->machine->impl_->ClearJitCaches();
         }
     }
 }

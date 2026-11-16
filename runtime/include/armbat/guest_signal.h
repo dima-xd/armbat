@@ -38,6 +38,11 @@ void SetGuestSignalAction(int signal, std::uint32_t handler, std::uint32_t flags
 // True when the guest installed a real handler, so a signal has somewhere to go.
 bool HasGuestSignalHandler(int signal);
 
+// True when every signal in the set was installed with SA_RESTART: a syscall
+// parked on this thread then has to be restarted after the handler runs, not
+// failed with EINTR.
+bool GuestSignalsRestart(std::uint64_t deliverable);
+
 // Runs the handlers of every signal queued on this machine's thread. Must be
 // called on that thread at a safe point: between JIT slices or on SVC entry.
 void DeliverGuestSignals(A32Machine& machine);

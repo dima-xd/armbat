@@ -212,8 +212,8 @@ void NoteGuestAbort(std::uint32_t return_address);
 std::uint32_t LastGuestAbort();
 
 // The Android platform libraries: assets, configuration, window, looper, input
-// and EGL. They need the archive the guest was started from, hence the setter.
-void SetGuestApk(GuestApk* apk);
+// and EGL. Assets are the platform's own AssetManager, so nothing here needs the
+// archive: AAssetManager_fromJava converts the Java object the guest passes.
 
 // The guest's allocator. libjnigraphics copies a Java bitmap into guest memory
 // and hands the guest its address, which only the guest heap can provide.

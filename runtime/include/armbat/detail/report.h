@@ -41,6 +41,12 @@ public:
         }
     }
 
+    // A check this path cannot answer. It is not a pass: nothing was verified.
+    // The suite stays green only because the reason is printed next to it.
+    void Skip(const std::string& name, const std::string& reason) {
+        Record("SKIP " + name + ": " + reason);
+    }
+
     int Failures() const { return failures_; }
 
     std::string Text(const std::string& header) const {

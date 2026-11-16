@@ -42,6 +42,7 @@
 #include "armbat/guest_arena.h"
 #include "armbat/guest_cpu.h"
 #include "armbat/hle.h"
+#include "armbat/jni_bridge.h"
 
 // The long tail of libc and libm: everything an ARMv7 image imports that the
 // container can serve by simply calling the host. Layouts that differ between
@@ -1124,7 +1125,7 @@ void RegisterExtraFunctions(HleRegistry& registry) {
             call.ReadCString(call.Arg(format_argument), format, 4096);
             const std::string text =
                 FormatVaList(call, format, call.Arg(format_argument + 1));
-            LogWriteAndroid(static_cast<int>(call.Arg(0)), tag.empty() ? "guest" : tag.c_str(),
+                LogWriteAndroid(static_cast<int>(call.Arg(0)), tag.empty() ? "guest" : tag.c_str(),
                             "%s", text.c_str());
             call.Return(static_cast<std::uint32_t>(text.size()));
         });

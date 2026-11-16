@@ -79,4 +79,13 @@ void UnregisterLiveGuestThread(A32Machine& machine);
 // thread, and a thread is only reachable through this table.
 A32Machine* FindLiveGuestThread(std::uint32_t tid);
 
+// The host thread that is running guest code on the context this tid belongs to,
+// or `tid` itself when it owns none. A platform thread borrows a guest thread's
+// stack and TLS to reach native code, so inside such a call the guest's own
+// identity -- pthread_self() and the tid bionic caches in it -- is the lender's.
+// A signal addressed to that identity has to reach whichever thread is running
+// on it, or a collector that stops threads by signalling them suspends a parked
+// lender and leaves the thread it needed to stop running.
+std::uint32_t BorrowingThreadForLender(std::uint32_t tid);
+
 }  // namespace armbat

@@ -13,8 +13,10 @@
 #define SYS_exit_group 248
 #define SYS_openat 322
 #define SYS_brk 45
+#define SYS_ftruncate 93
 #define SYS_munmap 91
 #define SYS_mprotect 125
+#define SYS_msync 144
 #define SYS_nanosleep 162
 #define SYS_mmap2 192
 #define SYS_clock_gettime 263
@@ -22,6 +24,7 @@
 
 #define PROT_READ 1
 #define PROT_WRITE 2
+#define MAP_SHARED 1
 #define MAP_PRIVATE 2
 #define MAP_ANONYMOUS 0x20
 
@@ -134,13 +137,18 @@ int lib_fstat_size(const char* path) {
     if (fd < 0) {
         return fd;
     }
-    unsigned int words[18];
+    // bionic's 32-bit ARM `struct stat` is the 64-bit-inode body: st_size is a
+    // long long at offset 48, not the offset-24 field of the pre-Lollipop one.
+    unsigned int words[26];
     const int result = syscall3(SYS_fstat, fd, (int)words, 0);
     syscall1(SYS_close, fd);
     if (result != 0) {
         return result;
     }
-    return (int)words[6];
+    if (words[13] != 0) {
+        return -1;
+    }
+    return (int)words[12];
 }
 
 // exit_group must stop the guest immediately; the statement after it never runs.
@@ -189,6 +197,103 @@ int lib_mmap_file(const char* path, int length) {
     syscall2(SYS_munmap, mapping, 4096);
     syscall1(SYS_close, fd);
     return sum;
+}
+
+// Fills a file through a MAP_SHARED window, unmaps it and reads it back with an
+// ordinary read. This is how an engine caches a downloaded bundle: the only
+// path from the guest's buffer to the file is the shared mapping, and a
+// container that copies the file in at map time and never writes it out leaves
+// a file of zeros behind.
+int lib_mmap_shared_write(const char* path, int length) {
+    const int fd = syscall3(SYS_open, (int)path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        return fd;
+    }
+    if (syscall2(SYS_ftruncate, fd, length) != 0) {
+        syscall1(SYS_close, fd);
+        return -1;
+    }
+    const int mapping =
+        syscall6(SYS_mmap2, 0, length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (mapping < 0) {
+        syscall1(SYS_close, fd);
+        return mapping;
+    }
+    char* bytes = (char*)mapping;
+    for (int i = 0; i < length; ++i) {
+        bytes[i] = (char)(i * 3 + 1);
+    }
+    // The descriptor goes away before the mapping does: the file still has to be
+    // complete, exactly as it would be if the kernel held the mapping itself.
+    syscall2(SYS_munmap, mapping, length);
+    syscall1(SYS_close, fd);
+
+    const int again = syscall3(SYS_open, (int)path, O_RDONLY, 0);
+    if (again < 0) {
+        return -2;
+    }
+    int mismatched = 0;
+    for (int i = 0; i < length; ++i) {
+        char byte = 0;
+        if (syscall3(SYS_read, again, (int)&byte, 1) != 1) {
+            ++mismatched;
+            break;
+        }
+        if (byte != (char)(i * 3 + 1)) {
+            ++mismatched;
+        }
+    }
+    syscall1(SYS_close, again);
+    return mismatched == 0 ? length : -3;
+}
+
+// The same, but reads the file while the mapping is still there: only msync can
+// have put the bytes in it at that point.
+int lib_mmap_msync(const char* path, int length) {
+    const int fd = syscall3(SYS_open, (int)path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        return fd;
+    }
+    if (syscall2(SYS_ftruncate, fd, length) != 0) {
+        syscall1(SYS_close, fd);
+        return -1;
+    }
+    const int mapping =
+        syscall6(SYS_mmap2, 0, length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (mapping < 0) {
+        syscall1(SYS_close, fd);
+        return mapping;
+    }
+    char* bytes = (char*)mapping;
+    for (int i = 0; i < length; ++i) {
+        bytes[i] = (char)(i + 7);
+    }
+    if (syscall3(SYS_msync, mapping, length, 4) != 0) {
+        syscall2(SYS_munmap, mapping, length);
+        syscall1(SYS_close, fd);
+        return -4;
+    }
+    const int again = syscall3(SYS_open, (int)path, O_RDONLY, 0);
+    if (again < 0) {
+        syscall2(SYS_munmap, mapping, length);
+        syscall1(SYS_close, fd);
+        return -2;
+    }
+    int mismatched = 0;
+    for (int i = 0; i < length; ++i) {
+        char byte = 0;
+        if (syscall3(SYS_read, again, (int)&byte, 1) != 1) {
+            ++mismatched;
+            break;
+        }
+        if (byte != (char)(i + 7)) {
+            ++mismatched;
+        }
+    }
+    syscall1(SYS_close, again);
+    syscall2(SYS_munmap, mapping, length);
+    syscall1(SYS_close, fd);
+    return mismatched == 0 ? length : -3;
 }
 
 int lib_brk_probe(void) {

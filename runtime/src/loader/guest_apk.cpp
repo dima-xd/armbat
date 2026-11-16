@@ -171,7 +171,6 @@ bool GuestApk::Open(const std::string& path, std::string* error) {
     abi_directory_.clear();
     entries_.clear();
     index_.clear();
-    directories_.clear();
     if (fd_ >= 0) {
         ::close(fd_);
         fd_ = -1;
@@ -259,17 +258,6 @@ bool GuestApk::Open(const std::string& path, std::string* error) {
                           name_length);
 
         index_[entry.name] = entries_.size();
-        // The immediate children of its parent directory: a directory listing is
-        // then one lookup instead of a scan of every entry in the archive. An
-        // entry that is itself a directory ("a/b/") has no name after the slash
-        // and is only a parent, not a child of anyone. Directories are not
-        // listed to the guest -- AAssetDir_getNextFileName skips everything that
-        // is not a regular file -- so an implicit parent stays invisible.
-        const std::size_t slash = entry.name.rfind('/');
-        if (slash != std::string::npos && slash + 1 < entry.name.size()) {
-            directories_[entry.name.substr(0, slash)].push_back(
-                entry.name.substr(slash + 1));
-        }
         entries_.push_back(std::move(entry));
         cursor += 46 + name_length + extra_length + comment_length;
     }
@@ -278,13 +266,6 @@ bool GuestApk::Open(const std::string& path, std::string* error) {
         return false;
     }
 
-    // Archive order is not a listing order: a file may appear anywhere in the
-    // central directory. Sorting also makes the duplicates that a directory's
-    // own entry produces collapse.
-    for (auto& [parent, children] : directories_) {
-        std::sort(children.begin(), children.end());
-        children.erase(std::unique(children.begin(), children.end()), children.end());
-    }
     // The platform picks exactly one ABI directory per application: armeabi-v7a
     // when the archive has one, armeabi otherwise. It never mixes them, and an
     // archive that carries an empty armeabi-v7a directory is an archive without
@@ -332,21 +313,6 @@ bool GuestApk::Read(const std::string& name, std::vector<std::uint8_t>* out,
         return false;
     }
     return ExtractEntry(*entry, name, out, error);
-}
-
-bool GuestApk::ReadAsset(const std::string& name, std::vector<std::uint8_t>* out,
-                         std::string* error) const {
-    const std::string relative = AssetEntryName(name);
-    if (relative.empty()) {
-        if (error) *error = "empty asset name";
-        return false;
-    }
-    const Entry* entry = Find(relative);
-    if (entry == nullptr) {
-        if (error) *error = "'" + relative + "' is not in the archive";
-        return false;
-    }
-    return ExtractEntry(*entry, relative, out, error);
 }
 
 int GuestApk::OpenAssetFileDescriptor(const std::string& name, std::uint64_t* start,
@@ -426,21 +392,6 @@ int GuestApk::OpenAssetFileDescriptor(const std::string& name, std::uint64_t* st
     if (start != nullptr) *start = data_offset;
     if (length != nullptr) *length = entry->size;
     return descriptor;
-}
-
-std::vector<std::string> GuestApk::ListAssets(const std::string& directory) const {
-    std::string prefix = AssetRelative(directory);
-    if (prefix.rfind("assets/", 0) != 0) {
-        prefix.insert(0, "assets/");
-    }
-    while (!prefix.empty() && prefix.back() == '/') {
-        prefix.pop_back();
-    }
-    const auto it = directories_.find(prefix);
-    if (it == directories_.end()) {
-        return {};
-    }
-    return it->second;
 }
 
 bool GuestApk::Extract(const std::string& name, const std::string& host_path,

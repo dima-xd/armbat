@@ -1,11 +1,13 @@
 #include "armbat/selftest.h"
 
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "armbat/a32_machine.h"
@@ -176,18 +178,14 @@ SuiteReport RunJitSelftest() {
         report.Pass("neon.qadd_i16", Format("%u lanes saturated", kSamples));
     }
 
-    // Narrowing add/sub: the operands are read as double-width elements made of
-    // adjacent lane pairs, and the high half of each sum lands in the D result.
-    // Values straddle zero and the rounding midpoint so that a missing shift or
-    // a missing round constant cannot pass.
+    // Narrowing add/sub: VADDHN/VSUBHN halve the element size -- eight 16-bit
+    // lanes in, eight 8-bit results out, each the high byte of the 16-bit sum
+    // (plus 0x80 in the rounding form). Values straddle zero and the rounding
+    // midpoint so that a missing shift or a missing round constant cannot pass.
     for (std::uint32_t i = 0; i < kSamples; ++i) {
         src_a[i] = static_cast<std::int16_t>((i % 2) ? 32767 : -32768);
         src_b[i] = static_cast<std::int16_t>((i % 5) * 9000 - 18000);
     }
-    const auto pack_pair = [](std::int16_t lo, std::int16_t hi) {
-        return (static_cast<std::uint32_t>(static_cast<std::uint16_t>(hi)) << 16) |
-               static_cast<std::uint16_t>(lo);
-    };
     const struct {
         const char* name;
         std::uint32_t entry;
@@ -199,24 +197,26 @@ SuiteReport RunJitSelftest() {
         {"neon.subhn_i16", GuestSym(generated::sym::neon_subhn_i16), true, false},
     };
     for (const auto& narrow : narrow_cases) {
-        std::memset(dst, 0, kSamples * sizeof(std::int16_t));
+        auto* dst_bytes = reinterpret_cast<std::int8_t*>(dst);
+        std::memset(dst_bytes, 0, kSamples);
         machine.Call(narrow.entry, {kBufferC, kBufferA, kBufferB, kSamples});
         bool narrow_ok = true;
-        for (std::uint32_t i = 0; i + 1 < kSamples && narrow_ok; i += 2) {
-            const std::uint32_t wide_n = pack_pair(src_a[i], src_a[i + 1]);
-            const std::uint32_t wide_m = pack_pair(src_b[i], src_b[i + 1]);
-            std::uint32_t sum = narrow.subtract ? wide_n - wide_m : wide_n + wide_m;
+        for (std::uint32_t i = 0; i < kSamples && narrow_ok; ++i) {
+            const int wide_n = src_a[i];
+            const int wide_m = src_b[i];
+            int sum = narrow.subtract ? wide_n - wide_m : wide_n + wide_m;
             if (narrow.round) {
-                sum += 0x8000u;
+                sum += 0x80;
             }
-            const auto want = static_cast<std::int16_t>(static_cast<std::uint16_t>(sum >> 16));
-            if (dst[i / 2] != want) {
+            const auto want = static_cast<std::int8_t>(static_cast<std::uint8_t>(sum >> 8));
+            if (dst_bytes[i] != want) {
                 narrow_ok = false;
-                report.Fail(narrow.name, Format("lane %u: got %d want %d", i / 2, dst[i / 2], want));
+                report.Fail(narrow.name,
+                            Format("lane %u: got %d want %d", i, dst_bytes[i], want));
             }
         }
         if (narrow_ok) {
-            report.Pass(narrow.name, Format("%u lanes", kSamples / 2));
+            report.Pass(narrow.name, Format("%u lanes", kSamples));
         }
     }
 
@@ -466,6 +466,135 @@ SuiteReport RunJitSelftest() {
                            variant.fastmem ? 1 : 0, variant.ticks ? 1 : 0, gib,
                            static_cast<unsigned long long>(probe.CallbackReads()),
                            static_cast<unsigned long long>(probe.CallbackWrites())));
+    }
+
+    // --- Cache invalidation ---------------------------------------------------
+    // The guest rewrites code at run time: Mono emits a method and flushes the
+    // range immediately. A flush has to reach every machine -- one that is idle,
+    // one that is executing right now, and one that is being destroyed while the
+    // flush is in flight -- and the flush runs on the thread that rewrote the
+    // code, not on the machine it is flushing.
+    {
+        constexpr std::uint32_t kFlushCode = kBufferC + 0x80000;
+        const std::uint32_t return_one[2] = {0xE3A00001u, 0xE12FFF1Eu};  // mov r0,#1; bx lr
+        const std::uint32_t return_two[2] = {0xE3A00002u, 0xE12FFF1Eu};  // mov r0,#2; bx lr
+
+        A32Machine flushed(arena);
+        flushed.SetSp(sp);
+        if (!flushed.LoadCode(kFlushCode, return_one, sizeof(return_one))) {
+            report.Fail("cacheflush.rewrite", "probe code could not be loaded");
+        } else {
+            const std::uint32_t before = flushed.Call(kFlushCode, {});
+            std::memcpy(arena.Ptr(kFlushCode), return_two, sizeof(return_two));
+            flushed.InvalidateCacheRange(kFlushCode, sizeof(return_two));
+            const std::uint32_t after = flushed.Call(kFlushCode, {});
+            report.Check("cacheflush.rewrite", before == 1 && after == 2,
+                         Format("before=%u after=%u", before, after));
+        }
+
+        // The flush comes from a different machine than the one that translated
+        // the block, which is the shape Mono has: one thread emits, others run.
+        A32Machine idle_probe(arena);
+        idle_probe.SetSp(sp);
+        if (!idle_probe.LoadCode(kFlushCode, return_one, sizeof(return_one))) {
+            report.Fail("cacheflush.other_machine", "probe code could not be loaded");
+        } else {
+            const std::uint32_t before = idle_probe.Call(kFlushCode, {});
+            std::memcpy(arena.Ptr(kFlushCode), return_two, sizeof(return_two));
+            flushed.InvalidateCacheRange(kFlushCode, sizeof(return_two));
+            const std::uint32_t after = idle_probe.Call(kFlushCode, {});
+            report.Check("cacheflush.other_machine", before == 1 && after == 2,
+                         Format("before=%u after=%u", before, after));
+        }
+
+        // A machine that was flushed while it sat in the pool: the queued range
+        // has to survive ResetForThread and be applied before the first block of
+        // the next thread on that slot runs.
+        {
+            A32Machine warm_probe(arena);
+            warm_probe.SetSp(sp);
+            if (!warm_probe.LoadCode(kFlushCode, return_one, sizeof(return_one))) {
+                report.Fail("cacheflush.warm", "probe code could not be loaded");
+            } else {
+                const std::uint32_t before = warm_probe.Call(kFlushCode, {});
+                std::memcpy(arena.Ptr(kFlushCode), return_two, sizeof(return_two));
+                flushed.InvalidateCacheRange(kFlushCode, sizeof(return_two));
+                warm_probe.ResetForThread();
+                warm_probe.SetSp(sp);
+                const std::uint32_t after = warm_probe.Call(kFlushCode, {});
+                report.Check("cacheflush.warm", before == 1 && after == 2,
+                             Format("before=%u after reuse=%u", before, after));
+            }
+        }
+
+        // A machine that is executing must not lose the flush: the range is
+        // queued and applied before the block it covers runs again.
+        {
+            std::atomic<bool> flushing{true};
+            std::thread flusher([&flushing, &flushed] {
+                while (flushing.load(std::memory_order_relaxed)) {
+                    // The flush goes through one machine and reaches the registry,
+                    // which is the shape Mono has: the thread that rewrote the code
+                    // is not the thread running it.
+                    flushed.InvalidateCacheRange(kCodeAddr, 0x1000);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            });
+            const std::uint32_t fib24 = machine.Call(GuestSym(generated::sym::fib), {24});
+            flushing.store(false, std::memory_order_relaxed);
+            flusher.join();
+            report.Check("cacheflush.running", fib24 == 46368,
+                         Format("fib(24)=%u while the range was flushed", fib24));
+        }
+
+        // Several threads flushing at once, against ranges no thread is running,
+        // so the test exercises the registry and the per-machine locks rather
+        // than re-translation. It passes only if no range is lost and nothing
+        // deadlocks.
+        {
+            std::atomic<bool> flushing{true};
+            std::atomic<std::uint32_t> done{0};
+            const auto flusher = [&flushing, &done, &flushed](std::uint32_t base) {
+                while (flushing.load(std::memory_order_relaxed)) {
+                    flushed.InvalidateCacheRange(base, 0x40);
+                    done.fetch_add(1, std::memory_order_relaxed);
+                }
+            };
+            std::thread first(flusher, kFlushCode);
+            std::thread second(flusher, kFlushCode + 0x40);
+            std::thread third(flusher, kFlushCode + 0x80);
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            flushing.store(false, std::memory_order_relaxed);
+            first.join();
+            second.join();
+            third.join();
+            report.Check("cacheflush.concurrent", done.load() > 0,
+                         Format("%u flushes from three threads, no deadlock",
+                                done.load()));
+        }
+
+        // Machines appearing and disappearing under a stream of flushes: the
+        // registry walk must never reach a machine that has already been
+        // destroyed.
+        {
+            std::atomic<bool> flooding{true};
+            const auto flood = [&flooding, &flushed] {
+                while (flooding.load(std::memory_order_relaxed)) {
+                    flushed.InvalidateCacheRange(kCodeAddr, 0x40);
+                }
+            };
+            std::thread first(flood);
+            std::thread second(flood);
+            for (int i = 0; i < 8; ++i) {
+                A32Machine transient(arena);
+                transient.SetSp(sp);
+            }
+            flooding.store(false, std::memory_order_relaxed);
+            first.join();
+            second.join();
+            report.Pass("cacheflush.destroy",
+                        "8 machines created and destroyed under two flush threads");
+        }
     }
 
     if (!machine.LastError().empty()) {

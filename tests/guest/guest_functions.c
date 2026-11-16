@@ -13,6 +13,7 @@
 typedef unsigned int u32;
 typedef unsigned short u16;
 typedef short s16;
+typedef signed char s8;
 
 #define GUEST_EXPORT __attribute__((noinline, used, visibility("default")))
 
@@ -65,26 +66,28 @@ GUEST_EXPORT void neon_qadd_i16(s16* dst, const s16* a, const s16* b, u32 count)
     guest_exit(0);
 }
 
-// Narrowing add/sub: the high halves of the double-width sums, eight inputs to
-// four outputs. The fork used to lack these encodings entirely, which halted a
-// Unity worker thread in the middle of its work.
-GUEST_EXPORT void neon_addhn_i16(s16* dst, const s16* a, const s16* b, u32 count) {
+// Narrowing add/sub: VADDHN/VSUBHN take eight 16-bit lanes and return eight
+// 8-bit halves of the 16-bit sums -- the element size halves, so the result is
+// a D register of bytes, not four halfwords. The fork used to lack these
+// encodings entirely, which halted a Unity worker thread in the middle of its
+// work.
+GUEST_EXPORT void neon_addhn_i16(s8* dst, const s16* a, const s16* b, u32 count) {
     for (u32 i = 0; i + 8 <= count; i += 8) {
-        vst1_s16(dst + i / 2, vaddhn_s16(vld1q_s16(a + i), vld1q_s16(b + i)));
+        vst1_s8(dst + i, vaddhn_s16(vld1q_s16(a + i), vld1q_s16(b + i)));
     }
     guest_exit(0);
 }
 
-GUEST_EXPORT void neon_raddhn_i16(s16* dst, const s16* a, const s16* b, u32 count) {
+GUEST_EXPORT void neon_raddhn_i16(s8* dst, const s16* a, const s16* b, u32 count) {
     for (u32 i = 0; i + 8 <= count; i += 8) {
-        vst1_s16(dst + i / 2, vraddhn_s16(vld1q_s16(a + i), vld1q_s16(b + i)));
+        vst1_s8(dst + i, vraddhn_s16(vld1q_s16(a + i), vld1q_s16(b + i)));
     }
     guest_exit(0);
 }
 
-GUEST_EXPORT void neon_subhn_i16(s16* dst, const s16* a, const s16* b, u32 count) {
+GUEST_EXPORT void neon_subhn_i16(s8* dst, const s16* a, const s16* b, u32 count) {
     for (u32 i = 0; i + 8 <= count; i += 8) {
-        vst1_s16(dst + i / 2, vsubhn_s16(vld1q_s16(a + i), vld1q_s16(b + i)));
+        vst1_s8(dst + i, vsubhn_s16(vld1q_s16(a + i), vld1q_s16(b + i)));
     }
     guest_exit(0);
 }

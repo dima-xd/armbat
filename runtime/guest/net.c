@@ -10,6 +10,7 @@
 
 #include <netdb.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -251,8 +252,12 @@ const char* gai_strerror(int error) {
 }
 
 // The IPv4-only entry point an older engine still calls. The answer is kept in
-// statics because that is the interface bionic exposes.
+// statics because that is the interface bionic exposes. Bionic holds a mutex
+// around the same block for the same reason: two engine threads resolving at
+// once would otherwise take turns overwriting each other's answer, and the
+// connection then goes to whichever host the other thread asked for.
 struct hostent* gethostbyname(const char* name) {
+    static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
     static struct hostent entry;
     static struct in_addr address;
     static char* aliases[1];
@@ -262,30 +267,35 @@ struct hostent* gethostbyname(const char* name) {
     if (name == NULL || name[0] == '\0') {
         return NULL;
     }
+
+    pthread_mutex_lock(&lock);
+    struct hostent* answer = NULL;
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
     struct addrinfo* result = NULL;
-    if (armbat_getaddrinfo(name, NULL, &hints, &result) != 0 || result == NULL) {
-        return NULL;
-    }
-    const struct sockaddr_in* found = (const struct sockaddr_in*)result->ai_addr;
-    address = found->sin_addr;
-    freeaddrinfo(result);
+    if (armbat_getaddrinfo(name, NULL, &hints, &result) == 0 && result != NULL) {
+        const struct sockaddr_in* found = (const struct sockaddr_in*)result->ai_addr;
+        if (found != NULL) {
+            address = found->sin_addr;
+        }
+        freeaddrinfo(result);
 
-    const unsigned long length = strlen(name);
-    if (length >= sizeof(name_buffer)) {
-        return NULL;
+        const unsigned long length = strlen(name);
+        if (found != NULL && length < sizeof(name_buffer)) {
+            memcpy(name_buffer, name, length + 1);
+            aliases[0] = NULL;
+            addresses[0] = (char*)&address;
+            addresses[1] = NULL;
+            entry.h_name = name_buffer;
+            entry.h_aliases = aliases;
+            entry.h_addrtype = AF_INET;
+            entry.h_length = 4;
+            entry.h_addr_list = addresses;
+            answer = &entry;
+        }
     }
-    memcpy(name_buffer, name, length + 1);
-    aliases[0] = NULL;
-    addresses[0] = (char*)&address;
-    addresses[1] = NULL;
-    entry.h_name = name_buffer;
-    entry.h_aliases = aliases;
-    entry.h_addrtype = AF_INET;
-    entry.h_length = 4;
-    entry.h_addr_list = addresses;
-    return &entry;
+    pthread_mutex_unlock(&lock);
+    return answer;
 }

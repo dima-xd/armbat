@@ -58,25 +58,12 @@ public:
     bool Extract(const std::string& name, const std::string& host_path,
                  std::string* error) const;
 
-    // Reads an archive asset the way AAssetManager does: a name without a
-    // leading slash is relative to assets/, and the archive root is not
-    // searched first. Applications ship their whole data tree there, so a
-    // lookup of "resource_packs/vanilla/manifest.json" means
-    // "assets/resource_packs/vanilla/manifest.json".
-    bool ReadAsset(const std::string& name, std::vector<std::uint8_t>* out,
-                   std::string* error) const;
-				   
     // Opens the APK itself for an uncompressed asset and returns the byte range
     // occupied by that entry. The returned descriptor is a new host descriptor
     // owned by the caller; compressed or encrypted entries cannot be exposed this
     // way and return -1, matching AAsset_openFileDescriptor semantics.
     int OpenAssetFileDescriptor(const std::string& name, std::uint64_t* start,
                                 std::uint64_t* length, std::string* error) const;
-
-    // Immediate children of an asset directory, the names
-    // AAssetDir_getNextFileName returns. The directory itself may be given with
-    // or without the assets/ prefix.
-    std::vector<std::string> ListAssets(const std::string& directory) const;
 
     // The entry with this name, or nullptr.
     const Entry* Find(const std::string& name) const;
@@ -141,10 +128,6 @@ private:
     std::uint64_t size_ = 0;
     std::vector<Entry> entries_;
     std::unordered_map<std::string, std::size_t> index_;
-    // Immediate children of every directory in the archive, sorted. Pack loading
-    // walks thousands of directories, and answering each walk with a scan of all
-    // entries was the second most expensive thing the loader did.
-    std::unordered_map<std::string, std::vector<std::string>> directories_;
 };
 
 }  // namespace armbat

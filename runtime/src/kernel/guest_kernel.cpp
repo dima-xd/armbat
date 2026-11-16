@@ -122,6 +122,9 @@ enum SyscallNumber : std::uint32_t {
     kSysWritev = 146,
     kSysPersonality = 136,
     kSysLlseek = 140,
+    // A file cached through a shared mapping is made durable by flushing the
+    // window, and without the call the guest's flush silently does nothing.
+    kSysMsync = 144,
     kSysSchedYield = 158,
     kSysNanosleep = 162,
     kSysPrctl = 172,
@@ -281,6 +284,31 @@ bool IsRegularFile(int fd) {
     return ::fstat(fd, &host) == 0 && S_ISREG(host.st_mode);
 }
 
+// signal(7): which signals end the process when nothing has been installed for
+// them. The ones left out stop it, continue it or are ignored, and a guest that
+// raises one of those is not asking for the process to go away -- libc and the
+// collectors raise SIGCHLD and SIGWINCH in passing all the time. SIGPIPE is
+// ignored on purpose: every Android process starts with it ignored (the
+// framework sets it before the application runs), and an application that writes
+// to a closed socket expects EPIPE, not death. Everything else, including the
+// real-time range, terminates.
+bool DefaultActionEndsProcess(int signal) {
+    switch (signal) {
+        case SIGCHLD:
+        case SIGCONT:
+        case SIGPIPE:
+        case SIGSTOP:
+        case SIGTSTP:
+        case SIGTTIN:
+        case SIGTTOU:
+        case SIGURG:
+        case SIGWINCH:
+            return false;
+        default:
+            return signal > 0 && signal < 65;
+    }
+}
+
 // `read` on a regular file answers the whole request unless it reaches the end of
 // the file. A guest is entitled to that: an application's files sit on ext4, but
 // the archive it reads its own data from sits on shared storage, where the
@@ -344,47 +372,19 @@ std::uint32_t MappedPrefix(const GuestArena& arena, std::uint32_t address,
     if (!arena.IsMapped(address, 1)) {
         return 0;
     }
-    const std::uint64_t room = arena.MappedEnd(address) - address;
+    // AccessibleEnd answers the start of the address's own page when that page
+    // is not writable -- a page the guest protected read-only, or one it never
+    // made accessible -- and that answer is below the address. Subtracting it
+    // from the address wraps into a span the size of the whole address space and
+    // hands the copy a length the guest never mapped, which is a host store into
+    // a page the guest made immutable.
+    const std::uint64_t end = arena.AccessibleEnd(address);
+    if (end <= address) {
+        return 0;
+    }
+    const std::uint64_t room = end - address;
     return static_cast<std::uint32_t>(
         std::min<std::uint64_t>(room, static_cast<std::uint64_t>(count)));
-}
-
-// read() as the host kernel would have answered it: fill the mapped prefix,
-// complete the request for a regular file, and report EFAULT only when the data
-// would have run past the mapping.
-std::int32_t ReadInto(int fd, GuestArena& arena, std::uint32_t buffer, std::uint32_t count) {
-    const std::uint32_t length = MappedPrefix(arena, buffer, count);
-    if (length == 0) {
-        return count == 0 ? 0 : -EFAULT;
-    }
-    const ssize_t result = IsRegularFile(fd) ? ReadFully(fd, arena.Ptr(buffer), length)
-                                             : ::read(fd, arena.Ptr(buffer), length);
-    if (result < 0) {
-        return -errno;
-    }
-    if (length != count && static_cast<std::uint32_t>(result) == length) {
-        return -EFAULT;
-    }
-    return ClampSize(result);
-}
-
-std::int32_t PreadInto(int fd, GuestArena& arena, std::uint32_t buffer, std::uint32_t count,
-                       std::uint64_t offset) {
-    const std::uint32_t length = MappedPrefix(arena, buffer, count);
-    if (length == 0) {
-        return count == 0 ? 0 : -EFAULT;
-    }
-    const ssize_t result =
-        IsRegularFile(fd)
-            ? PreadFully(fd, arena.Ptr(buffer), length, static_cast<off_t>(offset))
-            : ::pread(fd, arena.Ptr(buffer), length, static_cast<off_t>(offset));
-    if (result < 0) {
-        return -errno;
-    }
-    if (length != count && static_cast<std::uint32_t>(result) == length) {
-        return -EFAULT;
-    }
-    return ClampSize(result);
 }
 
 // The guest's 32-bit `struct epoll_event`: 4 bytes of events and an 8-byte
@@ -620,7 +620,81 @@ void FutexWaitEnd() {
     slot.tid.store(0, std::memory_order_release);
 }
 
+// A guest that hands the kernel a buffer it does not fully own is worth one
+// line: the kernel's Linux-faithful answer (a short count) hides the mistake
+// from the guest, and the caller then carries on with a buffer whose tail was
+// never written. Rate-limited: one broken call site repeats for every chunk of
+// the file it is reading.
+void NoteClampedRead(const char* name, int fd, std::uint32_t count, std::uint32_t mapped) {
+    static std::atomic<int> reported{0};
+    if (reported.fetch_add(1, std::memory_order_relaxed) >= 8) {
+        return;
+    }
+    ARMBAT_LOG_WARN("Armbat", "%s: fd=%d asked for %u bytes into a buffer with %u mapped",
+                    name, fd, count, mapped);
+}
+
 }  // namespace
+
+// read() as the host kernel would have answered it: fill the mapped prefix and
+// complete the request for a regular file. A buffer that runs into memory the
+// guest cannot be given answers with what was copied, not with an error -- that
+// is what Linux does (copy_to_user stops, the syscall returns the count it
+// managed, and EFAULT is left for a call that could copy nothing at all).
+std::int32_t GuestKernel::ReadInto(int fd, std::uint32_t buffer, std::uint32_t count) {
+    const std::uint32_t length = MappedPrefix(arena_, buffer, count);
+    if (length == 0) {
+        return count == 0 ? 0 : -EFAULT;
+    }
+    ssize_t result = 0;
+    if (IsRegularFile(fd)) {
+        // ReadFully takes several host reads whenever the storage answers short,
+        // and the file position is shared by every descriptor made from the same
+        // open file description. Holding the description for the whole request is
+        // what makes one guest read atomic: without it the other thread takes the
+        // bytes in between and both guests read a stream shifted by the other's
+        // read -- an asset bundle with a hole in the middle, or the same header
+        // twice, with nothing that looks like an error.
+        const DescriptionLock description = DescriptionOf(fd);
+        const std::lock_guard<std::mutex> held(*description);
+        result = ReadFully(fd, arena_.Ptr(buffer), length);
+    } else {
+        result = ::read(fd, arena_.Ptr(buffer), length);
+    }
+    if (result < 0) {
+        return -errno;
+    }
+    // Never EFAULT here. The bytes are read and the file position has already
+    // moved past them, so an error would lose them: a caller that retries resumes
+    // after the hole and parses a stream shifted by up to a whole request, which
+    // looks exactly like a corrupted asset and names nothing.
+    if (length != count) {
+        NoteClampedRead("read", fd, count, length);
+    }
+    return ClampSize(result);
+}
+
+std::int32_t GuestKernel::PreadInto(int fd, std::uint32_t buffer, std::uint32_t count,
+                                    std::uint64_t offset) {
+    const std::uint32_t length = MappedPrefix(arena_, buffer, count);
+    if (length == 0) {
+        return count == 0 ? 0 : -EFAULT;
+    }
+    // No description lock: pread never touches the shared file position, which is
+    // the whole reason a guest that reads from several threads uses it.
+    const ssize_t result =
+        IsRegularFile(fd)
+            ? PreadFully(fd, arena_.Ptr(buffer), length, static_cast<off_t>(offset))
+            : ::pread(fd, arena_.Ptr(buffer), length, static_cast<off_t>(offset));
+    if (result < 0) {
+        return -errno;
+    }
+    // Same answer as read(), even though a lost pread costs nothing but a repeat.
+    if (length != count) {
+        NoteClampedRead("pread", fd, count, length);
+    }
+    return ClampSize(result);
+}
 
 GuestKernel::GuestKernel(A32Machine& machine, GuestArena& arena, KernelConfig config)
     : machine_(machine),
@@ -733,12 +807,15 @@ std::string GuestKernel::ResolveGuestPath(std::string guest_path) {
     return guest_path;
 }
 
-void GuestKernel::TrackGuestFd(int fd) {
+void GuestKernel::TrackGuestFd(int fd, DescriptionLock description) {
     if (fd < 0) {
         return;
     }
+    if (description == nullptr) {
+        description = std::make_shared<std::mutex>();
+    }
     const std::lock_guard lock(fds_mutex_);
-    guest_fds_.insert(fd);
+    guest_fds_[fd] = std::move(description);
 }
 
 void GuestKernel::ForgetGuestFd(int fd) {
@@ -751,8 +828,38 @@ bool GuestKernel::IsGuestFd(int fd) const {
     return guest_fds_.count(fd) != 0;
 }
 
+GuestKernel::DescriptionLock GuestKernel::DescriptionOf(int fd) const {
+    const std::lock_guard lock(fds_mutex_);
+    const auto found = guest_fds_.find(fd);
+    if (found != guest_fds_.end()) {
+        return found->second;
+    }
+    // A descriptor the guest never opened through the container -- a standard
+    // stream, an inherited socket. It still needs a stable identity so two reads
+    // through it can be kept apart, but it must not appear in guest_fds_: that
+    // set is what the guest is allowed to close.
+    auto& fallback = fallback_descriptions_[fd];
+    if (fallback == nullptr) {
+        fallback = std::make_shared<std::mutex>();
+    }
+    return fallback;
+}
+
+// Only the caller is stopped here. The rest of the world belongs to whoever
+// reads ProcessExited(): a thread that halts its siblings from inside a syscall
+// can stop one that is holding the very lock the caller's unwind needs, and the
+// host is the one that has to end the session anyway.
+void GuestKernel::EndProcess(int code, int signal) {
+    bool expected = false;
+    if (exited_.compare_exchange_strong(expected, true, std::memory_order_relaxed)) {
+        exit_code_.store(code, std::memory_order_relaxed);
+        exit_signal_.store(signal, std::memory_order_relaxed);
+    }
+}
+
 std::string GuestKernel::RecentPaths() const {
     std::string text;
+    const std::lock_guard lock(paths_mutex_);
     for (const std::string& trace : path_traces_) {
         text += "\n  path: ";
         text += trace;
@@ -761,15 +868,79 @@ std::string GuestKernel::RecentPaths() const {
 }
 
 void GuestKernel::TracePath(const std::string& guest_path, const std::string& host_path,
-                            int result) {    if (path_traces_.size() >= 32) {
-        path_traces_.erase(path_traces_.begin());
+                            int result) {
+    const std::string trace =
+        guest_path + " -> " + host_path + " = " + std::to_string(result);
+    {
+        const std::lock_guard lock(paths_mutex_);
+        if (path_traces_.size() >= 32) {
+            path_traces_.erase(path_traces_.begin());
+        }
+        path_traces_.push_back(trace);
     }
-    path_traces_.push_back(guest_path + " -> " + host_path + " = " + std::to_string(result));
-    // TEMP: follows the Bricknet save path that ends in a null resource.
-    if (guest_path.find("bricknet") != std::string::npos ||
-        guest_path.find("saveDir") != std::string::npos) {
-        ARMBAT_LOG_INFO("Armbat", "path: %s -> %s = %d",
-                            guest_path.c_str(), host_path.c_str(), result);
+}
+// ---- module naming ---------------------------------------------------------
+
+void GuestKernel::NoteFileMapping(std::uint32_t base, std::uint32_t length, int fd,
+                                  bool executable) {
+    char origin[256] = "-";
+    char link[64];
+    std::snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+    const ssize_t read = ::readlink(link, origin, sizeof(origin) - 1);
+    if (read <= 0) {
+        return;
+    }
+    origin[read] = '\0';
+    if (std::strcmp(origin, "-") == 0) {
+        return;
+    }
+    if (executable) {
+        RegisterGuestModuleMapping(base, length, origin);
+        return;
+    }
+    const std::lock_guard lock(modules_mutex_);
+    // A candidate that is never made executable is never looked at again, so the
+    // list only has to be long enough for the libraries a launch maps. Dropping
+    // the oldest is safe: the report loses a name, not a frame.
+    constexpr std::size_t kPendingLimit = 256;
+    if (pending_modules_.size() >= kPendingLimit) {
+        pending_modules_.erase(pending_modules_.begin());
+    }
+    pending_modules_.push_back(PendingModule{base, length, origin});
+}
+
+void GuestKernel::PromoteExecutable(std::uint32_t address, std::uint32_t length) {
+    std::vector<PendingModule> promoted;
+    {
+        const std::lock_guard lock(modules_mutex_);
+        const std::uint32_t end = address + length;
+        for (auto it = pending_modules_.begin(); it != pending_modules_.end();) {
+            const std::uint32_t candidate_end = it->base + it->length;
+            if (candidate_end <= address || it->base >= end) {
+                ++it;
+                continue;
+            }
+            promoted.push_back(*it);
+            it = pending_modules_.erase(it);
+        }
+    }
+    // The whole mapping is named, not just the executable slice: the base is
+    // what makes a pc inside the image read as an offset into that file.
+    for (const PendingModule& module : promoted) {
+        RegisterGuestModuleMapping(module.base, module.length, module.path);
+    }
+}
+
+void GuestKernel::ForgetPendingModules(std::uint32_t address, std::uint32_t length) {
+    const std::uint32_t end = address + length;
+    const std::lock_guard lock(modules_mutex_);
+    for (auto it = pending_modules_.begin(); it != pending_modules_.end();) {
+        const std::uint32_t candidate_end = it->base + it->length;
+        if (candidate_end <= address || it->base >= end) {
+            ++it;
+            continue;
+        }
+        it = pending_modules_.erase(it);
     }
 }
 
@@ -907,7 +1078,7 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
         const int fd = static_cast<int>(args[0]);
         const std::uint32_t buffer = args[1];
         const std::uint32_t count = std::min<std::uint32_t>(args[2], INT32_MAX);
-        return ReadInto(fd, arena_, buffer, count);
+        return ReadInto(fd, buffer, count);
     }
 
     case kSysWrite: {
@@ -947,7 +1118,6 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
         }
         std::size_t total = 0;
         std::vector<std::uint32_t> lengths(guest_vectors.size(), 0);
-        bool clamped = false;
         for (std::size_t index = 0; index < guest_vectors.size(); ++index) {
             const GuestIoVec& vector = guest_vectors[index];
             if (number == kSysWritev) {
@@ -957,12 +1127,16 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
                 lengths[index] = vector.length;
             } else {
                 // A read only fails where the data really reaches the unmapped
-                // tail, the same rule as read() itself.
+                // tail, the same rule as read() itself. Nothing is consumed
+                // before that check: an unmapped vector answers EFAULT without
+                // moving the file position, so the error costs the guest nothing.
                 lengths[index] = MappedPrefix(arena_, vector.base, vector.length);
                 if (lengths[index] == 0 && vector.length != 0) {
                     return -EFAULT;
                 }
-                clamped = clamped || lengths[index] != vector.length;
+                if (lengths[index] != vector.length) {
+                    NoteClampedRead("readv", fd, vector.length, lengths[index]);
+                }
             }
             total += lengths[index];
         }
@@ -985,12 +1159,26 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
             const ssize_t result = ::write(fd, buffer.data(), buffer.size());
             return result < 0 ? -errno : ClampSize(result);
         }
-        const ssize_t result = IsRegularFile(fd) ? ReadFully(fd, buffer.data(), buffer.size())
-                                                 : ::read(fd, buffer.data(), buffer.size());
+        ssize_t result = 0;
+        if (IsRegularFile(fd)) {
+            // Same rule as read(): the vector is completed with several host
+            // reads, so the description is held for the whole request.
+            const DescriptionLock description = DescriptionOf(fd);
+            const std::lock_guard<std::mutex> held(*description);
+            result = ReadFully(fd, buffer.data(), buffer.size());
+        } else {
+            result = ::read(fd, buffer.data(), buffer.size());
+        }
         if (result < 0) {
             return -errno;
         }
         for (std::size_t index = 0; index < guest_vectors.size(); ++index) {
+            if (lengths[index] == 0) {
+                // An empty iovec is skipped, not a stop. Linux walks the whole
+                // vector, and stopping here left every later buffer empty while
+                // the count still said it had been filled.
+                continue;
+            }
             const std::size_t chunk =
                 std::min<std::size_t>(lengths[index],
                                       static_cast<std::size_t>(result) - offset);
@@ -1000,9 +1188,8 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
             std::memcpy(arena_.Ptr(guest_vectors[index].base), buffer.data() + offset, chunk);
             offset += chunk;
         }
-        if (clamped && static_cast<std::size_t>(result) == total && total != 0) {
-            return -EFAULT;
-        }
+        // No EFAULT on the way out, for the reason read() has none: the bytes are
+        // already read and the position has moved past them.
         return ClampSize(result);
     }
 
@@ -1018,7 +1205,7 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
         // (garbage << 0), which happily returns zero bytes at end of file.
         const std::uint64_t offset = Split64(args[4], args[5]);
         if (number == kSysPread64) {
-            return PreadInto(fd, arena_, buffer, count, offset);
+            return PreadInto(fd, buffer, count, offset);
         }
         if (count != 0 && !arena_.IsMapped(buffer, count)) {
             return -EFAULT;
@@ -1099,7 +1286,16 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
         if (!arena_.IsMapped(result_pointer, 8)) {
             return -EFAULT;
         }
-        const off_t result = ::lseek(fd, static_cast<off_t>(offset), whence);
+        off_t result = 0;
+        {
+            // Moving the position while another thread is halfway through a
+            // completed regular-file read would send the rest of that read to the
+            // new offset. Linux moves a position one syscall at a time; so does
+            // this.
+            const DescriptionLock description = DescriptionOf(fd);
+            const std::lock_guard<std::mutex> held(*description);
+            result = ::lseek(fd, static_cast<off_t>(offset), whence);
+        }
         if (result < 0) {
             return -errno;
         }
@@ -1109,9 +1305,14 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
     }
 
     case kSysLseek: {
-        const off_t result = ::lseek(static_cast<int>(args[0]),
-                                     static_cast<off_t>(static_cast<std::int32_t>(args[1])),
-                                     static_cast<int>(args[2]));
+        const int fd = static_cast<int>(args[0]);
+        off_t result = 0;
+        {
+            const DescriptionLock description = DescriptionOf(fd);
+            const std::lock_guard<std::mutex> held(*description);
+            result = ::lseek(fd, static_cast<off_t>(static_cast<std::int32_t>(args[1])),
+                             static_cast<int>(args[2]));
+        }
         return result < 0 ? -errno : static_cast<std::int32_t>(result);
     }
 
@@ -1313,12 +1514,16 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
             return -EFAULT;
         }
         const std::string host_path = MapPath(path);
-        const std::uint64_t length = Split64(args[1], args[2]);
+        // ARM EABI keeps a 64-bit argument in an even register pair, so after
+        // the path the length occupies r2:r3 and r1 is padding. bionic's
+        // truncate64 stub hands its registers to the kernel untouched.
+        const std::uint64_t length = Split64(args[2], args[3]);
         return ::truncate(host_path.c_str(), static_cast<off_t>(length)) == 0 ? 0 : -errno;
     }
 
     case kSysFtruncate64: {
-        const std::uint64_t length = Split64(args[1], args[2]);
+        // ftruncate64(fd, off64_t): the same even-pair rule, length in r2:r3.
+        const std::uint64_t length = Split64(args[2], args[3]);
         return ::ftruncate(static_cast<int>(args[0]), static_cast<off_t>(length)) == 0 ? 0
                                                                                         : -errno;
     }
@@ -1438,25 +1643,30 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
         std::int32_t error = 0;
         const std::uint32_t mapped = memory_.Map(args[0], args[1], static_cast<int>(args[3]),
                                                  static_cast<int>(args[4]), args[5], &error);
-        if (args[1] >= 0x40000) {
-            char origin[256] = "-";
-            if (static_cast<std::int32_t>(args[4]) >= 0) {
-                char link[64];
-                std::snprintf(link, sizeof(link), "/proc/self/fd/%d", static_cast<int>(args[4]));
-                const ssize_t read = ::readlink(link, origin, sizeof(origin) - 1);
-                if (read > 0) {
-                    origin[read] = '\0';
-                }
-            }
-            static std::atomic<unsigned> reported{0};
-            if (reported.fetch_add(1, std::memory_order_relaxed) < 24) {
-                ARMBAT_LOG_INFO("Armbat",
-                                    "mmap: length=0x%08x at=0x%08x offset=0x%08x file=%s", args[1],
-                                    mapped != 0 ? mapped : static_cast<std::uint32_t>(error), args[5],
-                                    origin);
-            }
-            if (mapped != 0 && std::strcmp(origin, "-") != 0) {
-                RegisterGuestModuleMapping(mapped, args[1], origin);
+        // A file mapping is not a module just because it came from a file: the
+        // linker maps a library's segments read-write and only makes them
+        // executable afterwards, while a font or a texture is a file mapping
+        // that never becomes one. Registering on the mapping alone put fonts in
+        // the fault report as modules, and every stack word inside one -- a
+        // pixel, a glyph index -- then read as a return address.
+        if (mapped != 0 && static_cast<std::int32_t>(args[4]) >= 0) {
+            NoteFileMapping(mapped, args[1], static_cast<int>(args[4]),
+                            (static_cast<std::uint32_t>(args[2]) & 0x4u) != 0);
+        }
+        // A guest states the protection it wants with every mapping, and bionic
+        // leans on PROT_NONE: a thread stack is one inaccessible mapping whose
+        // upper part is made writable right after, so the lowest page stays a
+        // guard. Mapping the whole range writable throws that guard away, and a
+        // thread that runs off the bottom of its stack then writes into whatever
+        // the neighbour happens to be -- silently, because nothing faults and
+        // nothing is logged, while the neighbour's data turns into garbage.
+        // Only "no access at all" is taken as protection: the container's copy
+        // is private, so a read-only request has nothing to keep the guest away
+        // from that the guest itself did not already write.
+        if (mapped != 0 && (args[2] & 7u) == 0) {
+            if (!arena_.Protect(mapped, args[1], 0)) {
+                memory_.Unmap(mapped, args[1]);
+                return -ENOMEM;
             }
         }
         return mapped != 0 ? static_cast<std::int32_t>(mapped) : error;
@@ -1464,9 +1674,13 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
 
     case kSysMunmap:
         if (memory_.Unmap(args[0], args[1])) {
+            ForgetPendingModules(args[0], args[1]);
             armbat::UnregisterGuestMappings(args[0], args[1]);
             return 0;
         }        return -EINVAL;
+
+    case kSysMsync:
+        return memory_.Sync(args[0], args[1], static_cast<int>(args[2]));
 
     case kSysMprotect: {
         if (args[1] == 0) {
@@ -1474,16 +1688,22 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
         }
         const std::uint32_t address = args[0] & ~0xfffu;
         const std::uint32_t length = (args[1] + (args[0] & 0xfff) + 0xfff) & ~0xfffu;
-        if (!arena_.IsMapped(address, length)) {
+        const bool ok = arena_.Protect(address, length, static_cast<int>(args[2]));
+        if (!ok) {
             return -ENOMEM;
         }
-        // The arena is always committed read/write; the JIT fetches code through
-        // callbacks, so protection is advisory and only has to be accepted.
+        // This is the moment a file mapping becomes code: the linker maps the
+        // segments writable and grants execute afterwards.
+        if ((static_cast<std::uint32_t>(args[2]) & 0x4u) != 0) {
+            PromoteExecutable(address, length);
+        }
         return 0;
     }
 
-    case kSysBrk:
-        return static_cast<std::int32_t>(memory_.Break(args[0]));
+    case kSysBrk: {
+        const std::uint32_t broke = memory_.Break(args[0]);
+        return static_cast<std::int32_t>(broke);
+    }
 
     case kSysClockGettime: {
         const std::uint32_t buffer = args[1];
@@ -1597,7 +1817,7 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
         const int base_operation = operation & 0x7f;
         const bool waiting =
             base_operation == FUTEX_WAIT || base_operation == FUTEX_WAIT_BITSET;
-        if (waiting && timeout_pointer == nullptr) {
+        if (waiting) {
             // An untimed wait is the one place where a signal aimed at this
             // thread can be lost: the machine ran its safe point before the
             // syscall, so a signal that arrives in between is pending while the
@@ -1605,39 +1825,119 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
             // park waits forever. Wake every slice and look again; a spurious
             // wakeup is something every futex caller already has to handle.
             A32Machine& parked = CallingMachine(machine_);
-            FutexWaitBegin(address, static_cast<std::int32_t>(value), operation, parked);
+            const bool timed = timeout_pointer != nullptr;
+            if (!timed) {
+                FutexWaitBegin(address, static_cast<std::int32_t>(value), operation, parked);
+            }
             const std::uint32_t bitset =
                 base_operation == FUTEX_WAIT_BITSET ? args[5] : 0xffffffffu;
             // Only the private flag is carried over: the deadline below is ours
             // and is always CLOCK_MONOTONIC, so FUTEX_CLOCK_REALTIME must not.
             const int private_flag = operation & FUTEX_PRIVATE_FLAG;
-            std::int32_t outcome = 0;
-            for (;;) {
-                if (parked.HasPendingSignal()) {
-                    outcome = -EINTR;
-                    break;
+            // A timed wait becomes an absolute CLOCK_MONOTONIC deadline here, so
+            // that a wait restarted after a signal keeps the time it has left.
+            // FUTEX_WAIT counts from now, FUTEX_WAIT_BITSET names an absolute
+            // time, and a realtime deadline has to be rebased because the sleep
+            // below runs on the monotonic clock.
+            timespec deadline{};
+            if (timed) {
+                const bool absolute = base_operation == FUTEX_WAIT_BITSET;
+                const bool realtime = absolute && (operation & FUTEX_CLOCK_REALTIME) != 0;
+                timespec now{};
+                timespec mono_now{};
+                ::clock_gettime(CLOCK_MONOTONIC, &mono_now);
+                if (realtime) {
+                    ::clock_gettime(CLOCK_REALTIME, &now);
+                    deadline.tv_sec = mono_now.tv_sec + (timeout.tv_sec - now.tv_sec);
+                    deadline.tv_nsec = mono_now.tv_nsec + (timeout.tv_nsec - now.tv_nsec);
+                } else if (absolute) {
+                    deadline = timeout;
+                } else {
+                    deadline.tv_sec = mono_now.tv_sec + timeout.tv_sec;
+                    deadline.tv_nsec = mono_now.tv_nsec + timeout.tv_nsec;
                 }
-                timespec deadline{};
-                ::clock_gettime(CLOCK_MONOTONIC, &deadline);
-                deadline.tv_nsec += kFutexSliceNanoseconds;
-                if (deadline.tv_nsec >= 1000000000L) {
+                while (deadline.tv_nsec >= 1000000000L) {
                     deadline.tv_sec += 1;
                     deadline.tv_nsec -= 1000000000L;
                 }
+                while (deadline.tv_nsec < 0) {
+                    deadline.tv_sec -= 1;
+                    deadline.tv_nsec += 1000000000L;
+                }
+            }
+            std::int32_t outcome = 0;
+            bool was_parked = false;
+            for (;;) {
+                // Only a signal that arrives while the thread is parked may end
+                // the wait: one that was already pending is delivered at the
+                // next safe point and the Linux syscall blocks regardless. A
+                // pre-emptive EINTR invents an interruption that the guest never
+                // got, and a caller that treats any return from FUTEX_WAIT as a
+                // wakeup -- libunity's semaphore does exactly that -- then walks
+                // on with the state it was waiting for still unset. The waking
+                // signal itself is sent by SendGuestSignal, so a thread that is
+                // really asleep still returns here through the EINTR below.
+                if (was_parked && parked.HasPendingSignal()) {
+                    // Linux runs the handler and then restarts a wait whose
+                    // action carries SA_RESTART; only a handler without it makes
+                    // the caller see EINTR. Answering EINTR to a restarted wait
+                    // ends libunity's semaphore early -- it treats any return
+                    // from FUTEX_WAIT as "the load finished" -- and the engine
+                    // then parses an asset bundle that is still being decoded
+                    // and reports it as not a valid bundle. The handler is run
+                    // here as a nested guest call, the same way the safe point
+                    // after a blocking syscall runs it.
+                    const std::uint64_t deliverable = parked.PendingSignals();
+                    if (GuestSignalsRestart(deliverable)) {
+                        parked.RunSafePoint();
+                        continue;
+                    }
+                    outcome = -EINTR;
+                    break;
+                }
+                timespec wait_deadline{};
+                if (timed) {
+                    timespec now{};
+                    ::clock_gettime(CLOCK_MONOTONIC, &now);
+                    if (now.tv_sec > deadline.tv_sec ||
+                        (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec)) {
+                        outcome = -ETIMEDOUT;
+                        break;
+                    }
+                    wait_deadline = deadline;
+                } else {
+                    ::clock_gettime(CLOCK_MONOTONIC, &wait_deadline);
+                    wait_deadline.tv_nsec += kFutexSliceNanoseconds;
+                    if (wait_deadline.tv_nsec >= 1000000000L) {
+                        wait_deadline.tv_sec += 1;
+                        wait_deadline.tv_nsec -= 1000000000L;
+                    }
+                }
                 const long slice = ::syscall(SYS_futex, target,
-                                             FUTEX_WAIT_BITSET | private_flag, value, &deadline,
-                                             nullptr, bitset);
+                                             FUTEX_WAIT_BITSET | private_flag, value,
+                                             &wait_deadline, nullptr, bitset);
+                was_parked = true;
                 if (slice == 0) {
                     outcome = 0;
                     break;
                 }
+                // ETIMEDOUT is either the slice that keeps an untimed wait
+                // responsive or the call's own deadline; the check above answers
+                // the guest's wait either way. EINTR is a signal that arrived
+                // while parked, and only the check at the top of the loop may
+                // turn it into a return: a timed wait that answered the signal
+                // itself used to end libunity's semaphore early, and the engine
+                // then parsed a bundle that was still being decoded and reported
+                // it as not a valid bundle.
                 if (errno == ETIMEDOUT || errno == EINTR) {
                     continue;
                 }
                 outcome = -errno;
                 break;
             }
-            FutexWaitEnd();
+            if (!timed) {
+                FutexWaitEnd();
+            }
             return outcome;
         }
         const long result =
@@ -2181,8 +2481,19 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
             }
         }
         std::vector<char> control;
-        if (!BuildHostControl(arena_, guest.control, guest.control_length, control)) {
-            return -EFAULT;
+        if (sending) {
+            if (!BuildHostControl(arena_, guest.control, guest.control_length, control)) {
+                return -EFAULT;
+            }
+        } else if (guest.control != 0 && guest.control_length != 0) {
+            // A receive writes the control buffer, so the guest's bytes are a
+            // capacity, not data to translate. Host cmsg framing is wider than
+            // the guest's, and a set that fits the guest's buffer must not be
+            // truncated host-side first, hence the extra room.
+            if (!arena_.IsMapped(guest.control, guest.control_length)) {
+                return -EFAULT;
+            }
+            control.assign(static_cast<std::size_t>(guest.control_length) * 2 + 32, 0);
         }
 
         msghdr host{};
@@ -2280,14 +2591,22 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
             // a dropped signal is not a missing feature: it is a hang.
             return SendGuestSignal(target, signal) ? 0 : -ESRCH;
         }
-        // No handler installed: the default action is not emulated, and the
-        // signal is dropped as it always was. A fatal one still leaves the only
-        // record of why the thread gave up.
-        if (signal == SIGABRT || signal == SIGSEGV || signal == SIGILL || signal == SIGBUS ||
-            signal == SIGFPE) {
+        // No handler installed, so the default action decides. Linux ends the
+        // process for every signal whose default is "terminate", and a guest
+        // that raises one at itself -- abort(), raise(), std::terminate() --
+        // counts on that: bionic's abort() is a raise(SIGABRT) followed by
+        // exit_group(1) on the assumption that the first one never returns.
+        // Dropping it resumes the code that just declared itself unrecoverable,
+        // and the archive keeps running on a runtime that no longer exists: it
+        // renders, answers nothing and never finishes the load that was in
+        // flight.
+        if (!DefaultActionEndsProcess(signal)) {
+            return 0;
+        }
+        {
             A32Machine& caller = CallingMachine(machine_);
             ARMBAT_LOG_WARN("Armbat",
-                                "signal: guest raised %d at %s (tid=%u, not delivered)", signal,
+                                "signal: guest raised %d at %s (tid=%u, process ends)", signal,
                                 armbat::DescribeGuestAddress(caller.Reg(15)).c_str(),
                                 static_cast<unsigned>(::gettid()));
             // The frames of an aborting thread are the only record of where it
@@ -2316,6 +2635,8 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
                                     words[5], words[6], words[7]);
             }
         }
+        EndProcess(0, signal);
+        t_halt_requested = true;
         return 0;
     }
 
@@ -2390,7 +2711,9 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
     case kSysDup: {
         const int result = ::dup(static_cast<int>(args[0]));
         if (result >= 0) {
-            TrackGuestFd(result);
+            // The new descriptor stands on the same open file description, so it
+            // shares the file position and the lock that protects it.
+            TrackGuestFd(result, DescriptionOf(static_cast<int>(args[0])));
         }
         return result < 0 ? -errno : result;
     }
@@ -2400,7 +2723,9 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
     // the container, except for the standard streams every program may redirect.
     case kSysDup2:
     case kSysDup3: {
+        const int source = static_cast<int>(args[0]);
         const int target = static_cast<int>(args[1]);
+        const DescriptionLock description = DescriptionOf(source);
         if (target < 0) {
             return -EBADF;
         }
@@ -2411,13 +2736,12 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
             ForgetGuestFd(target);
         }
         const int result = number == kSysDup2
-                               ? ::dup2(static_cast<int>(args[0]), target)
-                               : ::dup3(static_cast<int>(args[0]), target,
-                                        static_cast<int>(args[2]));
+                               ? ::dup2(source, target)
+                               : ::dup3(source, target, static_cast<int>(args[2]));
         if (result < 0) {
             return -errno;
         }
-        TrackGuestFd(result);
+        TrackGuestFd(result, description);
         return 0;
     }
 
@@ -2523,9 +2847,10 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
             return -errno;
         }
         // A duplicated descriptor is a new guest descriptor, and one the guest
-        // never learns about cannot be closed.
+        // never learns about cannot be closed. It is the same open file
+        // description as the original, though, so it shares the position lock.
         if (command == F_DUPFD || command == F_DUPFD_CLOEXEC) {
-            TrackGuestFd(result);
+            TrackGuestFd(result, DescriptionOf(fd));
         }
         return result;
     }
@@ -2584,12 +2909,33 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
             return 0;
         }
         default:
+            // The random driver answers "how many bits of entropy are left"
+            // through a pointer. bionic's getentropy() opens /dev/urandom,
+            // fstat()s it for S_IFCHR, asks that question and treats a failure
+            // as "no entropy at all", so arc4random() raise(SIGKILL)s -- the
+            // linker did exactly this on every single launch. Forward the
+            // request with a host buffer and copy the answer into the arena.
+            if (((request >> 8) & 0xFF) == 0x52 && ((request >> 30) & 0x3) == 2 &&
+                ((request >> 16) & 0x3FFF) == sizeof(int)) {
+                if (!arena_.IsMapped(argument, sizeof(int))) {
+                    return -EFAULT;
+                }
+                int value = 0;
+                if (::ioctl(fd, static_cast<unsigned long>(request), &value) != 0) {
+                    return -errno;
+                }
+                std::memcpy(arena_.Ptr(argument), &value, sizeof(value));
+                return 0;
+            }
             return -ENOTTY;
         }
     }
 
     case kSysFtruncate: {
-        const std::uint64_t length = Split64(args[1], args[2]);
+        // The 32-bit call takes an `unsigned long` length in r1. bionic's
+        // `ftruncate` sign-extends it and jumps straight to the 64-bit
+        // variant, so this number only sees guests built against an older libc.
+        const std::uint32_t length = args[1];
         return ::ftruncate(static_cast<int>(args[0]), static_cast<off_t>(length)) == 0 ? 0
                                                                                        : -errno;
     }
@@ -2826,8 +3172,11 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
         if (result < 0) {
             return -errno;
         }
-        if (length != requested && static_cast<std::uint32_t>(result) == length) {
-            return -EFAULT;
+        if (length != requested) {
+            // Same rule as read(): the entries are already consumed and the
+            // directory position has moved past them, so an error here would skip
+            // them on the next call. Answer with what it packed.
+            NoteClampedRead("getdents64", fd, requested, length);
         }
         return ClampSize(result);
     }
@@ -2835,7 +3184,16 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
     case kSysStatfs64:
     case kSysFstatfs64: {
         const bool from_fd = number == kSysFstatfs64;
-        const std::uint32_t buffer = args[1];
+        // bionic calls the kernel as statfs64(path, sizeof(struct statfs64),
+        // buf), so the size is in r1 and the buffer in r2. Reading r1 as the
+        // buffer asked the arena about address 0x58 and every call came back
+        // EFAULT. The kernel rejects a size it does not know for the same
+        // reason: the layout it writes has to match the caller's.
+        const std::uint32_t buffer_size = args[1];
+        const std::uint32_t buffer = args[2];
+        if (buffer_size != sizeof(GuestStatfs)) {
+            return -EINVAL;
+        }
         if (!arena_.IsMapped(buffer, sizeof(GuestStatfs))) {
             return -EFAULT;
         }
@@ -2993,14 +3351,13 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
             t_halt_requested = true;
             return 0;
         }
-        // exit_group asks for the whole process to end, and finding it in a log
-        // is the only way to tell "the archive quit by itself" from "it stopped
-        // rendering": a game that reaches Application.Quit() or aborts asks for
-        // this and then leaves a window with the last frame on screen. The
+        // exit_group asks for the whole process to end: Application.Quit(),
+        // abort() after Mono's unhandled-exception path, a native _exit(). The
         // request is recorded here; what it means for the process is decided by
         // the container, not by the kernel.
         ARMBAT_LOG_INFO("Armbat", "exit group: tid=%u code=%u frames:%s",
                             static_cast<unsigned>(::gettid()), args[0], frames.c_str());
+        EndProcess(static_cast<int>(args[0]), 0);
         t_halt_requested = true;
         return 0;
     }

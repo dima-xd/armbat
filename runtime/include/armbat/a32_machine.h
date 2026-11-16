@@ -114,6 +114,10 @@ public:
     // stop-the-world collector is a thread that blocks everything, acks, and
     // then waits for the resume signal to become deliverable inside sigsuspend.
     std::uint64_t BlockedSignals() const;
+    // The queued set minus the blocked one: the signals a delivery would run
+    // right now. A wait that is parked when one of them arrives has to decide
+    // whether the guest's action asks for the wait to be restarted.
+    std::uint64_t PendingSignals() const;
     void SetBlockedSignals(std::uint64_t mask);
 
     // Monotonic counter that RequestSignal bumps. A thread that suspends on a
@@ -136,6 +140,16 @@ public:
     std::uint32_t EnterClonedThread(const std::array<std::uint32_t, 16>& regs,
                                     std::uint32_t entry, std::uint32_t sp, std::uint32_t tls,
                                     bool thumb);
+
+    // Prepares a machine whose guest thread has exited to run another one. The
+    // translated code is kept on purpose: a thread that lives for a few
+    // milliseconds spends nearly all of that time translating the same library
+    // code the thread before it already translated, and a Unity worker pool
+    // hands the same processor slot from one short-lived thread to the next.
+    // Everything a thread leaves behind -- register file, halt flags, nesting
+    // depth, queued signals -- is dropped, so the next thread starts as if the
+    // machine had just been built.
+    void ResetForThread();
 
     // Instruction set of the code that is running now. A cloned thread resumes
     // in the same one, so clone() has to tell the caller.
@@ -191,6 +205,7 @@ public:
     // kept, which turns a raw stack dump into a call chain.
     std::vector<std::uint32_t> GuestReturnAddresses(std::uint32_t sp,
                                                     std::uint32_t scan_bytes) const;
+
     void SetReg(std::size_t index, std::uint32_t value);
 
     // Reads one guest word, for diagnostics that run when the machine is stopped.

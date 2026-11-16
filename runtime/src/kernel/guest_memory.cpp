@@ -10,6 +10,8 @@
 #include <unistd.h>
 
 #include "armbat/guest_arena.h"
+#include "armbat/jni_bridge.h"
+#include "armbat/log.h"
 
 namespace armbat {
 namespace {
@@ -37,6 +39,12 @@ std::uint64_t PageUp(std::uint64_t value) { return (value + kPageSize - 1) & ~(k
 
 }  // namespace
 
+GuestMemory::FileHandle::~FileHandle() {
+    if (fd >= 0) {
+        ::close(fd);
+    }
+}
+
 GuestMemory::GuestMemory(GuestArena& arena, std::uint32_t map_start, std::uint32_t map_limit,
                          std::uint32_t brk_base, std::uint32_t brk_limit)
     : arena_(arena),
@@ -58,12 +66,7 @@ bool GuestMemory::Overlaps(std::uint64_t start, std::uint64_t end) const {
 }
 
 bool GuestMemory::AnyMapped(std::uint64_t start, std::uint64_t end) const {
-    for (std::uint64_t page = start; page < end; page += kPageSize) {
-        if (arena_.IsMapped(static_cast<std::uint32_t>(page), kPageSize)) {
-            return true;
-        }
-    }
-    return false;
+    return arena_.AnyMapped(static_cast<std::uint32_t>(start), end - start);
 }
 
 // True when part of [start, end) is committed in the arena by someone other
@@ -89,7 +92,9 @@ bool GuestMemory::HasForeignMapping(std::uint64_t start, std::uint64_t end) cons
 }
 
 // Removes [start, end) from the table, keeping what sticks out on either side.
-void GuestMemory::Carve(std::uint64_t start, std::uint64_t end, std::vector<Range>* removed) {
+// A shared file mapping is carried into the pieces: the file offset follows the
+// address, so the tail that survives a carve still names the right file byte.
+void GuestMemory::Carve(std::uint64_t start, std::uint64_t end, std::vector<Piece>* removed) {
     auto it = live_.upper_bound(start);
     if (it != live_.begin()) {
         --it;
@@ -103,13 +108,21 @@ void GuestMemory::Carve(std::uint64_t start, std::uint64_t end, std::vector<Rang
         }
         it = live_.erase(it);
         if (segment_start < start) {
-            live_.emplace(segment_start, Segment{start, segment.anonymous});
+            Segment head = segment;
+            head.end = start;
+            live_.emplace(segment_start, head);
         }
         if (segment.end > end) {
-            live_.emplace(end, Segment{segment.end, segment.anonymous});
+            Segment tail = segment;
+            tail.file_offset += end - segment_start;
+            live_.emplace(end, tail);
         }
         if (removed != nullptr) {
-            removed->push_back({std::max(segment_start, start), std::min(segment.end, end)});
+            const std::uint64_t piece_start = std::max(segment_start, start);
+            const std::uint64_t piece_end = std::min(segment.end, end);
+            Segment piece = segment;
+            piece.file_offset += piece_start - segment_start;
+            removed->push_back({piece_start, piece_end, segment_start, piece});
         }
     }
 }
@@ -165,6 +178,108 @@ void GuestMemory::PurgeToZero(std::uint64_t start, std::uint64_t length) {
     std::memset(base, 0, static_cast<std::size_t>(length));
 }
 
+// ---- shared file mappings ---------------------------------------------------
+
+// A shared mapping is a window onto the file, so a guest that fills a buffer
+// through one expects the bytes in the file without calling anything else: an
+// engine that caches a downloaded bundle exactly this way (open, ftruncate,
+// mmap MAP_SHARED, memcpy) re-reads a file of zeros on the next launch, and the
+// only symptom is "not a valid asset bundle". There is no page-fault path here
+// to notice a dirty page, so the whole piece goes back on munmap and on msync.
+// The cost is a write of pages that were never touched, which is what Linux
+// would have written anyway had the guest dirtied them.
+void GuestMemory::Flush(const Piece& piece) {
+    if (!piece.segment.shared || piece.segment.file == nullptr ||
+        piece.segment.file->fd < 0) {
+        return;
+    }
+    const int fd = piece.segment.file->fd;
+    std::uint64_t cursor = piece.start;
+    while (cursor < piece.end) {
+        // The guest may have closed the window to itself with mprotect, and the
+        // host cannot read a page the guest made inaccessible: the copy would
+        // fault here instead of in the guest. Such pages are skipped -- their
+        // contents are the guest's own copy of the file, which it chose not to
+        // reach any more.
+        const std::uint64_t accessible =
+            arena_.AccessibleEnd(static_cast<std::uint32_t>(cursor));
+        if (accessible <= cursor) {
+            cursor = std::min<std::uint64_t>(piece.end, PageUp(cursor + 1));
+            continue;
+        }
+        const std::uint64_t chunk_end = std::min<std::uint64_t>(piece.end, accessible);
+        const off_t offset = static_cast<off_t>(piece.segment.file_offset) +
+                             static_cast<off_t>(cursor - piece.start);
+        std::uint64_t written = 0;
+        const std::uint64_t total = chunk_end - cursor;
+        while (written < total) {
+            const ssize_t count =
+                ::pwrite(fd, arena_.Ptr(static_cast<std::uint32_t>(cursor + written)),
+                         static_cast<std::size_t>(total - written),
+                         offset + static_cast<off_t>(written));
+            if (count < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                return;  // munmap cannot report a failure, like Linux
+            }
+            if (count == 0) {
+                return;
+            }
+            written += static_cast<std::size_t>(count);
+        }
+        cursor = chunk_end;
+    }
+}
+
+// MS_INVALIDATE: the file's contents replace the mapping's copy. A private
+// mapping is left alone -- its pages are the guest's own copy, and re-reading
+// the file would throw its writes away. A shared piece is flushed first so the
+// refresh cannot lose what the guest wrote: only the file-side change is
+// picked up.
+void GuestMemory::Invalidate(const Piece& piece) {
+    if (!piece.segment.shared || piece.segment.file == nullptr) {
+        return;
+    }
+    const int fd = piece.segment.file->fd;
+    if (fd < 0) {
+        return;
+    }
+    std::uint64_t cursor = piece.start;
+    while (cursor < piece.end) {
+        const std::uint64_t accessible =
+            arena_.AccessibleEnd(static_cast<std::uint32_t>(cursor));
+        if (accessible <= cursor) {
+            cursor = std::min<std::uint64_t>(piece.end, PageUp(cursor + 1));
+            continue;
+        }
+        const std::uint64_t chunk_end = std::min<std::uint64_t>(piece.end, accessible);
+        const off_t offset = static_cast<off_t>(piece.segment.file_offset) +
+                             static_cast<off_t>(cursor - piece.start);
+        std::uint64_t filled = 0;
+        const std::uint64_t total = chunk_end - cursor;
+        while (filled < total) {
+            const ssize_t count =
+                ::pread(fd, arena_.Ptr(static_cast<std::uint32_t>(cursor + filled)),
+                        static_cast<std::size_t>(total - filled),
+                        offset + static_cast<off_t>(filled));
+            if (count < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                return;
+            }
+            if (count == 0) {
+                std::memset(arena_.Ptr(static_cast<std::uint32_t>(cursor + filled)), 0,
+                            static_cast<std::size_t>(total - filled));
+                break;
+            }
+            filled += static_cast<std::size_t>(count);
+        }
+        cursor = chunk_end;
+    }
+}
+
 // ---- mmap ------------------------------------------------------------------
 
 std::uint32_t GuestMemory::Map(std::uint32_t address, std::uint32_t length, int flags, int fd,
@@ -214,9 +329,12 @@ std::uint32_t GuestMemory::Map(std::uint32_t address, std::uint32_t length, int 
         }
         // The bionic linker reserves a range with PROT_NONE and maps every
         // segment over it with MAP_FIXED, so replacing our own ranges is normal.
-        std::vector<Range> removed;
+        std::vector<Piece> removed;
         Carve(start, end, &removed);
-        for (const Range& piece : removed) {
+        for (const Piece& piece : removed) {
+            // Replacing a shared mapping is an unmap of it, and the pages have
+            // to be in the file before the arena takes them away.
+            Flush(piece);
             arena_.Unmap(static_cast<std::uint32_t>(piece.start),
                          piece.end - piece.start);
         }
@@ -247,8 +365,22 @@ std::uint32_t GuestMemory::Map(std::uint32_t address, std::uint32_t length, int 
     // Fresh pages must read as zero even when the arena recycled them.
     PurgeToZero(start, size);
 
+    std::shared_ptr<FileHandle> shared_file;
+    std::uint64_t file_offset = 0;
     if (!anonymous) {
         const off_t offset = static_cast<off_t>(page_offset) * static_cast<off_t>(kPageSize);
+        file_offset = static_cast<std::uint64_t>(offset);
+        // The descriptor belongs to the mapping, not to the guest's next read:
+        // a guest that closes its own copy still expects its writes through a
+        // shared window to land in the file.
+        if ((flags & kMapShared) != 0) {
+            const int copy = ::dup(fd);
+            if (copy >= 0) {
+                auto holder = std::make_shared<FileHandle>();
+                holder->fd = copy;
+                shared_file = std::move(holder);
+            }
+        }
         std::size_t filled = 0;
         while (filled < size) {
             const ssize_t count = ::pread(fd, arena_.Ptr(static_cast<std::uint32_t>(start + filled)),
@@ -269,7 +401,8 @@ std::uint32_t GuestMemory::Map(std::uint32_t address, std::uint32_t length, int 
         }
     }
 
-    live_.emplace(start, Segment{start + size, anonymous});
+    live_.emplace(start, Segment{start + size, anonymous, shared_file != nullptr,
+                                 std::move(shared_file), file_offset});
     return static_cast<std::uint32_t>(start);
 }
 
@@ -297,14 +430,66 @@ bool GuestMemory::Unmap(std::uint32_t address, std::uint32_t length) {
     const std::uint64_t end = std::min<std::uint64_t>(PageUp(start + length), kAddressSpace);
 
     std::lock_guard<std::mutex> lock(mutex_);
-    std::vector<Range> removed;
+    std::vector<Piece> removed;
     Carve(start, end, &removed);
     // Only what this class handed out is released: a munmap that reaches the
     // heap or an image by mistake removes nothing of theirs.
-    for (const Range& piece : removed) {
+    for (const Piece& piece : removed) {
+        Flush(piece);
         arena_.Unmap(static_cast<std::uint32_t>(piece.start), piece.end - piece.start);
     }
     return true;
+}
+
+// ---- msync -----------------------------------------------------------------
+
+std::int32_t GuestMemory::Sync(std::uint32_t address, std::uint32_t length, int flags) {
+    constexpr int kMsAsync = 1;
+    constexpr int kMsInvalidate = 2;
+    constexpr int kMsSync = 4;
+    if ((flags & ~(kMsAsync | kMsInvalidate | kMsSync)) != 0) {
+        return -EINVAL;
+    }
+    if ((address & (kPageSize - 1)) != 0) {
+        return -EINVAL;
+    }
+    if (length == 0) {
+        return 0;
+    }
+    const std::uint64_t start = address;
+    const std::uint64_t end = std::min<std::uint64_t>(PageUp(start + length), kAddressSpace);
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    // Like the kernel, a hole in the range is ENOMEM even before anything is
+    // written. The heap and the images are not in live_ but are just as valid a
+    // target for msync, so the arena answers this, not the range table.
+    if (!arena_.IsCommitted(static_cast<std::uint32_t>(start), end - start)) {
+        return -ENOMEM;
+    }
+
+    auto it = live_.upper_bound(start);
+    if (it != live_.begin() && std::prev(it)->second.end > start) {
+        it = std::prev(it);
+    }
+    for (; it != live_.end() && it->first < end; ++it) {
+        const std::uint64_t piece_start = std::max(it->first, start);
+        const std::uint64_t piece_end = std::min(it->second.end, end);
+        if (piece_end <= piece_start) {
+            continue;
+        }
+        Segment segment = it->second;
+        segment.file_offset += piece_start - it->first;
+        const Piece piece{piece_start, piece_end, it->first, segment};
+        // Nothing in the container defers a write, so MS_ASYNC flushes now and
+        // MS_INVALIDATE refreshes afterwards. The flush comes first whatever the
+        // flags say: a refresh that ran before it would throw away the guest's
+        // own writes in the name of picking up the file's.
+        Flush(piece);
+        if ((flags & kMsInvalidate) != 0) {
+            Invalidate(piece);
+        }
+    }
+    return 0;
 }
 
 // ---- madvise ---------------------------------------------------------------
@@ -364,7 +549,14 @@ std::int32_t GuestMemory::Advise(std::uint32_t address, std::uint32_t length, in
         // from the file, which the container does not track, so they are left
         // alone -- and their segment says so.
         if (advice == kMadvDontNeed && it->second.anonymous) {
-            PurgeToZero(piece_start, piece_end - piece_start);
+            // A mapping the guest made inaccessible is still its own and still
+            // zero-filled when it makes it accessible again, but the zeroing is
+            // a host store and a guard page has to fault, not accept one.
+            const std::uint64_t writable =
+                arena_.AccessibleEnd(static_cast<std::uint32_t>(piece_start));
+            if (writable > piece_start) {
+                PurgeToZero(piece_start, std::min(piece_end, writable) - piece_start);
+            }
         }
         cursor = std::max(cursor, piece_end);
     }
