@@ -12,7 +12,7 @@
     <string name="apps">应用</string>
     <string name="about">关于</string>
     <string name="version_label">版本</string>
-    <string name="about_description">在 64 位 Android 上运行 32 位 ARM 应用。</string>
+    <string name="about_description">可在 64 位 ARM 设备上运行兼容的 32 位 ARM Android 应用，即使系统不支持 32 位应用也可以。Java 代码由 Android ART 运行，原生 ARM 代码则在运行时转换为 ARM64。</string>
     <string name="cancel">取消</string>
 
     <string name="launch">启动</string>

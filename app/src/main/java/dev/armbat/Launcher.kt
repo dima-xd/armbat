@@ -57,6 +57,7 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.TextStyle
@@ -1147,21 +1148,21 @@ fun AboutScreen(appCount: Int, version: String) {
 
 @Composable
 private fun AppMark() {
+    val shape = RoundedCornerShape(16.dp)
     Box(
         Modifier
             .size(76.dp)
-            .clip(RoundedCornerShape(14.dp))
-            .background(
-                Brush.linearGradient(
-                    colors = listOf(Color(0xFF5A6873), Color(0xFF1B2227)),
-                    start = Offset(0f, 0f),
-                    end = Offset(300f, 300f),
-                ),
-            )
-            .border(1.dp, Color(0xFF75828D), RoundedCornerShape(14.dp)),
+            .clip(shape)
+            .background(Color.White)
+            .border(1.dp, Color(0xFFE0E0E0), shape),
         contentAlignment = Alignment.Center,
     ) {
-        Text("A", color = HoloText, fontSize = 38.sp, fontWeight = FontWeight.Bold)
+        Image(
+            painter = painterResource(R.drawable.ic_launcher_foreground),
+            contentDescription = null,
+            modifier = Modifier.fillMaxSize(),
+            contentScale = ContentScale.Fit,
+        )
     }
 }
 

@@ -10,7 +10,7 @@
     <string name="apps">Apps</string>
     <string name="about">Acerca de</string>
     <string name="version_label">Versión</string>
-    <string name="about_description">Ejecuta aplicaciones ARM de 32 bits en Android de 64 bits.</string>
+    <string name="about_description">Ejecuta aplicaciones Android ARM de 32 bits compatibles en dispositivos ARM de 64 bits, incluso sin compatibilidad de sistema con 32 bits. El código Java se ejecuta en ART de Android y el código ARM nativo se traduce a ARM64 durante la ejecución.</string>
     <string name="cancel">CANCELAR</string>
 
     <string name="launch">INICIAR</string>

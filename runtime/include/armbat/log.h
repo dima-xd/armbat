@@ -41,6 +41,12 @@ bool LogRunning();
 std::string LogDirectory();
 std::string LogFilePath();
 
+// Android system properties are the runtime's single source for debug knobs.
+// Missing properties return an empty string; 0/false/off disable a flag and any
+// other non-empty value enables it.
+std::string SystemProperty(const char* name);
+bool SystemPropertyEnabled(const char* name, bool default_value = false);
+
 // One record. `format` follows printf; a record that does not fit is truncated.
 void LogWrite(LogLevel level, const char* tag, const char* format, ...)
     __attribute__((format(printf, 3, 4)));

@@ -12,6 +12,7 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <pthread.h>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -168,8 +169,14 @@ std::condition_variable g_callback_ready;
 std::deque<CallbackRequest> g_callback_queue;
 std::thread g_callback_thread;
 bool g_callback_stopping = false;
+bool g_callback_exited = true;
 
 void CallbackLoop() {
+    // Name the worker before it starts entering guest code. Thread creation is
+    // moved to SetGuestCallRunner(), outside the device's real-time callback.
+    (void)::pthread_setname_np(::pthread_self(), "armbat-audio");
+    std::vector<std::uint32_t> arguments;
+    arguments.reserve(2);
     for (;;) {
         CallbackRequest request;
         GuestCallRunner runner;
@@ -178,6 +185,8 @@ void CallbackLoop() {
             g_callback_ready.wait(
                 lock, [] { return g_callback_stopping || !g_callback_queue.empty(); });
             if (g_callback_stopping) {
+                g_callback_exited = true;
+                g_callback_ready.notify_all();
                 return;
             }
             request = g_callback_queue.front();
@@ -185,21 +194,37 @@ void CallbackLoop() {
             runner = g_guest_call;
         }
         if (runner) {
-            runner(request.callback, {request.itf, request.context});
+            // Reuse the tiny argument vector rather than allocating one for
+            // every audio period.
+            arguments.clear();
+            arguments.push_back(request.itf);
+            arguments.push_back(request.context);
+            runner(request.callback, arguments);
         }
     }
 }
 
-// One callback per consumed buffer, like the device: an engine that mixes ahead
-// relies on each of its enqueues coming back as a wake-up. The cap only keeps a
-// stalled engine from growing the queue without bound.
-void PostCallback(const CallbackRequest& request) {
-    const std::lock_guard lock(g_callback_mutex);
-    if (g_callback_stopping || g_callback_queue.size() >= 64) {
+void StartCallbackThreadLocked() {
+    if (g_callback_thread.joinable() || !g_callback_exited) {
         return;
     }
+    g_callback_stopping = false;
+    g_callback_exited = false;
+    g_callback_thread = std::thread(CallbackLoop);
+}
+
+// Every consumed buffer is a completion event, not a hint. Dropping one when
+// the worker is briefly behind leaves the guest queue permanently short and can
+// turn a transient scheduling delay into sustained silence. The worker is
+// normally started eagerly by SetGuestCallRunner(), outside this callback.
+void PostCallback(const CallbackRequest& request) {
+    const std::lock_guard lock(g_callback_mutex);
+    if (g_callback_stopping) {
+        return;
+    }
+    StartCallbackThreadLocked();
     if (!g_callback_thread.joinable()) {
-        g_callback_thread = std::thread(CallbackLoop);
+        return;
     }
     g_callback_queue.push_back(request);
     g_callback_ready.notify_one();
@@ -1045,6 +1070,11 @@ void SlCreateEngine(HleCall& call) {
 void SetGuestCallRunner(GuestCallRunner runner) {
     const std::lock_guard lock(g_callback_mutex);
     g_guest_call = std::move(runner);
+    if (g_guest_call) {
+        // Start before the first host buffer completes. Creating a std::thread
+        // from HostQueueCallback adds avoidable latency to the first refill.
+        StartCallbackThreadLocked();
+    }
 }
 
 void StopGuestCallThread() {
@@ -1056,12 +1086,12 @@ void StopGuestCallThread() {
         if (!g_callback_thread.joinable()) {
             return;
         }
+        g_callback_stopping = true;
         if (g_callback_thread.get_id() == std::this_thread::get_id()) {
-            // The callback itself is asking: joining would deadlock, and the
-            // thread has nothing left to run once the process is going away.
+            // The callback itself is asking: joining would deadlock. The stop
+            // flag makes the detached worker leave its loop after this callback.
             g_callback_thread.detach();
         } else {
-            g_callback_stopping = true;
             thread = std::move(g_callback_thread);
             joined = true;
         }
@@ -1071,6 +1101,7 @@ void StopGuestCallThread() {
         thread.join();
         const std::lock_guard lock(g_callback_mutex);
         g_callback_stopping = false;
+        g_callback_exited = true;
     }
 }
 

@@ -10,7 +10,7 @@
     <string name="apps">Приложения</string>
     <string name="about">О программе</string>
     <string name="version_label">Версия</string>
-    <string name="about_description">Запускает 32-битные ARM-приложения на 64-битном Android.</string>
+    <string name="about_description">Запускает совместимые 32-битные ARM-приложения Android на 64-битных ARM-устройствах, даже если в системе нет поддержки 32-битных приложений. Java-код выполняется в ART Android, а машинный код ARM преобразуется в ARM64 во время работы.</string>
     <string name="cancel">ОТМЕНА</string>
 
     <string name="launch">ЗАПУСТИТЬ</string>
