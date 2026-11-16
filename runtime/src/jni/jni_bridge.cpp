@@ -44,7 +44,11 @@ constexpr std::uint32_t kJniTableSize = 240;
 // One arm64 trampoline is 72 bytes; the stride keeps them 16-byte aligned so the
 // literal pools stay aligned as well.
 constexpr std::size_t kTrampolineStride = 96;
-constexpr std::size_t kTrampolineCount = 512;
+// The pool does not grow, so it has to fit the greediest guest: the Google Play
+// Games C++ SDK alone registers about a thousand natives. Running out used to put
+// a null function pointer in the table, which the guest then called and faulted
+// at 0xdead100f; now it costs a line in the log and one unregistered method.
+constexpr std::size_t kTrampolineCount = 2048;
 
 JavaVM* g_vm = nullptr;
 
@@ -2271,9 +2275,21 @@ struct JniBridge::Impl {
             call.CopyIn(call.Arg(2) + i * 12, entry, sizeof(entry));
             natives.push_back(NativeMethod{entry[2], signatures[i]});
             const std::uint32_t id = static_cast<std::uint32_t>(natives.size() - 1);
+            void* trampoline = MakeTrampoline(id);
+            if (trampoline == nullptr) {
+                // Out of stubs. A null function pointer in the table is a fault
+                // inside the guest's own call, so the method is left unregistered
+                // and the log says which one and that the pool is the reason.
+                static std::atomic<bool> reported{false};
+                if (!reported.exchange(true)) {
+                    ARMBAT_LOG_ERROR("Armbat", "jni: trampoline pool exhausted (%zu), dropped %s",
+                                     kTrampolineCount, names[i].c_str());
+                }
+                natives.pop_back();
+                continue;
+            }
             table.push_back(JNINativeMethod{const_cast<char*>(names[i].c_str()),
-                                            const_cast<char*>(signatures[i].c_str()),
-                                            MakeTrampoline(id)});
+                                            const_cast<char*>(signatures[i].c_str()), trampoline});
         }
         const jint result = env->RegisterNatives(type, table.data(), static_cast<jint>(table.size()));
         SealTrampolines();
