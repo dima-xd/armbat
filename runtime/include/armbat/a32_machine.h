@@ -101,11 +101,20 @@ public:
     // halt flag, which RunJit sees at the next slice boundary.
     void RequestSignal(std::uint32_t signal);
 
-    // Clears and returns the lowest queued signal, or 0 when none is pending.
+    // Clears and returns the lowest queued signal the thread does not block, or
+    // 0 when none of them is deliverable.
     std::uint32_t TakePendingSignal();
 
-    // True while at least one guest signal is queued on this machine.
+    // True while at least one deliverable guest signal is queued on this machine.
     bool HasPendingSignal() const;
+
+    // The blocked set of this thread, one bit per signal (bit 0 is signal 1), as
+    // rt_sigprocmask and rt_sigsuspend maintain it. A blocked signal stays
+    // queued instead of being dropped: the suspend/resume protocol of a
+    // stop-the-world collector is a thread that blocks everything, acks, and
+    // then waits for the resume signal to become deliverable inside sigsuspend.
+    std::uint64_t BlockedSignals() const;
+    void SetBlockedSignals(std::uint64_t mask);
 
     // Monotonic counter that RequestSignal bumps. A thread that suspends on a
     // signal reads it first and then sleeps on it: a signal queued between the

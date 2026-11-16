@@ -39,6 +39,9 @@ constexpr std::uint32_t kUcontextSize = 0x400;
 constexpr int kWakeupSignal = SIGUSR2;
 
 constexpr std::uint32_t kSaSiginfo = 0x00000004u;
+// SA_NODEFER: the handler runs with its own signal still deliverable. Without
+// it a device blocks the signal being handled for the lifetime of the handler.
+constexpr std::uint32_t kSaNodefer = 0x40000000u;
 constexpr std::uint32_t kSigDfl = 0;
 constexpr std::uint32_t kSigIgn = 1;
 // si_code for a thread-directed signal sent with tkill; the guest's handlers
@@ -49,6 +52,10 @@ struct Action {
     std::uint32_t handler = kSigDfl;
     std::uint32_t flags = 0;
     std::uint32_t restorer = 0;
+    // sa_mask: signals the handler blocks while it runs. libmono's Boehm suspend
+    // handler is installed with every signal in it, which is what keeps the
+    // restart signal queued instead of running it inside the suspend handler.
+    std::uint64_t mask = 0;
 };
 
 GuestArena* g_arena = nullptr;
@@ -118,7 +125,7 @@ void UnblockGuestSignalWakeup() {
 }
 
 void SetGuestSignalAction(int signal, std::uint32_t handler, std::uint32_t flags,
-                          std::uint32_t restorer) {
+                          std::uint32_t restorer, std::uint64_t mask) {
     if (signal <= 0 || signal >= 65) {
         return;
     }
@@ -136,6 +143,7 @@ void SetGuestSignalAction(int signal, std::uint32_t handler, std::uint32_t flags
     g_actions[signal].handler = handler;
     g_actions[signal].flags = flags;
     g_actions[signal].restorer = restorer;
+    g_actions[signal].mask = mask;
 }
 
 bool HasGuestSignalHandler(int signal) {
@@ -201,7 +209,20 @@ void DeliverGuestSignals(A32Machine& machine) {
             arguments.push_back(frame);
             arguments.push_back(frame + kUcontextOffset);
         }
+        // A device runs a handler with the thread's own mask, the action's
+        // sa_mask and (unless SA_NODEFER) the signal being handled all blocked,
+        // and restores the previous mask when the handler returns. That is the
+        // whole stop-the-world protocol: a suspend handler is installed with
+        // sa_mask = everything, so the resume signal stays queued until the
+        // handler itself drops into sigsuspend with a mask that lets it through.
+        const std::uint64_t previous = machine.BlockedSignals();
+        std::uint64_t during = previous | action.mask;
+        if ((action.flags & kSaNodefer) == 0) {
+            during |= 1ull << (signal - 1);
+        }
+        machine.SetBlockedSignals(during);
         machine.CallNestedPreservingRegisters(action.handler, arguments);
+        machine.SetBlockedSignals(previous);
     }
 }
 

@@ -55,6 +55,10 @@ namespace {
 
 constexpr std::uint32_t kSyscallSvc = 0;
 constexpr std::uint32_t kMaxPath = 4096;
+// How often a thread parked in an untimed futex re-checks for a deliverable
+// signal. Short enough that a collector notices inside a frame, long enough to
+// cost a parked thread nothing.
+constexpr long kFutexSliceNanoseconds = 50 * 1000 * 1000;
 constexpr std::uint32_t kOLargeFile = 0x8000;  // 32-bit-only flag
 constexpr std::uint32_t kAtEmptyPath = 0x1000;
 
@@ -1594,14 +1598,51 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
         const bool waiting =
             base_operation == FUTEX_WAIT || base_operation == FUTEX_WAIT_BITSET;
         if (waiting && timeout_pointer == nullptr) {
-            FutexWaitBegin(address, static_cast<std::int32_t>(value), operation, CallingMachine(machine_));
+            // An untimed wait is the one place where a signal aimed at this
+            // thread can be lost: the machine ran its safe point before the
+            // syscall, so a signal that arrives in between is pending while the
+            // thread sleeps here -- and a collector waiting for this thread to
+            // park waits forever. Wake every slice and look again; a spurious
+            // wakeup is something every futex caller already has to handle.
+            A32Machine& parked = CallingMachine(machine_);
+            FutexWaitBegin(address, static_cast<std::int32_t>(value), operation, parked);
+            const std::uint32_t bitset =
+                base_operation == FUTEX_WAIT_BITSET ? args[5] : 0xffffffffu;
+            // Only the private flag is carried over: the deadline below is ours
+            // and is always CLOCK_MONOTONIC, so FUTEX_CLOCK_REALTIME must not.
+            const int private_flag = operation & FUTEX_PRIVATE_FLAG;
+            std::int32_t outcome = 0;
+            for (;;) {
+                if (parked.HasPendingSignal()) {
+                    outcome = -EINTR;
+                    break;
+                }
+                timespec deadline{};
+                ::clock_gettime(CLOCK_MONOTONIC, &deadline);
+                deadline.tv_nsec += kFutexSliceNanoseconds;
+                if (deadline.tv_nsec >= 1000000000L) {
+                    deadline.tv_sec += 1;
+                    deadline.tv_nsec -= 1000000000L;
+                }
+                const long slice = ::syscall(SYS_futex, target,
+                                             FUTEX_WAIT_BITSET | private_flag, value, &deadline,
+                                             nullptr, bitset);
+                if (slice == 0) {
+                    outcome = 0;
+                    break;
+                }
+                if (errno == ETIMEDOUT || errno == EINTR) {
+                    continue;
+                }
+                outcome = -errno;
+                break;
+            }
+            FutexWaitEnd();
+            return outcome;
         }
         const long result =
             ::syscall(SYS_futex, target, operation, value, timeout_pointer, target2, args[5]);
         const int error = errno;
-        if (waiting && timeout_pointer == nullptr) {
-            FutexWaitEnd();
-        }
         return result < 0 ? -error : static_cast<std::int32_t>(result);
     }
 
@@ -1721,8 +1762,8 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
     case kSysRtSigaction: {
         // Signal handlers are recorded here; delivery happens at a safe point on
         // the target thread (see guest_signal.cpp). The action is read for the
-        // handler and the SA_SIGINFO bit only, which is all the delivery path
-        // needs; masks and alternate stacks are not emulated.
+        // handler, the SA_* bits and sa_mask, which is what the delivery path
+        // needs; alternate stacks are not emulated.
         //
         // The old action is answered with the one field a caller reads back --
         // the handler -- and nothing else. bionic's struct is a union of
@@ -1733,15 +1774,26 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
         // the guest dies of "stack corruption detected" before it draws a frame.
         const std::uint32_t signal = args[0];
         const std::uint32_t new_action = args[1];
-        if (new_action != 0 && arena_.IsMapped(new_action, 4 * sizeof(std::uint32_t))) {
-            // bionic's own `sigaction` struct keeps the handler first, then the
-            // mask; the raw rt_sigaction struct follows the kernel and puts the
-            // flags second. Both are four words, only the order differs.
-            const bool rt = number == kSysRtSigaction;
+        const bool rt = number == kSysRtSigaction;
+        // The raw rt_sigaction struct follows the kernel: handler, flags,
+        // restorer, then the sigset whose size the caller passes last. The old
+        // ARM struct puts a 32-bit mask second and the flags third. sa_mask
+        // matters: a stop-the-world collector installs its suspend handler with
+        // every signal in it.
+        const std::uint32_t set_size =
+            rt ? std::min<std::uint32_t>(args[3], sizeof(std::uint64_t)) : 4;
+        const std::uint32_t action_size = rt ? 12 + set_size : 4 * sizeof(std::uint32_t);
+        if (new_action != 0 && arena_.IsMapped(new_action, action_size)) {
             const std::uint32_t* words =
                 reinterpret_cast<const std::uint32_t*>(arena_.Ptr(new_action));
+            std::uint64_t mask = 0;
+            if (rt) {
+                std::memcpy(&mask, arena_.Ptr(new_action + 12), set_size);
+            } else {
+                mask = words[1];
+            }
             SetGuestSignalAction(static_cast<int>(signal), words[0], rt ? words[1] : words[2],
-                                 rt ? words[2] : words[3]);
+                                 rt ? words[2] : words[3], mask);
         }
         const std::uint32_t old_action = args[2];
         if (old_action != 0 && arena_.IsMapped(old_action, sizeof(std::uint32_t))) {
@@ -1750,20 +1802,48 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
         return 0;
     }
 
-    case kSysSigprocmask: {
-        // The pre-RT variant has no sigset size argument.
-        const std::uint32_t old_set = args[2];
-        if (old_set != 0 && arena_.IsMapped(old_set, 4)) {
-            std::memset(arena_.Ptr(old_set), 0, 4);
-        }
-        return 0;
-    }
-
+    case kSysSigprocmask:
     case kSysRtSigprocmask: {
+        // A blocked signal is not dropped, it waits: this is the set the
+        // delivery path subtracts from the pending one. A stop-the-world
+        // collector blocks everything before it acks a suspend and clears its
+        // mask again in sigsuspend, so a mask that is not emulated is a thread
+        // suspended forever. The pre-RT variant carries a 32-bit mask and no
+        // size argument; the RT one says how many bytes the caller's sigset_t
+        // holds (4 or 8 depending on the bionic the guest was built against).
+        const bool rt = number == kSysRtSigprocmask;
+        const std::uint32_t how = args[0];
+        const std::uint32_t set = args[1];
         const std::uint32_t old_set = args[2];
-        const std::uint32_t size = args[3];
-        if (old_set != 0 && size != 0 && arena_.IsMapped(old_set, size)) {
-            std::memset(arena_.Ptr(old_set), 0, size);
+        const std::uint32_t size =
+            rt ? std::min<std::uint32_t>(args[3], sizeof(std::uint64_t)) : 4;
+        if (size == 0) {
+            return -EINVAL;
+        }
+        A32Machine& owner = CallingMachine(machine_);
+        std::uint64_t requested = 0;
+        if (set != 0) {
+            if (!arena_.IsMapped(set, size)) {
+                return -EFAULT;
+            }
+            std::memcpy(&requested, arena_.Ptr(set), size);
+        }
+        const std::uint64_t previous = owner.BlockedSignals();
+        if (set != 0) {
+            std::uint64_t next = previous;
+            if (how == 0) {  // SIG_BLOCK
+                next |= requested;
+            } else if (how == 1) {  // SIG_UNBLOCK
+                next &= ~requested;
+            } else if (how == 2) {  // SIG_SETMASK
+                next = requested;
+            } else {
+                return -EINVAL;
+            }
+            owner.SetBlockedSignals(next);
+        }
+        if (old_set != 0 && arena_.IsMapped(old_set, size)) {
+            std::memcpy(arena_.Ptr(old_set), &previous, size);
         }
         return 0;
     }
@@ -1771,23 +1851,34 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
     case kSysRtSigsuspend: {
         // A thread suspends here until a signal arrives, and libmono's Boehm
         // collector is the caller that matters: it stops a thread this way and
-        // resumes it with a signal, then waits for the acknowledgement. Answering
-        // ENOSYS made the thread come back as if it had already been resumed, so
-        // the collection it belonged to could never be finished and the whole
-        // guest stopped on the first allocation burst after a level started.
+        // resumes it with a signal, then waits for the acknowledgement.
         //
-        // The mask is not emulated: the container tracks its own pending set, and
-        // delivery happens at the safe point the returned EINTR leads to, which is
-        // where the guest handler expects to run.
+        // The mask is the whole point. The caller's set replaces the blocked set
+        // for the duration of the call, the resume signal is only deliverable
+        // because of it, and the handler has to run *inside* this syscall:
+        // delivering it after the return would run it under the restored mask,
+        // which blocks it again, and the guest would spin. On a device the
+        // handler runs before sigsuspend returns EINTR, and so it does here.
         A32Machine& suspended = CallingMachine(machine_);
-        // Read the ticket before looking at the pending set: a signal queued in
-        // between bumps the ticket, so the wait returns instead of sleeping
-        // through it.
-        const std::uint32_t ticket = suspended.SignalTicket();
-        if (suspended.HasPendingSignal()) {
-            return -EINTR;
+        const std::uint32_t size = std::min<std::uint32_t>(args[1], sizeof(std::uint64_t));
+        std::uint64_t mask = 0;
+        if (args[0] != 0 && size != 0 && arena_.IsMapped(args[0], size)) {
+            std::memcpy(&mask, arena_.Ptr(args[0]), size);
         }
-        suspended.WaitForSignal(ticket);
+        const std::uint64_t previous = suspended.BlockedSignals();
+        suspended.SetBlockedSignals(mask);
+        for (;;) {
+            // Read the ticket before looking at the pending set: a signal queued
+            // in between bumps the ticket, so the wait returns instead of
+            // sleeping through it.
+            const std::uint32_t ticket = suspended.SignalTicket();
+            if (suspended.HasPendingSignal()) {
+                break;
+            }
+            suspended.WaitForSignal(ticket);
+        }
+        DeliverGuestSignals(suspended);
+        suspended.SetBlockedSignals(previous);
         return -EINTR;
     }
 
@@ -1932,6 +2023,19 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
         if (length != 0 && !arena_.IsMapped(value, length)) {
             return -EFAULT;
         }
+        // A socket timeout is a `struct timeval`: two 32-bit fields in the guest,
+        // two 64-bit longs here. Handing the guest's eight bytes to the host made
+        // every socket with ReadTimeout or WriteTimeout set fail with EINVAL,
+        // which libmono surfaces as SocketException on a working connection.
+        if (level == SOL_SOCKET && (option == SO_RCVTIMEO || option == SO_SNDTIMEO) &&
+            length == sizeof(GuestTimeval)) {
+            GuestTimeval guest{};
+            std::memcpy(&guest, arena_.Ptr(value), sizeof(guest));
+            timeval host{};
+            host.tv_sec = guest.seconds;
+            host.tv_usec = guest.microseconds;
+            return ::setsockopt(fd, level, option, &host, sizeof(host)) == 0 ? 0 : -errno;
+        }
         return ::setsockopt(fd, level, option, arena_.Ptr(value), length) == 0 ? 0 : -errno;
     }
 
@@ -1948,6 +2052,22 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
         std::memcpy(&length, arena_.Ptr(length_address), sizeof(length));
         if (length > 256 || (length != 0 && !arena_.IsMapped(value, length))) {
             return -EFAULT;
+        }
+        if (level == SOL_SOCKET && (option == SO_RCVTIMEO || option == SO_SNDTIMEO)) {
+            timeval host{};
+            socklen_t host_length = sizeof(host);
+            if (::getsockopt(fd, level, option, &host, &host_length) != 0) {
+                return -errno;
+            }
+            if (length >= sizeof(GuestTimeval)) {
+                GuestTimeval guest{};
+                guest.seconds = static_cast<std::int32_t>(host.tv_sec);
+                guest.microseconds = static_cast<std::int32_t>(host.tv_usec);
+                std::memcpy(arena_.Ptr(value), &guest, sizeof(guest));
+                const std::uint32_t reported = sizeof(guest);
+                std::memcpy(arena_.Ptr(length_address), &reported, sizeof(reported));
+            }
+            return 0;
         }
         socklen_t local_length = static_cast<socklen_t>(length);
         if (::getsockopt(fd, level, option, arena_.Ptr(value), &local_length) != 0) {
@@ -2865,7 +2985,21 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
                 break;
             }
         }
-        ARMBAT_LOG_INFO("Armbat", "exit: tid=%u code=%u frames:%s",
+        if (number == kSysExit) {
+            // A thread leaving its process: bionic reaches this from
+            // pthread_exit, and the process keeps running with one thread fewer.
+            ARMBAT_LOG_INFO("Armbat", "exit: tid=%u code=%u frames:%s",
+                                static_cast<unsigned>(::gettid()), args[0], frames.c_str());
+            t_halt_requested = true;
+            return 0;
+        }
+        // exit_group asks for the whole process to end, and finding it in a log
+        // is the only way to tell "the archive quit by itself" from "it stopped
+        // rendering": a game that reaches Application.Quit() or aborts asks for
+        // this and then leaves a window with the last frame on screen. The
+        // request is recorded here; what it means for the process is decided by
+        // the container, not by the kernel.
+        ARMBAT_LOG_INFO("Armbat", "exit group: tid=%u code=%u frames:%s",
                             static_cast<unsigned>(::gettid()), args[0], frames.c_str());
         t_halt_requested = true;
         return 0;

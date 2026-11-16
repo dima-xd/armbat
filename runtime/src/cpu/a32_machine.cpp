@@ -848,6 +848,11 @@ struct A32Machine::Impl {
     Dynarmic::A32::Jit* base_jit = nullptr;
     // Signals queued by other threads, one bit per signal number.
     std::atomic<std::uint64_t> pending_signals{0};
+    // Signals this thread currently blocks, one bit per signal number. Written
+    // only by the owning thread (sigprocmask, sigsuspend, the delivery path) and
+    // read by RequestSignal's target from the same thread, so it can be a plain
+    // atomic: a blocked signal is still queued, it is just not deliverable yet.
+    std::atomic<std::uint64_t> blocked_signals{0};
     // Bumped by RequestSignal and waited on by rt_sigsuspend, so a thread that
     // suspends on a signal is resumed by the sender rather than by a timeout.
     std::atomic<std::uint32_t> signal_ticket{0};
@@ -1100,7 +1105,16 @@ void A32Machine::RequestSignal(std::uint32_t signal) {
 }
 
 bool A32Machine::HasPendingSignal() const {
-    return impl_->pending_signals.load(std::memory_order_acquire) != 0;
+    const std::uint64_t blocked = impl_->blocked_signals.load(std::memory_order_acquire);
+    return (impl_->pending_signals.load(std::memory_order_acquire) & ~blocked) != 0;
+}
+
+std::uint64_t A32Machine::BlockedSignals() const {
+    return impl_->blocked_signals.load(std::memory_order_acquire);
+}
+
+void A32Machine::SetBlockedSignals(std::uint64_t mask) {
+    impl_->blocked_signals.store(mask, std::memory_order_release);
 }
 
 std::uint32_t A32Machine::SignalTicket() const {
@@ -1120,9 +1134,14 @@ void A32Machine::WaitForSignal(std::uint32_t ticket) {
 }
 
 std::uint32_t A32Machine::TakePendingSignal() {
+    const std::uint64_t blocked = impl_->blocked_signals.load(std::memory_order_acquire);
     std::uint64_t mask = impl_->pending_signals.load(std::memory_order_acquire);
     while (mask != 0) {
-        const std::uint32_t signal = static_cast<std::uint32_t>(__builtin_ctzll(mask)) + 1;
+        const std::uint64_t deliverable = mask & ~blocked;
+        if (deliverable == 0) {
+            return 0;
+        }
+        const std::uint32_t signal = static_cast<std::uint32_t>(__builtin_ctzll(deliverable)) + 1;
         if (impl_->pending_signals.compare_exchange_weak(mask, mask & ~(1ull << (signal - 1)),
                                                          std::memory_order_acq_rel,
                                                          std::memory_order_acquire)) {
@@ -1141,7 +1160,7 @@ void A32Machine::CopySafePointHandlerFrom(const A32Machine& other) {
 }
 
 void A32Machine::RunSafePoint() {
-    if (impl_->pending_signals.load(std::memory_order_acquire) == 0) {
+    if (!HasPendingSignal()) {
         return;
     }
     if (!impl_->safe_point_handler) {

@@ -15,8 +15,11 @@ class GuestArena;
 //
 // The model here is deliberately small: a signal with a handler is queued on the
 // target thread and the handler runs at the next safe point, on that thread,
-// with its register file intact. Signal masks, alternate stacks and the
-// kernel's ucontext are not emulated; a handler that needs them gets zeroes.
+// with its register file intact. Blocked signals are emulated -- they stay
+// queued and are delivered once the thread unblocks them -- because the
+// stop-the-world protocol of a conservative collector is built on exactly that.
+// Alternate stacks and the kernel's ucontext are not emulated; a handler that
+// needs them gets zeroes.
 
 // Maps the per-thread signal frames and installs the host signal used to wake a
 // guest thread out of a blocking syscall. Called once, after the arena exists.
@@ -27,9 +30,10 @@ void InitGuestSignals(GuestArena& arena);
 void UnblockGuestSignalWakeup();
 
 // Records an action the guest installed with sigaction. `handler` is a guest
-// entry point, or SIG_DFL (0) / SIG_IGN (1).
+// entry point, or SIG_DFL (0) / SIG_IGN (1). `mask` is the action's sa_mask: the
+// signals the handler itself blocks while it runs.
 void SetGuestSignalAction(int signal, std::uint32_t handler, std::uint32_t flags,
-                          std::uint32_t restorer);
+                          std::uint32_t restorer, std::uint64_t mask);
 
 // True when the guest installed a real handler, so a signal has somewhere to go.
 bool HasGuestSignalHandler(int signal);
