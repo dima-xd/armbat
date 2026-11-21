@@ -3674,8 +3674,12 @@ struct JniBridge::Impl {
         }
         // The bionic path maps libraries with the guest's own linker, so they
         // never appear in the HLE module list. The container resolved their
-        // Java_* entry points with dlsym and hands them over here.
-        for (const GuestContainer::GuestExport& entry : container.BionicExports()) {
+        // Java_* entry points with dlsym and hands them over here. Iterated as
+        // a copy: resolving a Java_* symbol asks the guest class loader for the
+        // class, its static initializer may load a library of its own, and that
+        // appends to the container's list.
+        const std::vector<GuestContainer::GuestExport> exports = container.BionicExports();
+        for (const GuestContainer::GuestExport& entry : exports) {
             consider(entry.symbol, entry.address);
         }
 

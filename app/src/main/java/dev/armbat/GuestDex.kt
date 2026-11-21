@@ -76,7 +76,7 @@ import java.util.zip.ZipFile
 object GuestDex {
 
     /** Bump when the rewrite rules or the cache layout change. */
-    private const val CACHE_VERSION = 5
+    private const val CACHE_VERSION = 6
 
     private const val CACHE_MARKER = ".ok"
     private const val DEX_CLASS_LOADER_CLASS = "Ldalvik/system/DexClassLoader;"
@@ -99,6 +99,9 @@ object GuestDex {
         "getExternalStorageDirectory",
         "getExternalStoragePublicDirectory",
     )
+
+    private const val SYSTEM_CLASS = "Ljava/lang/System;"
+    private const val GUEST_NATIVES = "Ldev/armbat/GuestNatives;"
 
     /** One lock per archive root, so a launch and import prewarm cannot race. */
     private val locks = ConcurrentHashMap<String, Any>()
@@ -497,6 +500,10 @@ object GuestDex {
      * Environment: the shared storage root is the real device's, so paths the
      *   archive builds from it name no package; [GuestEnvironment] answers
      *   with the guest's tree instead.
+     * System.load: an archive that unpacks a library at run time loads it by
+     *   absolute path. This process's linker would be handed an ARMv7 image it
+     *   cannot map, so [GuestNatives] sends the file to the guest's own linker
+     *   and answers for it.
      *
      * The replacement keeps the same name and prototype, so the call site
      * needs no other change.
@@ -509,6 +516,8 @@ object GuestDex {
                 GUEST_PENDING_INTENTS.takeIf { reference.name in PENDING_INTENT_FACTORIES }
             ENVIRONMENT_CLASS ->
                 GUEST_ENVIRONMENT.takeIf { reference.name in ENVIRONMENT_METHODS }
+            SYSTEM_CLASS ->
+                GUEST_NATIVES.takeIf { reference.name == "load" && isSingleString(reference) }
             else -> null
         } ?: return null
         val target = ImmutableMethodReference(
@@ -537,6 +546,11 @@ object GuestDex {
             else -> null
         }
     }
+
+    /** Whether the call takes exactly one String, as System.load(String) does. */
+    private fun isSingleString(reference: MethodReference): Boolean =
+        reference.parameterTypes.size == 1 &&
+            reference.parameterTypes[0].toString() == "Ljava/lang/String;"
 
     private fun rewritePath(value: String, rules: List<Pair<String, String>>): String {
         for ((from, to) in rules) {

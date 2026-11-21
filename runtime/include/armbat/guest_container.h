@@ -61,6 +61,29 @@ public:
     Elf32Loader& Loader();
     JniBridge& Jni();
 
+    // What happened to a file the archive handed to System.load at run time.
+    enum class LoadResult {
+        // The guest's linker mapped it; its JNI_OnLoad is pending and its
+        // Java_* entry points are in BionicExports.
+        Loaded,
+        // Not an ARMv7 image: the platform's own System.load has to answer.
+        NotGuestImage,
+        // An ARMv7 image the guest's linker refused; `error` says why.
+        Failed,
+    };
+
+    // Maps an ARMv7 image the archive wrote into its data directory after it
+    // started, the way System.load does on a device. A protector unpacks its
+    // own stub that way, and the process's linker cannot map a 32-bit image.
+    // The library is remembered so a later launch can run its JNI_OnLoad again.
+    LoadResult LoadGuestLibrary(const std::string& path, std::string* error);
+
+    // Re-arms the JNI_OnLoad of every library the guest has mapped. A new
+    // launch defines the archive's Java classes again with a fresh class
+    // loader, and each library has to bind its natives to those classes; the
+    // entries were consumed by the previous launch, so they are put back.
+    void RearmOnLoad();
+
     // A Java_* entry point of a library the guest's own linker loaded. On the
     // bionic path the HLE loader's module list stays empty, so the JNI bridge
     // reads the entry points from here instead.

@@ -53,6 +53,11 @@ std::string g_cache;
 std::string g_loaded;
 std::string g_last_report;
 
+// The class loader the libraries' natives are bound to. A different one means a
+// new launch: a fresh DexClassLoader defines the archive's classes again, and
+// the libraries have to bind their natives to those classes.
+jobject g_bound_loader = nullptr;
+
 // logcat splits on newlines anyway; doing it here keeps one guest line per
 // record instead of one giant blob.
 void LogLines(const std::string& text) {
@@ -144,12 +149,24 @@ Java_dev_armbat_GuestNatives_registerNatives(JNIEnv* env, jobject /*self*/, jobj
     }
     std::string text;
     try {
+        // A relaunch in this process defines the archive's classes again with a
+        // new class loader, while the libraries are the same mapped images. Their
+        // JNI_OnLoad entries were consumed by the previous launch, so they are
+        // put back before the new classes are bound: the entry registers the
+        // natives of the class it finds through the loader in use.
+        if (g_bound_loader != nullptr && !env->IsSameObject(g_bound_loader, loader)) {
+            g_container->RearmOnLoad();
+        }
         const auto started = std::chrono::steady_clock::now();
         text = g_container->Jni().RegisterExports(env, loader);
         const auto registered = std::chrono::steady_clock::now();
         ARMBAT_LOG_INFO("Armbat", "startup: natives registered at %lld ms",
             static_cast<long long>(
                 std::chrono::duration_cast<std::chrono::milliseconds>(registered - started).count()));
+        if (g_bound_loader != nullptr) {
+            env->DeleteGlobalRef(g_bound_loader);
+        }
+        g_bound_loader = env->NewGlobalRef(loader);
     } catch (const std::exception& failure) {
         text = std::string("natives: error: ") + failure.what() + "\n";
     }
@@ -200,6 +217,62 @@ Java_dev_armbat_GuestNatives_libraryLoaded(JNIEnv* env, jobject /*self*/, jstrin
         return 0;
     }
     return static_cast<jint>(version);
+}
+
+// System.load for guest code. A protector unpacks its stub into the
+// application's data directory and loads it by absolute path; this process's
+// linker cannot map an ARMv7 image, so the guest's own linker maps it here and
+// the platform's System.load never sees it. Reached from a guest Java call that
+// may already hold g_mutex (an Activity constructor runs under the lifecycle
+// entry), so it must not take that mutex, exactly like libraryLoaded.
+//
+// Answers null when the guest's linker took the file, an empty string when the
+// file is not an ARMv7 image and the platform should answer instead, and the
+// linker's reason otherwise.
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_armbat_GuestNatives_loadFromPath(JNIEnv* env, jobject /*self*/, jstring path) {
+    armbat::GuestContainer* container = g_container.get();
+    if (container == nullptr) {
+        return env->NewStringUTF("no guest world");
+    }
+    static std::recursive_mutex mutex;
+    const std::lock_guard<std::recursive_mutex> lock(mutex);
+    const std::string file = StringOf(env, path);
+    std::string reason;
+    const armbat::GuestContainer::LoadResult result = container->LoadGuestLibrary(file, &reason);
+    if (result == armbat::GuestContainer::LoadResult::NotGuestImage) {
+        // The Java side lets the platform's System.load speak: it names the
+        // file's own problem (a 64-bit image, a missing file) better than the
+        // container can.
+        return env->NewStringUTF("");
+    }
+    if (result == armbat::GuestContainer::LoadResult::Failed) {
+        return env->NewStringUTF(reason.c_str());
+    }
+    // The platform runs JNI_OnLoad as part of System.load; the entry binds the
+    // library's natives to the classes of the loader in use.
+    std::uint32_t version = 0;
+    if (container->CallOnLoad(file, &version)) {
+        ARMBAT_LOG_INFO("Armbat", "JNI_OnLoad: %s=0x%08x", file.c_str(), version);
+        if (version == 0) {
+            jclass error = env->FindClass("java/lang/UnsatisfiedLinkError");
+            if (error != nullptr) {
+                const std::string message = "JNI_OnLoad failed in " + file;
+                env->ThrowNew(error, message.c_str());
+                env->DeleteLocalRef(error);
+            }
+            return nullptr;
+        }
+    }
+    // The image's Java_* entry points are in the container's list now; bind
+    // them, and everything the classes of this loader already answered for, the
+    // same way the launch binds an archive library.
+    if (g_bound_loader != nullptr) {
+        const std::string text = container->Jni().RegisterExports(env, g_bound_loader);
+        LogLines(text);
+    }
+    container->Jni().DropGuestException("after a library the archive loaded at run time");
+    return nullptr;
 }
 
 // The archive's Java activity, handed over before onCreate. ANativeActivity.clazz

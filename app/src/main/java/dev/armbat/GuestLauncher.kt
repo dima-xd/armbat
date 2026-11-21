@@ -34,6 +34,7 @@ import android.view.WindowManager
 import android.widget.FrameLayout
 import dalvik.system.DexClassLoader
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.net.URL
 import java.util.zip.ZipFile
@@ -434,15 +435,63 @@ class GuestLauncher(private val host: Activity) {
 
         /**
          * Old applications still pass MODE_WORLD_READABLE/MODE_WORLD_WRITEABLE,
-         * which the framework has rejected since Android 7. The container has its
-         * own private directory, so dropping those bits keeps the files private
+         * which the framework has rejected since Android 7. The guest's tree sits
+         * on the shared storage, so dropping those bits keeps the files private
          * and lets the application run.
          */
         private fun legacyMode(mode: Int): Int =
             mode and (MODE_WORLD_READABLE or MODE_WORLD_WRITEABLE).inv()
 
-        override fun openFileOutput(name: String, mode: Int): FileOutputStream =
-            super.openFileOutput(name, legacyMode(mode))
+        /**
+         * The file APIs that name a file inside the application's private
+         * directory.
+         *
+         * The framework answers them from the container's own directory, while
+         * [getFilesDir] answers the guest's tree: an archive that writes a file
+         * through the context and then reads it back from the path it asked for
+         * would look in two different places. Protectors and updaters do exactly
+         * that -- an unpacker copies its library with openFileOutput and hands
+         * `getFilesDir()/name` to System.load -- so every name the context
+         * resolves lives under [getFilesDir] here.
+         */
+        override fun openFileOutput(name: String, mode: Int): FileOutputStream {
+            val file = getFileStreamPath(name)
+            return if (mode and MODE_APPEND != 0) {
+                FileOutputStream(file, true)
+            } else {
+                FileOutputStream(file)
+            }
+        }
+
+        override fun openFileInput(name: String): FileInputStream =
+            FileInputStream(getFileStreamPath(name))
+
+        override fun deleteFile(name: String): Boolean = getFileStreamPath(name).delete()
+
+        override fun fileList(): Array<String> = getFilesDir().list() ?: emptyArray()
+
+        override fun getFileStreamPath(name: String): File {
+            // What the framework validates, for the same reason: the name is a
+            // file in the application's directory, not a path of its own.
+            require(!name.contains(File.separatorChar)) {
+                "File $name contains a path separator"
+            }
+            return File(getFilesDir(), name)
+        }
+
+        /**
+         * The framework puts getDir under the application's data directory next
+         * to files and cache, and an archive may hand that path to its own
+         * native code. The guest's data directory is the same tree.
+         */
+        override fun getDir(name: String, mode: Int): File {
+            require(!name.contains(File.separatorChar)) {
+                "File $name contains a path separator"
+            }
+            val dir = File(GuestStorage.dataDir(guestPackage), "app_$name")
+            dir.mkdirs()
+            return dir
+        }
 
         override fun getSharedPreferences(name: String, mode: Int): SharedPreferences =
             super.getSharedPreferences(name, legacyMode(mode))

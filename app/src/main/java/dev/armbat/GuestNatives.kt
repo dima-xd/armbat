@@ -61,6 +61,36 @@ internal object GuestNatives {
     external fun libraryLoaded(name: String): Int
 
     /**
+     * System.load for the archive's own code.
+     *
+     * A protector unpacks its stub into the application's data directory and
+     * loads it by absolute path. The platform's System.load would hand an ARMv7
+     * image to this process's AArch64 linker and fail; the file goes to the
+     * guest's linker instead, its JNI_OnLoad runs and its Java_* entry points
+     * are bound to the classes of the loader in use.
+     *
+     * [GuestDex] redirects the guest's System.load calls here.
+     */
+    @JvmStatic
+    fun load(path: String) {
+        when (val answer = loadFromPath(path)) {
+            // Taken by the guest's linker.
+            null -> Unit
+            // Not an ARMv7 image: the platform names that problem precisely.
+            "" -> System.load(path)
+            else -> throw UnsatisfiedLinkError(answer)
+        }
+    }
+
+    /**
+     * Maps a library the archive wrote after it started. Null when the guest's
+     * linker took it; an empty string when the file is not an ARMv7 image and
+     * the platform's System.load should answer instead; otherwise the reason
+     * the guest's linker refused it.
+     */
+    private external fun loadFromPath(path: String): String?
+
+    /**
      * Starts the archive's native activity. Mirrors what android.app.NativeActivity
      * does once it has loaded the library: the archive's ANativeActivity_onCreate
      * runs with the container's activity as its Java side.

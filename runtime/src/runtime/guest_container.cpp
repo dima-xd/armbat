@@ -1297,6 +1297,18 @@ struct GuestContainer::Impl {
     // HLE loader is empty on this path, so anything that has to look a symbol up
     // afterwards - ANativeActivity_onCreate above all - asks the guest.
     std::vector<std::uint32_t> bionic_handles;
+    // The same libraries, with what a new launch needs to run their Java side
+    // again: the file the archive loads, the name the image calls itself and
+    // the address of its JNI_OnLoad. Includes an image the archive unpacked
+    // and loaded itself (see LoadGuestLibrary).
+    struct LoadedLibrary {
+        std::uint32_t handle = 0;
+        std::string path;
+        std::string file;
+        std::string soname;
+        std::uint32_t on_load = 0;
+    };
+    std::vector<LoadedLibrary> loaded_libraries;
     // Where /data/data/<package> lands on the host. Created once, before the
     // guest can write anything. Set from the shell when the guest's tree lives
     // on the shared storage, otherwise derived from the cache directory.
@@ -1651,45 +1663,130 @@ bool GuestContainer::CallOnLoad(const std::string& library, std::uint32_t* versi
     if (file.size() < 3 || file.compare(file.size() - 3, 3, ".so") != 0) {
         file += ".so";
     }
+    // The entry is taken out of the list before it runs. It is guest code, and
+    // an archive loads libraries from it: a protector's JNI_OnLoad calls
+    // System.loadLibrary for the next stage, and a stub the archive unpacked
+    // goes through System.load. Either appends to this very list, which
+    // reallocates it; an iterator taken before the guest ran would then move
+    // elements out of freed memory. Removing it first also means a nested load
+    // of the same library cannot run the entry twice.
+    PendingOnLoad pending;
+    bool found = false;
     for (auto entry = impl_->on_load.begin(); entry != impl_->on_load.end(); ++entry) {
         if (entry->file != file && entry->soname != file && entry->soname != library) {
             continue;
         }
-        // The entry runs on the thread that is loading the library, the way an
-        // imported native does: JNI_OnLoad is guest code reached from Java, and
-        // a platform thread has no ARM stack or TLS of its own. The boot machine
-        // cannot stand in for it -- that thread may still be parked in the boot
-        // program, and its registers and TLS belong to it alone.
-        const std::uint32_t vm = impl_->jni->GuestVm();
-        std::uint32_t value = 0;
-        if (A32Machine* current = CurrentGuestMachine(); current != nullptr) {
-            // A load issued by guest code that this call already runs: it nests
-            // on that thread's machine, where the Java frame above it lives.
-            if (current->Executing()) {
-                current->CallNested(entry->entry, {vm, 0});
-            } else {
-                current->CallFunction(entry->entry, {vm, 0});
-            }
-            value = current->Reg(0);
-        } else {
-            std::uint32_t high = 0;
-            if (!RunOnGuestThread(entry->entry, {vm, 0}, &value, &high)) {
-                return false;
-            }
-        }
-        // A refusing entry leaves the library unloaded on the platform, and the
-        // next load tries it again: a caller that has set up the state the entry
-        // reads by then gets a different answer. A successful one never runs a
-        // second time.
-        if (value != 0) {
-            impl_->on_load.erase(entry);
-        }
-        if (version != nullptr) {
-            *version = value;
-        }
-        return true;
+        pending = *entry;
+        impl_->on_load.erase(entry);
+        found = true;
+        break;
     }
-    return false;
+    if (!found) {
+        return false;
+    }
+    // The entry runs on the thread that is loading the library, the way an
+    // imported native does: JNI_OnLoad is guest code reached from Java, and a
+    // platform thread has no ARM stack or TLS of its own. The boot machine
+    // cannot stand in for it -- that thread may still be parked in the boot
+    // program, and its registers and TLS belong to it alone.
+    const std::uint32_t vm = impl_->jni->GuestVm();
+    std::uint32_t value = 0;
+    if (A32Machine* current = CurrentGuestMachine(); current != nullptr) {
+        // A load issued by guest code that this call already runs: it nests
+        // on that thread's machine, where the Java frame above it lives.
+        if (current->Executing()) {
+            current->CallNested(pending.entry, {vm, 0});
+        } else {
+            current->CallFunction(pending.entry, {vm, 0});
+        }
+        value = current->Reg(0);
+    } else {
+        std::uint32_t high = 0;
+        if (!RunOnGuestThread(pending.entry, {vm, 0}, &value, &high)) {
+            impl_->on_load.push_back(pending);
+            return false;
+        }
+    }
+    // A refusing entry leaves the library unloaded on the platform, and the
+    // next load tries it again: a caller that has set up the state the entry
+    // reads by then gets a different answer. A successful one never runs a
+    // second time.
+    if (value == 0) {
+        impl_->on_load.push_back(pending);
+    }
+    if (version != nullptr) {
+        *version = value;
+    }
+    return true;
+}
+
+GuestContainer::LoadResult GuestContainer::LoadGuestLibrary(const std::string& path,
+                                                            std::string* error) {
+#if ARMBAT_GUEST_RUNTIME_BIONIC
+    // The archive hands over a host path: its Java half runs in this process
+    // and built the name from the context's own directory. Only an ELF32 ARM
+    // image belongs to the guest; a 64-bit image, or a file the unpacker wrote
+    // half-way, is the platform's to refuse, and it names that reason better.
+    const std::vector<unsigned char> image = ReadWholeFile(path);
+    const bool elf = image.size() >= 52 && image[0] == 0x7f && image[1] == 'E' &&
+                     image[2] == 'L' && image[3] == 'F';
+    if (!elf || image[4] != 1 /*ELFCLASS32*/ || image[5] != 1 /*ELFDATA2LSB*/) {
+        return LoadResult::NotGuestImage;
+    }
+    const std::uint16_t machine =
+        static_cast<std::uint16_t>(image[18] | (static_cast<std::uint16_t>(image[19]) << 8));
+    if (machine != 40 /*EM_ARM*/) {
+        return LoadResult::NotGuestImage;
+    }
+    // Loading the same file twice is a no-op on the platform; running the entry
+    // again would bind its natives twice.
+    for (const Impl::LoadedLibrary& library : impl_->loaded_libraries) {
+        if (library.path == path) {
+            return LoadResult::Loaded;
+        }
+    }
+    const std::uint32_t handle = impl_->bionic->Dlopen(path, 2 /*RTLD_NOW*/);
+    if (handle == 0) {
+        *error = impl_->bionic->LastError();
+        return LoadResult::Failed;
+    }
+    const std::size_t slash = path.find_last_of('/');
+    const std::string file = slash == std::string::npos ? path : path.substr(slash + 1);
+    const std::uint32_t on_load = impl_->bionic->Dlsym(handle, "JNI_OnLoad");
+    impl_->loaded_libraries.push_back(Impl::LoadedLibrary{handle, path, file, file, on_load});
+    if (on_load != 0) {
+        impl_->on_load.push_back(PendingOnLoad{file, file, on_load});
+    }
+    // Exported entry points, collected the same way an archive library's are at
+    // startup: the JNI bridge binds them to the classes of the loader in use.
+    for (const std::string& name : ReadDynamicFunctionNames(image.data(), image.size())) {
+        if (name.rfind("Java_", 0) != 0) {
+            continue;
+        }
+        const std::uint32_t address = impl_->bionic->Dlsym(handle, name);
+        if (address != 0) {
+            impl_->bionic_exports.push_back(GuestExport{name, address});
+        }
+    }
+    return LoadResult::Loaded;
+#else
+    // The HLE loader maps libraries by name from the archive; a file written at
+    // run time is left to the platform's System.load.
+    (void)path;
+    (void)error;
+    return LoadResult::NotGuestImage;
+#endif
+}
+
+void GuestContainer::RearmOnLoad() {
+#if ARMBAT_GUEST_RUNTIME_BIONIC
+    impl_->on_load.clear();
+    for (const Impl::LoadedLibrary& library : impl_->loaded_libraries) {
+        if (library.on_load != 0) {
+            impl_->on_load.push_back(PendingOnLoad{library.file, library.soname, library.on_load});
+        }
+    }
+#endif
 }
 
 std::string GuestContainer::LoadApk(const std::string& apk_path, const std::string& cache_dir,
@@ -1769,6 +1866,7 @@ std::string GuestContainer::LoadApk(const std::string& apk_path, const std::stri
     impl_->on_load.clear();
     impl_->bionic_exports.clear();
     impl_->bionic_handles.clear();
+    impl_->loaded_libraries.clear();
 
     // Maps every name an archive library answers to: the name of its file and
     // the soname other images put in DT_NEEDED.
@@ -1812,6 +1910,8 @@ std::string GuestContainer::LoadApk(const std::string& apk_path, const std::stri
             impl_->on_load.push_back(PendingOnLoad{library.file, library.soname, on_load});
         }
         impl_->bionic_handles.push_back(handle);
+        impl_->loaded_libraries.push_back(
+            Impl::LoadedLibrary{handle, path, library.file, library.soname, on_load});
         // Java entry points exported by name: the JNI bridge registers them with
         // the host runtime so the archive's Java side can call its own native
         // methods. Their names come from the file, their addresses from the
