@@ -76,12 +76,15 @@ import java.util.zip.ZipFile
 object GuestDex {
 
     /** Bump when the rewrite rules or the cache layout change. */
-    private const val CACHE_VERSION = 6
+    private const val CACHE_VERSION = 7
 
     private const val CACHE_MARKER = ".ok"
     private const val DEX_CLASS_LOADER_CLASS = "Ldalvik/system/DexClassLoader;"
     private const val GUEST_DEX_CLASS_LOADER_CLASS = "Ldev/armbat/GuestDexClassLoader;"
     private const val PLATFORM_DEX = "guestplatform.dex"
+
+    /** Subtree of `files/dex` that holds the per-build platform dex. */
+    private const val PLATFORM_ROOT = ".platform"
 
     private const val PENDING_INTENT_CLASS = "Landroid/app/PendingIntent;"
     private const val GUEST_PENDING_INTENTS = "Ldev/armbat/GuestPendingIntents;"
@@ -113,8 +116,8 @@ object GuestDex {
      * string table actually contains one.
      *
      * The result is cached under `files/dex/<apk>/<key>/`; `guestplatform.dex`
-     * is part of the same directory because it is loaded through the same
-     * class loader and changes with the container build.
+     * lives in its own cache under `files/dex/.platform/` because it belongs to
+     * the container build rather than to the archive (see [platformDex]).
      */
     fun prepare(
         host: Context,
@@ -134,33 +137,34 @@ object GuestDex {
         // The runtime writes the description of the emulated core here for
         // native readers; Java readers get the same file (see rules).
         val cpuInfo = File(host.codeCacheDir, "cpuinfo").absolutePath
-        val key = cacheKey(host, packageName, data, obb, cpuInfo, entries)
+        val key = cacheKey(packageName, data, obb, cpuInfo, entries)
         val lock = locks.computeIfAbsent(root.absolutePath) { Any() }
         return synchronized(lock) {
             val directory = File(root, key)
-            val names = entries.map { it.name } + PLATFORM_DEX
+            val names = entries.map { it.name }
             val started = SystemClock.elapsedRealtime()
-            if (isComplete(directory, names)) {
+            val hit = isComplete(directory, names)
+            if (hit) {
                 names.forEach { name ->
                     val file = File(directory, name)
                     if (file.canWrite()) {
                         file.setReadOnly()
                     }
                 }
-                ArmbatLog.i(
-                    "Armbat",
-                    "dex cache: hit ${entries.size} files in ${SystemClock.elapsedRealtime() - started} ms",
+            } else {
+                build(
+                    host, apk, packageName, data, obb, cpuInfo, root, directory, entries, onStage,
                 )
-                return@synchronized names.map { File(directory, it) }.sortedBy { it.name }
             }
-            val files = build(
-                host, apk, packageName, data, obb, cpuInfo, root, directory, entries, onStage,
-            )
+            val platform = platformDex(host)
             ArmbatLog.i(
                 "Armbat",
-                "dex cache: built ${entries.size} files in ${SystemClock.elapsedRealtime() - started} ms",
+                "dex cache: ${if (hit) "hit" else "built"} ${entries.size} files in " +
+                    "${SystemClock.elapsedRealtime() - started} ms",
             )
-            files
+            (names + PLATFORM_DEX)
+                .sorted()
+                .map { name -> if (name == PLATFORM_DEX) platform else File(directory, name) }
         }
     }
 
@@ -316,33 +320,93 @@ object GuestDex {
             .toList()
     }
 
+    /**
+     * Identity of the rewritten dex: the archive's own dex bytes plus every
+     * input of the rewrite rules.
+     *
+     * The container build is deliberately absent. The rewritten file only
+     * carries string constants and names like `Ldev/armbat/GuestEnvironment;`;
+     * the code those names resolve to is loaded by the parent class loader and
+     * can change without touching this file. Including the installed APK would
+     * invalidate every archive's dex on every container update — the rewrite of
+     * one large dex takes tens of seconds — so [CACHE_VERSION] is what marks a
+     * change of rules instead.
+     */
     private fun cacheKey(
-        host: Context,
         packageName: String,
         data: File,
         obb: File,
         cpuInfo: String,
         entries: List<DexEntry>,
     ): String {
-        val hostApk = File(host.applicationInfo.sourceDir)
         val raw = buildString {
             append(CACHE_VERSION).append('|')
             append(packageName).append('|')
             append(data.absolutePath).append('|')
             append(obb.absolutePath).append('|')
             append(cpuInfo).append('|')
-            append(hostApk.length()).append('|')
-            append(hostApk.lastModified()).append('|')
             for (entry in entries) {
                 append(entry.name).append(':').append(entry.crc).append(':').append(entry.size).append('|')
             }
         }
+        return digest(raw).take(32)
+    }
+
+    private fun digest(raw: String): String {
         val digest = MessageDigest.getInstance("SHA-256").digest(raw.toByteArray(Charsets.UTF_8))
         return buildString {
             for (byte in digest) {
                 append("%02x".format(byte.toInt() and 0xFF))
             }
-        }.take(32)
+        }
+    }
+
+    /** One lock for the per-build platform dex, separate from the archive roots. */
+    private val platformLock = Any()
+
+    /**
+     * `guestplatform.dex` is the container's own guest activity shim: it is
+     * rebuilt with the container, not with the archive, so it gets its own key
+     * instead of living inside the archive's cache directory. That is what lets
+     * a container update keep every archive's rewritten dex.
+     */
+    private fun platformDex(host: Context): File = synchronized(platformLock) {
+        val hostApk = File(host.applicationInfo.sourceDir)
+        val root = File(host.filesDir, "dex/$PLATFORM_ROOT")
+        val key = digest("$CACHE_VERSION|${hostApk.length()}|${hostApk.lastModified()}").take(32)
+        val directory = File(root, key)
+        val target = File(directory, PLATFORM_DEX)
+        if (!target.isFile) {
+            val temporary = File(root, ".tmp-${System.nanoTime()}")
+            temporary.deleteRecursively()
+            if (!temporary.mkdirs() && !temporary.isDirectory) {
+                throw IOException(host.getString(R.string.error_dex_create, temporary.path))
+            }
+            try {
+                val staged = File(temporary, PLATFORM_DEX)
+                host.assets.open(PLATFORM_DEX).use { input ->
+                    staged.outputStream().use { output -> input.copyTo(output) }
+                }
+                staged.setReadOnly()
+                directory.deleteRecursively()
+                if (!temporary.renameTo(directory)) {
+                    throw IOException(host.getString(R.string.error_dex_publish, directory.path))
+                }
+            } catch (error: Throwable) {
+                temporary.deleteRecursively()
+                throw error
+            }
+        }
+        // Only the build in use matters; the previous one is stale by definition.
+        root.listFiles()?.forEach { sibling ->
+            if (sibling != directory) {
+                sibling.deleteRecursively()
+            }
+        }
+        if (target.canWrite()) {
+            target.setReadOnly()
+        }
+        target
     }
 
     private fun isComplete(directory: File, names: List<String>): Boolean =
@@ -361,7 +425,7 @@ object GuestDex {
         directory: File,
         entries: List<DexEntry>,
         onStage: ((LaunchStage) -> Unit)?,
-    ): List<File> {
+    ) {
         val temporary = File(root, ".tmp-${System.nanoTime()}")
         temporary.deleteRecursively()
         if (!temporary.mkdirs()) {
@@ -380,11 +444,6 @@ object GuestDex {
                     target.setReadOnly()
                 }
             }
-            val platform = File(temporary, PLATFORM_DEX)
-            host.assets.open(PLATFORM_DEX).use { input ->
-                platform.outputStream().use { output -> input.copyTo(output) }
-            }
-            platform.setReadOnly()
             // The marker is written last: a crash in the middle leaves a
             // directory that the next launch deletes instead of loading.
             File(temporary, CACHE_MARKER).writeText("")
@@ -400,8 +459,6 @@ object GuestDex {
                     sibling.deleteRecursively()
                 }
             }
-            return (entries.map { File(directory, it.name) } + File(directory, PLATFORM_DEX))
-                .sortedBy { it.name }
         } catch (error: Throwable) {
             temporary.deleteRecursively()
             throw error
