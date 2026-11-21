@@ -595,6 +595,42 @@ SuiteReport RunLoaderSelftest() {
     report.Check("kernel.brk", brk_value == 42,
                  detail::Format("wrote and read the byte at the new break: %u", brk_value));
 
+    // The map the guest reads has to be its own: the container answers the file
+    // from the guest's tables, and a host address in it is unusable to a 32-bit
+    // parser -- libmcmusic (Minecraft 0.9.4) scans the range it computes from one
+    // and dies on a page the guest never owned. Every start is eight digits here,
+    // and the break this test just grew is named the way Linux names it.
+    const std::uint32_t maps_buffer = kDataAddr + 0xB00;
+    const std::uint32_t maps_count = call_in(*syscalls, "lib_proc_maps", {maps_buffer, 900});
+    std::size_t longest = 0;
+    bool host_address = false;
+    std::string maps_text;
+    if (static_cast<std::int32_t>(maps_count) > 0) {
+        maps_text.assign(reinterpret_cast<const char*>(arena.Ptr(maps_buffer)),
+                         std::min<std::size_t>(maps_count, 900));
+        std::size_t line_start = 0;
+        while (line_start < maps_text.size()) {
+            const std::size_t line_end = maps_text.find('\n', line_start);
+            const std::size_t stop =
+                line_end == std::string::npos ? maps_text.size() : line_end;
+            const std::size_t dash = maps_text.find('-', line_start);
+            if (dash != std::string::npos && dash < stop) {
+                longest = std::max(longest, dash - line_start);
+            }
+            if (line_end == std::string::npos) {
+                break;
+            }
+            line_start = line_end + 1;
+        }
+        host_address = longest > 8;
+    }
+    report.Check("kernel.proc_maps", maps_count > 0 && !host_address &&
+                                         maps_text.find("[heap]") != std::string::npos,
+                 detail::Format("%u bytes, longest start %u digits%s", maps_count, longest,
+                                maps_text.find("[heap]") != std::string::npos
+                                    ? ", [heap] named"
+                                    : ", [heap] missing"));
+
     const std::uint32_t slept = call_in(*syscalls, "lib_sleep_measure", {});
     report.Check("kernel.clock", slept >= 5 && slept < 500,
                  detail::Format("CLOCK_MONOTONIC advanced %u ms across a 10 ms sleep", slept));

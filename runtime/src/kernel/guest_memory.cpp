@@ -1,4 +1,6 @@
 #include "armbat/guest_memory.h"
+#include <cstdio>
+#include <string>
 
 #include <algorithm>
 #include <cerrno>
@@ -589,6 +591,58 @@ std::uint32_t GuestMemory::Break(std::uint32_t requested) {
     }
     brk_current_ = requested;
     return requested;
+}
+
+// ---- the guest's own map ---------------------------------------------------
+
+namespace {
+
+bool InsideImages(std::uint64_t start, std::uint64_t end,
+                  const std::vector<GuestModule>& images) {
+    for (const GuestModule& image : images) {
+        if (start >= image.base && end <= image.end) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void AppendRange(std::string& out, std::uint64_t start, std::uint64_t end, const char* perms,
+                 const char* name) {
+    char line[512];
+    // The layout of one /proc/self/maps line, unchanged: a parser that splits on
+    // the first five fields has to keep working.
+    if (name != nullptr && name[0] != '\0') {
+        std::snprintf(line, sizeof(line), "%08llx-%08llx %s 00000000 00:00 0 %s\n",
+                      static_cast<unsigned long long>(start),
+                      static_cast<unsigned long long>(end), perms, name);
+    } else {
+        std::snprintf(line, sizeof(line), "%08llx-%08llx %s 00000000 00:00 0\n",
+                      static_cast<unsigned long long>(start),
+                      static_cast<unsigned long long>(end), perms);
+    }
+    out += line;
+}
+
+}  // namespace
+
+void GuestMemory::Describe(std::string& out, const std::vector<GuestModule>& images) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& entry : live_) {
+        const std::uint64_t start = entry.first;
+        const std::uint64_t end = entry.second.end;
+        if (InsideImages(start, end, images)) {
+            continue;
+        }
+        AppendRange(out, start, end, entry.second.shared ? "rw-s" : "rw-p", nullptr);
+    }
+}
+
+void GuestMemory::DescribeBreak(std::string& out) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (brk_mapped_end_ > brk_base_) {
+        AppendRange(out, brk_base_, brk_mapped_end_, "rw-p", "[heap]");
+    }
 }
 
 }  // namespace armbat

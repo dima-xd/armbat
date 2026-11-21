@@ -123,6 +123,17 @@ private:
     std::int32_t DispatchPrivate(std::uint32_t number, const std::uint32_t* args);
     bool ReadString(std::uint32_t address, std::string& out) const;
     std::string MapPath(const std::string& guest_path) const;
+    // /proc/self/maps answered from the guest's own address space. Returns a
+    // descriptor holding the text, or -errno.
+    //
+    // The file is passed through to the host like every other /proc path, and the
+    // host's map is not the guest's: its ranges are host addresses, so a 32-bit
+    // guest that parses one gets a truncated pointer, and code that scans the
+    // range it computed from that pointer (Minecraft 0.9.4's libmcmusic looks for
+    // a signature before the offset it knows) reads a page the guest was never
+    // given. Answering the guest's own ranges is also the honest answer: it is
+    // the map the guest would have on a device.
+    int ServeMaps();
     // Turns a name relative to the guest's working directory into the absolute
     // guest name of the same file.
     static std::string ResolveGuestPath(std::string guest_path);

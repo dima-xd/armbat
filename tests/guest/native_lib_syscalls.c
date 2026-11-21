@@ -118,6 +118,24 @@ int lib_open_missing(const char* path) {
     return syscall3(SYS_open, (int)path, O_RDONLY, 0);
 }
 
+// A guest that parses /proc/self/maps must be handed guest addresses. The file
+// is answered from the container's own maps, so its ranges are host ones; a
+// guest that reads them gets an address it cannot use, and code that scans the
+// range it computes (Minecraft's libmcmusic does exactly that) dies on the page
+// it was never given.
+int lib_proc_maps(char* buffer, int capacity) {
+    const int fd = syscall3(SYS_open, (int)"/proc/self/maps", O_RDONLY, 0);
+    if (fd < 0) {
+        return fd;
+    }
+    const int count = syscall3(SYS_read, fd, (int)buffer, capacity - 1);
+    syscall1(SYS_close, fd);
+    if (count > 0) {
+        buffer[count] = '\0';
+    }
+    return count;
+}
+
 int lib_read_bad_fd(void) {
     char byte = 0;
     return syscall3(SYS_read, -1, (int)&byte, 1);

@@ -4,7 +4,10 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
+
+#include "armbat/guest_modules.h"
 
 namespace armbat {
 
@@ -72,6 +75,17 @@ public:
 
     // Returns the program break after the call, following Linux brk semantics.
     std::uint32_t Break(std::uint32_t requested);
+
+    // The ranges this class owns, written the way /proc/self/maps writes them, so
+    // the kernel can answer that file from the guest's own address space instead
+    // of handing over the host process's map. Ranges already covered by a loaded
+    // image are left out: the image is named by its path, its segments are not
+    // tracked per-protection here, and two lines for one range would only make the
+    // file look corrupted to a guest that parses it.
+    void Describe(std::string& out, const std::vector<GuestModule>& images) const;
+
+    // The committed part of the program break, for the same file.
+    void DescribeBreak(std::string& out) const;
 
 private:
     // A descriptor kept open for a shared file mapping. The guest is free to

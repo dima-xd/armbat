@@ -27,6 +27,7 @@
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/random.h>
 #include <sys/resource.h>
 #include <sys/select.h>
@@ -790,6 +791,47 @@ std::string GuestKernel::MapPath(const std::string& guest_path) const {
     return guest_path;
 }
 
+int GuestKernel::ServeMaps() {
+    // A descriptor, not a buffer: the guest may read the file in pieces, seek in
+    // it, or close it at any point, and every one of those has to keep working.
+    const int fd = ::memfd_create("armbat-maps", 0);
+    if (fd < 0) {
+        return -errno;
+    }
+
+    std::string text;
+    text.reserve(8192);
+    const std::vector<GuestModule> images = GuestModules();
+    for (const GuestModule& image : images) {
+        char line[512];
+        std::snprintf(line, sizeof(line), "%08x-%08x r-xp 00000000 00:00 0 %s\n", image.base,
+                      image.end, image.path.c_str());
+        text += line;
+    }
+    memory_.Describe(text, images);
+    memory_.DescribeBreak(text);
+
+    std::size_t written = 0;
+    while (written < text.size()) {
+        const ssize_t count = ::write(fd, text.data() + written, text.size() - written);
+        if (count < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            const int code = errno;
+            ::close(fd);
+            return -code;
+        }
+        written += static_cast<std::size_t>(count);
+    }
+    if (::lseek(fd, 0, SEEK_SET) != 0) {
+        const int code = errno;
+        ::close(fd);
+        return -code;
+    }
+    return fd;
+}
+
 void GuestKernel::RegisterGuestFd(int fd) {
     TrackGuestFd(fd);
 }
@@ -1233,6 +1275,14 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
         // against that descriptor, as on a real kernel.
         if (directory == AT_FDCWD) {
             path = ResolveGuestPath(std::move(path));
+        }
+        if (path == "/proc/self/maps") {
+            const int maps = ServeMaps();
+            if (maps < 0) {
+                return maps;
+            }
+            TrackGuestFd(maps);
+            return maps;
         }
         const std::string host_path = MapPath(path);
 
