@@ -253,9 +253,10 @@ bool AttachGuestLooperSource(std::uint32_t looper, std::uint32_t fd, std::uint32
 // source behind: the descriptor number is reused by the next pipe.
 void DetachGuestLooperSource(std::uint32_t fd);
 
-// OpenSL ES. Unlike the flat entry points these hand the guest objects with
-// vtables of their own, so they are built here instead of forwarded to a host
-// engine.
+// OpenSL ES. The guest holds a 32-bit object whose first word is a table of
+// ARMv7 function pointers, so each platform object is proxied by a guest block
+// and every method forwards to the platform: states, queue depth, volume and
+// callbacks are the real ones, only the ABI is adapted here.
 void RegisterOpenslesFunctions(HleRegistry& registry);
 
 // Runs a guest function on a host thread that owns a guest context. The audio

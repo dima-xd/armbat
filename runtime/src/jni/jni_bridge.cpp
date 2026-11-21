@@ -12,7 +12,6 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
-#include <chrono>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -97,79 +96,6 @@ thread_local std::vector<std::uint32_t> g_thread_refs;
 
 void Log(const std::string& line) {
     ARMBAT_LOG_TEXT(LogLevel::Info, "Armbat", line);
-}
-
-// TEMPORARY, for the audio crackle report. The mixer hands PCM to the platform
-// through AudioTrack.write, once per buffer; the device underruns when the gap
-// between two writes is longer than the buffer it has been given, and a write
-// that blocks for a long time says the queue was still full. Both numbers are
-// the whole diagnosis, so they are measured here and printed once every two
-// seconds. Remove with the report.
-void NoteAudioWrite(std::chrono::steady_clock::time_point start,
-                    std::chrono::steady_clock::time_point end, std::int32_t written) {
-    static std::mutex mutex;
-    static std::uint64_t window_start_ns = 0;
-    static std::uint64_t last_call_ns = 0;
-    static std::uint64_t calls = 0;
-    static std::uint64_t bytes = 0;
-    static std::uint64_t gap_sum_ns = 0;
-    static std::uint64_t gap_max_ns = 0;
-    static std::uint64_t block_sum_ns = 0;
-    static std::uint64_t block_max_ns = 0;
-    static std::uint64_t long_gaps = 0;
-    const auto ns = [](std::chrono::steady_clock::time_point point) {
-        return static_cast<std::uint64_t>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(point.time_since_epoch())
-                .count());
-    };
-    const std::uint64_t now = ns(end);
-    std::string line;
-    {
-        const std::lock_guard lock(mutex);
-        if (window_start_ns == 0) {
-            window_start_ns = ns(start);
-            last_call_ns = ns(start);
-        }
-        const std::uint64_t gap = now - last_call_ns;
-        last_call_ns = now;
-        const std::uint64_t block = ns(end) - ns(start);
-        ++calls;
-        bytes += written > 0 ? static_cast<std::uint64_t>(written) : 0;
-        gap_sum_ns += gap;
-        gap_max_ns = std::max(gap_max_ns, gap);
-        block_sum_ns += block;
-        block_max_ns = std::max(block_max_ns, block);
-        if (gap > 30000000ULL) {
-            ++long_gaps;
-        }
-        const std::uint64_t span = now - window_start_ns;
-        if (span >= 2000000000ULL) {
-            char text[256];
-            std::snprintf(text, sizeof(text),
-                          "audio: %llu writes in %llu ms, %llu KiB, gap avg=%.1f max=%.1f ms "
-                          "(>30 ms: %llu), block avg=%.2f max=%.2f ms",
-                          static_cast<unsigned long long>(calls),
-                          static_cast<unsigned long long>(span / 1000000ULL),
-                          static_cast<unsigned long long>(bytes / 1024ULL),
-                          static_cast<double>(gap_sum_ns) / 1e6 / static_cast<double>(calls),
-                          static_cast<double>(gap_max_ns) / 1e6,
-                          static_cast<unsigned long long>(long_gaps),
-                          static_cast<double>(block_sum_ns) / 1e6 / static_cast<double>(calls),
-                          static_cast<double>(block_max_ns) / 1e6);
-            line = text;
-            window_start_ns = now;
-            calls = 0;
-            bytes = 0;
-            gap_sum_ns = 0;
-            gap_max_ns = 0;
-            block_sum_ns = 0;
-            block_max_ns = 0;
-            long_gaps = 0;
-        }
-    }
-    if (!line.empty()) {
-        ARMBAT_LOG_INFO("Armbat", "%s", line.c_str());
-    }
 }
 
 JNIEnv* HostEnv() {
@@ -602,7 +528,22 @@ struct JniBridge::Impl {
         // for the address on the call that fills it, which is the path this
         // keeps fast: the copy happens once per boundary, not once per buffer.
         bool handed_out = false;
+        // Which thread is in the middle of a guest call that was handed this
+        // buffer. A boundary in another thread must not write the copy back
+        // while this one is still filling it: the two calls run side by side,
+        // and the audio thread's block was being replaced by the previous one
+        // whenever the render thread reached a boundary first.
+        std::uintptr_t owner = 0;
     };
+    // Identity of the calling thread for the mirror table. A buffer is mirrored
+    // per thread, so two threads filling the same Java buffer do not write into
+    // each other's copy.
+    static std::uintptr_t MirrorThread() {
+        static thread_local const char token = 0;
+        return reinterpret_cast<std::uintptr_t>(&token);
+    }
+    // Handed out by this thread and not yet written back.
+    static inline thread_local std::size_t mirror_pending = 0;
     std::vector<DirectMirror> mirrors;
     std::mutex mirrors_mutex;
     // Buffers are pinned, so every one of them holds its memory until the world
@@ -614,7 +555,6 @@ struct JniBridge::Impl {
     // to write back" is no nearly always, and a lock there would sit on the path
     // every guest JNI call takes.
     std::atomic<std::size_t> mirror_count{0};
-    std::atomic<std::size_t> mirror_pending{0};
     bool mirror_refused = false;
 
     // Re-entrant on one thread. RegisterExports binds Java_* symbols by asking
@@ -1241,15 +1181,14 @@ struct JniBridge::Impl {
             ARMBAT_LOG_INFO("Armbat", "jni: direct buffer mirror %llu bytes",
                             static_cast<unsigned long long>(bytes_needed));
         }
+        const std::uintptr_t thread = MirrorThread();
         const std::lock_guard lock(mirrors_mutex);
         for (DirectMirror& mirror : mirrors) {
-            if (mirror.host != host || mirror.capacity != bytes_needed) {
+            if (mirror.host != host || mirror.capacity != bytes_needed || mirror.owner != thread) {
                 continue;
             }
-            if (!mirror.handed_out) {
-                mirror.handed_out = true;
-                mirror_pending.fetch_add(1, std::memory_order_relaxed);
-            }
+            mirror.handed_out = true;
+            ++mirror_pending;
             std::memcpy(arena.Ptr(mirror.guest), host, mirror.capacity);
             return mirror.guest;
         }
@@ -1283,9 +1222,9 @@ struct JniBridge::Impl {
             return 0;
         }
         std::memcpy(arena.Ptr(guest), host, static_cast<std::size_t>(bytes_needed));
-        mirrors.push_back(DirectMirror{kept, host, guest, bytes_needed, true});
+        mirrors.push_back(DirectMirror{kept, host, guest, bytes_needed, true, MirrorThread()});
         mirror_count.store(mirrors.size(), std::memory_order_release);
-        mirror_pending.fetch_add(1, std::memory_order_relaxed);
+        ++mirror_pending;
         return guest;
     }
 
@@ -1324,18 +1263,19 @@ struct JniBridge::Impl {
     // data from before them; a buffer nobody asked for since the last boundary
     // is left alone, because Java may have refilled it in the meantime.
     void FlushDirectBuffers() {
-        if (mirror_pending.load(std::memory_order_acquire) == 0) {
+        if (mirror_pending == 0) {
             return;
         }
+        const std::uintptr_t thread = MirrorThread();
         const std::lock_guard lock(mirrors_mutex);
         for (DirectMirror& mirror : mirrors) {
-            if (!mirror.handed_out) {
+            if (!mirror.handed_out || mirror.owner != thread) {
                 continue;
             }
             std::memcpy(mirror.host, arena.Ptr(mirror.guest), mirror.capacity);
             mirror.handed_out = false;
         }
-        mirror_pending.store(0, std::memory_order_release);
+        mirror_pending = 0;
     }
 
     // Refreshes the arena copies from Java's memory. Called where control passes
@@ -3212,28 +3152,11 @@ struct JniBridge::Impl {
                                     call.Machine().Reg(2), call.Machine().Reg(3));
             }
         }
-        // TEMPORARY, for the audio crackle report: the mixer's only call that
-        // hands PCM to the device.
-        const bool audio_write =
-            ref.name == "write" &&
-            (ref.signature.compare(0, 5, "([BII") == 0 ||
-             ref.signature.compare(0, 5, "([SII") == 0 ||
-             ref.signature.compare(0, 22, "(Ljava/nio/ByteBuffer;") == 0);
-        const auto audio_start =
-            audio_write ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const std::string previous = current_call;
         current_call = ref.name + ref.signature;
         InvokeCall(call, returns, family == 2, family == 1, object, type, ref.method,
                    values.empty() ? nullptr : values.data(), result_descriptor);
         current_call = previous;
-        if (audio_write) {
-            NoteAudioWrite(audio_start, std::chrono::steady_clock::now(),
-                           static_cast<std::int32_t>(call.Machine().Reg(0)));
-        }
-        if (ref.name == "getMinBufferSize" && LogAllowed("audio-minbuf", 4)) {
-            ARMBAT_LOG_INFO("Armbat", "audio: getMinBufferSize%s = %d", ref.signature.c_str(),
-                                static_cast<std::int32_t>(call.Machine().Reg(0)));
-        }
     }
 
     // Reads or writes one field. The field id carries the signature, so all
