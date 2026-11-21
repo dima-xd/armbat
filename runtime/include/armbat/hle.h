@@ -232,6 +232,27 @@ void RegisterAndroidFunctions(HleRegistry& registry);
 // GLES 2.0 entry points, reached through eglGetProcAddress.
 void RegisterGlesFunctions(HleRegistry& registry);
 
+// The sensor API (android/sensor.h). The host's own sensors are pumped on a
+// thread of the container's and copied into the queues the guest created, so the
+// archive sees the device's accelerometer and gyroscope instead of a null
+// manager.
+void RegisterSensorFunctions(HleRegistry& registry);
+
+// Stops the pump and forgets the guest handles: they point into the arena the
+// container is about to release. Called before teardown, like the audio thread.
+void StopGuestSensors();
+
+// Registers a container-owned descriptor with a guest looper the way the
+// platform attaches its own sources. A sensor queue needs it: its samples sit
+// behind a pipe the guest never opened, and the archive's ALooper_pollOnce has to
+// wake on it. A looper handle of zero means the calling thread's.
+bool AttachGuestLooperSource(std::uint32_t looper, std::uint32_t fd, std::uint32_t ident,
+                             std::uint32_t events, std::uint32_t callback, std::uint32_t data);
+
+// Removes that descriptor from every looper. A destroyed queue must not leave a
+// source behind: the descriptor number is reused by the next pipe.
+void DetachGuestLooperSource(std::uint32_t fd);
+
 // OpenSL ES. Unlike the flat entry points these hand the guest objects with
 // vtables of their own, so they are built here instead of forwarded to a host
 // engine.

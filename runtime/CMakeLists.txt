@@ -14,6 +14,7 @@ add_library(armbat_core STATIC
     src/hle/guest_android.cpp
     src/hle/guest_opensles.cpp
     src/hle/guest_input.cpp
+    src/hle/guest_sensors.cpp
     src/hle/guest_gles.cpp
     src/kernel/guest_kernel.cpp
     src/kernel/guest_signal.cpp

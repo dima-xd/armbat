@@ -497,7 +497,15 @@ std::int32_t PollLooperOnce(HleCall& call, std::int32_t timeout) {
             const std::uint32_t fd = source.fd;
             const std::uint32_t revents = static_cast<std::uint32_t>(fds[i].revents);
             const std::uint32_t data = source.data;
-            call.Machine().CallNested(source.callback, {fd, revents, data});
+            const std::uint32_t keep =
+                call.Machine().CallNested(source.callback, {fd, revents, data});
+            // android/looper.h: a callback that answers 0 asks for its source to
+            // leave the looper, and the platform removes it. Ignoring that answer
+            // leaves a descriptor the archive already gave up being dispatched
+            // forever, which turns its own unsubscribe into a spin.
+            if (keep == 0) {
+                LooperRemoveSource(*looper, source.fd);
+            }
             call.Return(static_cast<std::uint32_t>(kLooperCallback));
             return kLooperCallback;
         }
@@ -792,6 +800,29 @@ std::size_t FindBitmapLock(JNIEnv* env, jobject bitmap) {
 void SetGuestHeap(GuestHeap* heap) { g_heap = heap; }
 void SetGuestMemory(GuestMemory* memory) { g_memory = memory; }
 void SetGuestKernel(GuestKernel* kernel) { g_kernel = kernel; }
+
+bool AttachGuestLooperSource(std::uint32_t looper_handle, std::uint32_t fd, std::uint32_t ident,
+                             std::uint32_t events, std::uint32_t callback, std::uint32_t data) {
+    Looper* looper = LooperForHandle(looper_handle);
+    if (looper == nullptr) {
+        looper = g_thread_looper != nullptr ? g_thread_looper : CreateThreadLooper();
+    }
+    if (looper == nullptr) {
+        return false;
+    }
+    LooperAddSource(*looper, LooperSource{fd, ident, events, callback, data});
+    return true;
+}
+
+void DetachGuestLooperSource(std::uint32_t fd) {
+    // The descriptor leaves every looper, for the same reason the input queue
+    // does: a number the kernel reuses must not answer a stale source.
+    LooperTable& table = Loopers();
+    const std::lock_guard lock(table.mutex);
+    for (auto& entry : table.by_handle) {
+        LooperRemoveSource(*entry.second, fd);
+    }
+}
 
 void RegisterAndroidFunctions(HleRegistry& registry) {
     // ---- AAssetManager ----------------------------------------------------
@@ -2069,6 +2100,10 @@ void RegisterAndroidFunctions(HleRegistry& registry) {
     });
 
     RegisterGlesFunctions(registry);
+
+    // Sensors run on the host's own implementation, behind a pump thread; see
+    // guest_sensors.cpp.
+    RegisterSensorFunctions(registry);
 }
 
 }  // namespace armbat

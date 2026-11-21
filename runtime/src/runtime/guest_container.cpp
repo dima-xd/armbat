@@ -1327,6 +1327,9 @@ GuestContainer::~GuestContainer() {
     // arena is.
     StopGuestCallThread();
     SetGuestCallRunner(nullptr);
+    // The sensor handles point into that same arena; stop the pump that feeds
+    // them first.
+    StopGuestSensors();
 	SetGuestKernel(nullptr);
 }
 
