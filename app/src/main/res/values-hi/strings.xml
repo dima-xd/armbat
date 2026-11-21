@@ -70,6 +70,7 @@
     <string name="widescreen_off">बंद — ऐप की मूल स्क्रीन रहती है</string>
 
     <string name="updates">अपडेट</string>
+    <string name="update_channel">अपडेट चैनल</string>
     <string name="update_channel_release">रिलीज़</string>
     <string name="update_channel_nightly">Nightly</string>
     <string name="update_check">%1$s · जाँचने के लिए टैप करें</string>

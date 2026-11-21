@@ -42,6 +42,29 @@ internal object UpdateRules {
         buildLine.find(notes)?.groupValues?.get(1)?.lowercase()
 
     /**
+     * Whether a release tagged [version], carrying [code], replaces the installed
+     * build.
+     *
+     * On the channel the APK was built for, only a higher code is newer. A build
+     * of the other channel is a different build even when the numbers agree: a
+     * nightly is named after the last release and carries its code, so the
+     * numbers say nothing about which channel the installed build came from.
+     * The platform refuses only an actual downgrade, hence `>=`; a release older
+     * than the installed build is not offered at all.
+     */
+    fun replaces(
+        version: String,
+        code: Int?,
+        localCode: Int,
+        localVersion: String,
+        sameChannel: Boolean,
+    ): Boolean = when {
+        code == null -> compareVersions(version, localVersion) > 0
+        sameChannel -> code > localCode
+        else -> code >= localCode
+    }
+
+    /**
      * Whether two ids name the same commit. CI passes the full hash, while the
      * notes and a hand-cut build may carry an abbreviation of it.
      */

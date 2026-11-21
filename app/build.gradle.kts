@@ -18,10 +18,11 @@ android {
         ndk {
             abiFilters += "arm64-v8a"
         }
-        // The channel is fixed where the APK is built: a tag is a release, a
-        // branch build is a nightly, and the same source produces both. Nothing
-        // inside an installed APK says which of the two it is, so without this
-        // the updater could not stay on the channel it came from.
+        // The channel the APK is built for: a tag is a release, a branch build is
+        // a nightly, and the same source produces both. It is the updater's
+        // default, not its rule: the user can pick the other channel in Settings,
+        // and the build id (empty for a release) is what a nightly is compared
+        // against.
         val channel = (project.findProperty("armbatChannel") as String?) ?: "release"
         val buildId = (project.findProperty("armbatBuildId") as String?) ?: ""
         buildConfigField("String", "CHANNEL", "\"$channel\"")

@@ -73,6 +73,7 @@
     <string name="widescreen_off">Выкл. — экран, под который сделано приложение</string>
 
     <string name="updates">Обновления</string>
+    <string name="update_channel">Канал обновлений</string>
     <string name="update_channel_release">Релиз</string>
     <string name="update_channel_nightly">Nightly</string>
     <string name="update_check">%1$s · нажмите, чтобы проверить</string>

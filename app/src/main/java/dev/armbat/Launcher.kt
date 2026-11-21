@@ -642,16 +642,19 @@ fun SettingsScreen(
     localeTag: String,
     logLevel: Int,
     widescreen: Boolean,
+    channel: String,
     version: String,
     updateStatus: Updates.Status,
     onLocale: (String) -> Unit,
     onLogLevel: (Int) -> Unit,
     onWidescreen: (Boolean) -> Unit,
+    onChannel: (String) -> Unit,
     onCheckUpdates: () -> Unit,
     onAbout: () -> Unit,
 ) {
     var languageOpen by remember { mutableStateOf(false) }
     var logLevelOpen by remember { mutableStateOf(false) }
+    var channelOpen by remember { mutableStateOf(false) }
 
     Box(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize().background(HoloBlack)) {
@@ -681,12 +684,21 @@ fun SettingsScreen(
                     onToggle = { onWidescreen(!widescreen) },
                 )
                 HoloDivider()
-                // The row is also the answer: its summary is the state of the
-                // last check, so a tap that finds nothing new still says so.
+                // Rows for the updater only exist where it can act: a debug
+                // package cannot replace the release one, see Updates.enabled.
                 if (Updates.enabled) {
                     SettingsRow(
+                        title = stringResource(R.string.update_channel),
+                        summary = channelName(channel),
+                        onClick = { channelOpen = true },
+                    )
+                    HoloDivider()
+                    // The row is also the answer: its summary is the state of
+                    // the last check, so a tap that finds nothing new still
+                    // says so.
+                    SettingsRow(
                         title = stringResource(R.string.updates),
-                        summary = updateSummary(updateStatus),
+                        summary = updateSummary(channel, updateStatus),
                         onClick = onCheckUpdates,
                     )
                     HoloDivider()
@@ -721,6 +733,17 @@ fun SettingsScreen(
                 onDismiss = { logLevelOpen = false },
             )
         }
+
+        if (channelOpen) {
+            ChannelDialog(
+                channel = channel,
+                onPick = {
+                    channelOpen = false
+                    onChannel(it)
+                },
+                onDismiss = { channelOpen = false },
+            )
+        }
     }
 }
 
@@ -735,20 +758,24 @@ private fun logLevelLabel(level: Int): Int = when (level) {
     else -> R.string.log_level_info
 }
 
+/** The name a channel is shown as, in the row and in its picker. */
+@Composable
+private fun channelName(channel: String): String = stringResource(
+    if (channel == Updates.NIGHTLY) {
+        R.string.update_channel_nightly
+    } else {
+        R.string.update_channel_release
+    },
+)
+
 /** What the update row says under its title: the channel, and the last answer. */
 @Composable
-private fun updateSummary(status: Updates.Status): String {
-    val channel = stringResource(
-        if (Updates.channel == Updates.NIGHTLY) {
-            R.string.update_channel_nightly
-        } else {
-            R.string.update_channel_release
-        },
-    )
+private fun updateSummary(channel: String, status: Updates.Status): String {
+    val name = channelName(channel)
     return when (status) {
-        Updates.Status.Idle -> stringResource(R.string.update_check, channel)
+        Updates.Status.Idle -> stringResource(R.string.update_check, name)
         Updates.Status.Checking -> stringResource(R.string.update_checking)
-        Updates.Status.UpToDate -> stringResource(R.string.update_up_to_date, channel)
+        Updates.Status.UpToDate -> stringResource(R.string.update_up_to_date, name)
         is Updates.Status.Available -> stringResource(
             R.string.update_available,
             status.update.version,
@@ -872,6 +899,24 @@ private fun LogLevelDialog(
             ArmbatLog.TRACE to stringResource(R.string.log_level_trace),
         ),
         selected = logLevel,
+        onPick = onPick,
+        onDismiss = onDismiss,
+    )
+}
+
+@Composable
+private fun ChannelDialog(
+    channel: String,
+    onPick: (String) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    ChoiceDialog(
+        title = stringResource(R.string.update_channel),
+        options = listOf(
+            Updates.RELEASE to stringResource(R.string.update_channel_release),
+            Updates.NIGHTLY to stringResource(R.string.update_channel_nightly),
+        ),
+        selected = channel,
         onPick = onPick,
         onDismiss = onDismiss,
     )

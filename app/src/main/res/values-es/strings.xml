@@ -71,6 +71,7 @@
     <string name="widescreen_off">Desactivado: mantiene la pantalla original</string>
 
     <string name="updates">Actualizaciones</string>
+    <string name="update_channel">Canal de actualizaciones</string>
     <string name="update_channel_release">Versión estable</string>
     <string name="update_channel_nightly">Nightly</string>
     <string name="update_check">%1$s · toca para comprobar</string>

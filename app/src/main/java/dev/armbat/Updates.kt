@@ -21,9 +21,10 @@ import org.json.JSONObject
  *
  * The two channels are published from the same repository but are not
  * interchangeable: a release follows the newest version tag, a nightly follows
- * the `nightly` pre-release, whose asset is overwritten on every push. An
- * installed APK therefore stays on the channel it was built for, and a phone
- * that deliberately runs nightlies is never walked back to a release rule.
+ * the `nightly` pre-release, whose asset is overwritten on every push. The
+ * channel is a setting, and the one the APK was built for is only its default,
+ * so a phone that deliberately runs nightlies keeps following them until
+ * someone chooses otherwise.
  *
  * The check runs on the launcher's own network stack, not through the guest: it
  * is the container asking about itself, and a guest must never see this traffic.
@@ -38,12 +39,41 @@ object Updates {
     private const val NIGHTLY_TAG = "nightly"
     private const val TIMEOUT_MS = 15_000
 
+    private const val PREFS = "armbat.updates"
+    private const val KEY_CHANNEL = "channel"
+
     /** How long an answer is reused before GitHub is asked again. */
     private const val FRESH_MS = 10 * 60 * 1000L
 
-    /** The channel this APK was built for; set by the workflow, see build.gradle.kts. */
-    val channel: String
-        get() = BuildConfig.CHANNEL
+    /**
+     * The channel the user chose, or the one this APK was built for when nothing
+     * has been chosen yet.
+     *
+     * A stored value that names no channel is ignored rather than trusted: the
+     * updater must still work after a build that wrote something else there.
+     */
+    fun channel(context: Context): String {
+        val chosen = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getString(KEY_CHANNEL, null)
+        return if (chosen == NIGHTLY || chosen == RELEASE) chosen else BuildConfig.CHANNEL
+    }
+
+    /**
+     * Moves the updater to [channel].
+     *
+     * The cached answer and the turned-down offer belong to the channel that was
+     * asked, so both are dropped: keeping them would have the settings row
+     * report a nightly as up to date while a release is being asked for.
+     */
+    fun setChannel(context: Context, channel: String) {
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_CHANNEL, channel)
+            .apply()
+        cached = null
+        cachedAt = 0L
+        dismissed = null
+    }
 
     /**
      * Whether this package can update itself at all. The debug build installs
@@ -89,20 +119,25 @@ object Updates {
      * launcher recomposes on every return from a guest, and a check on each of
      * those would spend the unauthenticated rate limit for nothing.
      */
-    suspend fun check(fresh: Boolean): Status = asking.withLock {
+    suspend fun check(context: Context, fresh: Boolean): Status = asking.withLock {
         val last = cached
         if (!fresh && last != null && System.currentTimeMillis() - cachedAt < FRESH_MS) {
             return@withLock last
         }
+        val channel = channel(context)
         val result = withContext(Dispatchers.IO) {
-            runCatching { query() }.getOrElse { error ->
+            runCatching { query(channel) }.getOrElse { error ->
                 ArmbatLog.w("Armbat", "update check failed: ${error.message}")
                 Status.Failed(error.message ?: error.javaClass.simpleName)
             }
         }
         ArmbatLog.i("Armbat", "update check: $channel -> $result")
-        cached = result
-        cachedAt = System.currentTimeMillis()
+        // A check that outlived the channel it was started for must not answer
+        // the next channel's question.
+        if (channel(context) == channel) {
+            cached = result
+            cachedAt = System.currentTimeMillis()
+        }
         result
     }
 
@@ -211,21 +246,22 @@ object Updates {
         }
     }
 
-    private fun query(): Status {
+    private fun query(channel: String): Status {
         val release = fetch(if (channel == NIGHTLY) "tags/$NIGHTLY_TAG" else "latest")
         val asset = release.assets.firstOrNull { it.name.endsWith(".apk") }
             ?: return Status.Failed("no apk asset in ${release.tag}")
-        return if (channel == NIGHTLY) nightly(release, asset) else stable(release, asset)
+        return if (channel == NIGHTLY) nightly(release, asset) else stable(channel, release, asset)
     }
 
-    private fun stable(release: Release, asset: Asset): Status {
+    private fun stable(channel: String, release: Release, asset: Asset): Status {
         val version = release.tag.removePrefix("v")
-        val remoteCode = UpdateRules.versionCode(asset.name)
-        val newer = if (remoteCode != null) {
-            remoteCode > BuildConfig.VERSION_CODE
-        } else {
-            UpdateRules.compareVersions(version, BuildConfig.VERSION_NAME) > 0
-        }
+        val newer = UpdateRules.replaces(
+            version = version,
+            code = UpdateRules.versionCode(asset.name),
+            localCode = BuildConfig.VERSION_CODE,
+            localVersion = BuildConfig.VERSION_NAME,
+            sameChannel = channel == BuildConfig.CHANNEL,
+        )
         if (!newer) return Status.UpToDate
         return Status.Available(
             Update(

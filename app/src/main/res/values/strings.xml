@@ -73,6 +73,7 @@
     <string name="widescreen_off">Off — keeps the screen the app was made for</string>
 
     <string name="updates">Updates</string>
+    <string name="update_channel">Update channel</string>
     <string name="update_channel_release">Release</string>
     <string name="update_channel_nightly">Nightly</string>
     <string name="update_check">%1$s · tap to check</string>

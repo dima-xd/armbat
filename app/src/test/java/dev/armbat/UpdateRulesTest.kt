@@ -46,4 +46,34 @@ class UpdateRulesTest {
         assertFalse(UpdateRules.sameBuild(full, "2bff7fa"))
         assertFalse(UpdateRules.sameBuild("", "1aff7fa"))
     }
+
+    @Test
+    fun onlyAHigherCodeReplacesABuildOfTheSameChannel() {
+        assertTrue(replaces(version = "0.1.5", code = 6, sameChannel = true))
+        assertFalse(replaces(version = "0.1.4", code = 5, sameChannel = true))
+        assertFalse(replaces(version = "0.1.3", code = 4, sameChannel = true))
+    }
+
+    @Test
+    fun offersTheOtherChannelEvenWhenTheCodeIsTheSame() {
+        assertTrue(replaces(version = "0.1.4", code = 5, sameChannel = false))
+        assertFalse(replaces(version = "0.1.3", code = 4, sameChannel = false))
+    }
+
+    @Test
+    fun fallsBackToTheTagWhenTheNameCarriesNoCode() {
+        assertTrue(replaces(version = "0.1.5", code = null, sameChannel = true))
+        assertFalse(replaces(version = "0.1.4", code = null, sameChannel = true))
+        assertFalse(replaces(version = "0.1.4", code = null, sameChannel = false))
+    }
+
+    /** The installed build is always 0.1.4 (5) in these cases. */
+    private fun replaces(version: String, code: Int?, sameChannel: Boolean): Boolean =
+        UpdateRules.replaces(
+            version = version,
+            code = code,
+            localCode = 5,
+            localVersion = "0.1.4",
+            sameChannel = sameChannel,
+        )
 }

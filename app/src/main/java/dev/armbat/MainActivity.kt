@@ -357,6 +357,7 @@ class MainActivity : ComponentActivity() {
         var localeTag by remember { mutableStateOf(AppLocale.current(context)) }
         var logLevel by remember { mutableStateOf(ArmbatLog.level()) }
         var widescreen by remember { mutableStateOf(GuestScreen.widescreen(context)) }
+        var channel by remember { mutableStateOf(Updates.channel(context)) }
         var updateStatus by remember { mutableStateOf<Updates.Status>(Updates.Status.Idle) }
         var updateOffer by remember { mutableStateOf<Updates.Update?>(null) }
         // -1 when nothing is being fetched; the dialog reads it as a percentage.
@@ -376,7 +377,7 @@ class MainActivity : ComponentActivity() {
         }
 
         /**
-         * Asks the channel this build came from whether something newer exists.
+         * Asks the chosen channel whether something newer exists.
          *
          * The launch check is quiet unless there is something to offer; the
          * settings row shows the answer either way, so a tap that finds nothing
@@ -388,8 +389,14 @@ class MainActivity : ComponentActivity() {
             if (!Updates.enabled) {
                 return
             }
+            val wanted = Updates.channel(context)
             updateStatus = Updates.Status.Checking
-            val result = Updates.check(fresh = manual)
+            val result = Updates.check(context, fresh = manual)
+            // A check started before the channel was switched answers a question
+            // nobody is asking any more.
+            if (Updates.channel(context) != wanted) {
+                return
+            }
             updateStatus = result
             val found = (result as? Updates.Status.Available)?.update ?: return
             if (manual || Updates.shouldAnnounce(found)) {
@@ -684,6 +691,7 @@ class MainActivity : ComponentActivity() {
                             localeTag = localeTag,
                             logLevel = logLevel,
                             widescreen = widescreen,
+                            channel = channel,
                             version = version,
                             updateStatus = updateStatus,
                             onLocale = { tag ->
@@ -697,6 +705,18 @@ class MainActivity : ComponentActivity() {
                             onWidescreen = { on ->
                                 widescreen = on
                                 GuestScreen.setWidescreen(this@MainActivity, on)
+                            },
+                            onChannel = { picked ->
+                                channel = picked
+                                Updates.setChannel(this@MainActivity, picked)
+                                updateStatus = Updates.Status.Idle
+                                // Anything found for the other channel is not an
+                                // answer about this one.
+                                updateOffer = null
+                                pendingInstall = null
+                                // The point of picking a channel is to see what
+                                // it offers, so the check follows the tap.
+                                scope.launch { checkUpdates(manual = true) }
                             },
                             onCheckUpdates = { scope.launch { checkUpdates(manual = true) } },
                             onAbout = { screen = Screen.About },
