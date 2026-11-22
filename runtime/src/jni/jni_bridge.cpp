@@ -2706,17 +2706,22 @@ struct JniBridge::Impl {
                             signature.c_str());
     }
 
-    jclass GuestClass(const std::string& name) {
+    // The class loader that defines the guest's classes, asked for one by the
+    // name the guest used. ClassLoader.loadClass cannot resolve array
+    // descriptors ([B, [Ljava/lang/String;), while Class.forName can, and it
+    // takes the dotted binary name that BinaryName produces.
+    //
+    // `initialize` is false for the registration pass: it asks for a class only
+    // to bind its Java_* entry points, and running <clinit> there would call a
+    // native method that pass has not bound yet. The failed initializer leaves
+    // the class erroneous for good -- FIFA 14's com.ea.blast.MouseAndroid calls
+    // its own NativeGetIdRawMouseDown from <clinit>, so every later use of the
+    // class reports NoClassDefFoundError.
+    jclass GuestClass(const std::string& name, bool initialize = true) {
         JNIEnv* env = HostEnv();
         if (env == nullptr || loader == nullptr) {
             return nullptr;
         }
-        // ClassLoader.loadClass cannot resolve array descriptors ([B,
-        // [Ljava/lang/String;), while Class.forName can, and it takes the
-        // dotted binary name that BinaryName produces. JNI's FindClass loads,
-        // links *and* initializes the class, so the static initializer has to run
-        // here as well: a guest that looks a class up and then uses its statics
-        // relies on it.
         jclass class_class = env->FindClass("java/lang/Class");
         if (class_class == nullptr) {
             env->ExceptionClear();
@@ -2730,7 +2735,8 @@ struct JniBridge::Impl {
             return nullptr;
         }
         jstring text = env->NewStringUTF(BinaryName(name).c_str());
-        jobject type = env->CallStaticObjectMethod(class_class, for_name, text, JNI_TRUE, loader);
+        jobject type = env->CallStaticObjectMethod(class_class, for_name, text,
+                                                   initialize ? JNI_TRUE : JNI_FALSE, loader);
         env->DeleteLocalRef(text);
         env->DeleteLocalRef(class_class);
         if (env->ExceptionCheck()) {
@@ -3625,7 +3631,7 @@ struct JniBridge::Impl {
                     type = known->second;
                     type_name = descriptor;
                 } else {
-                    jclass found = GuestClass(descriptor);
+                    jclass found = GuestClass(descriptor, false);
                     classes.emplace(descriptor, found);
                     if (found != nullptr) {
                         type = found;
