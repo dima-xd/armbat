@@ -378,6 +378,12 @@ struct JniBridge::Impl {
     struct NativeMethod {
         std::uint32_t entry = 0;
         std::string signature;
+        std::string name;
+        // Whether this container answers the method instead of running it: -1
+        // until the first call decides (see AnswersInstead). The answer is
+        // derived from immutable data -- the configured list and the module
+        // table -- so two threads arriving at once compute the same byte.
+        std::int8_t answered = -1;
     };
 
     struct MethodRef {
@@ -503,6 +509,12 @@ struct JniBridge::Impl {
     std::vector<NativeMethod> natives;
     std::atomic<std::uint32_t> natives_published{0};
 
+    // Libraries whose native methods are answered instead of run, and the flag
+    // that keeps the ordinary archive off the lookup: empty and false unless the
+    // user asked for it, and then one compare in Dispatch.
+    std::vector<std::string> silenced_libraries;
+    std::atomic<bool> silencing{false};
+
     // A direct buffer Java allocated lives in host memory that only the JVM can
     // address, while the guest can address nothing but the arena. The guest
     // therefore gets an arena copy of it, refreshed when it asks for the
@@ -569,6 +581,11 @@ struct JniBridge::Impl {
     // an unsynchronized push_back here reallocates host memory under another
     // thread's feet (that is how a guest pointer ended up inside the loader).
     mutable std::recursive_mutex refs_mutex;
+
+    // java.io.File, resolved once. A guest path entering a File is the one
+    // place where the Java half and the native half of an application have to
+    // agree on which file they mean.
+    jclass file_class = nullptr;
 
     // ---- references -------------------------------------------------------
 
@@ -1360,7 +1377,8 @@ struct JniBridge::Impl {
             const std::string name = ArgString(call, call.Arg(1));
             const jclass type = GuestClass(name);
             if (type == nullptr) {
-                ARMBAT_LOG_INFO("Armbat", "jni: no class %s", name.c_str());
+                ARMBAT_LOG_INFO("Armbat", "jni: no class %s from %s", name.c_str(),
+                                    armbat::DescribeGuestAddress(current_env_lr).c_str());
             }
             call.Return(Handle(HostEnv(), type));
         });
@@ -2162,6 +2180,44 @@ struct JniBridge::Impl {
             call.Return(0);
         });
         add_vm(JNI_VM_IDX(DestroyJavaVM), [](HleCall& call) { call.Return(0); });
+
+        // The runtime image, reached by name: a native library that opens
+        // libart.so (or libdvm.so on a Dalvik image) asks for the VM the same
+        // way a framework component would, and gets the guest's own VM -- the
+        // one its JNI_OnLoad was handed. A library that only needs to know that
+        // the process has a Java runtime gets a truthful answer, and everything
+        // it then does with the VM lands in the tables above.
+        imports.Add("JNI_GetCreatedJavaVMs", [this](HleCall& call) {
+            const std::uint32_t buffer = call.Arg(0);
+            const std::int32_t capacity = static_cast<std::int32_t>(call.Arg(1));
+            const std::uint32_t count_pointer = call.Arg(2);
+            const std::uint32_t one = 1;
+            const std::uint32_t vm = vm_pointer;
+            if (count_pointer == 0 || !call.CopyOut(count_pointer, &one, sizeof(one))) {
+                call.Return(static_cast<std::uint32_t>(JNI_EINVAL));
+                return;
+            }
+            if (capacity > 0 && buffer != 0 && !call.CopyOut(buffer, &vm, sizeof(vm))) {
+                call.Return(static_cast<std::uint32_t>(JNI_EINVAL));
+                return;
+            }
+            call.Return(static_cast<std::uint32_t>(JNI_OK));
+        });
+        imports.Add("JNI_CreateJavaVM", [](HleCall& call) {
+            // The library is running inside a process that already has a VM;
+            // a device refuses a second one and so does the container.
+            call.Return(static_cast<std::uint32_t>(JNI_EEXIST));
+        });
+        imports.Add("JNI_GetDefaultJavaVMInitArgs", [](HleCall& call) {
+            std::int32_t version = 0;
+            if (!call.CopyIn(call.Arg(0), &version, sizeof(version))) {
+                call.Return(static_cast<std::uint32_t>(JNI_EINVAL));
+                return;
+            }
+            const bool known = version == JNI_VERSION_1_2 || version == JNI_VERSION_1_4 ||
+                               version == JNI_VERSION_1_6;
+            call.Return(static_cast<std::uint32_t>(known ? JNI_OK : JNI_EVERSION));
+        });
     }
 
     // The entry a guest handle names, or null when no such handle was ever
@@ -2711,7 +2767,7 @@ struct JniBridge::Impl {
         for (std::uint32_t i = 0; i < count; ++i) {
             std::uint32_t entry[3] = {};
             call.CopyIn(call.Arg(2) + i * 12, entry, sizeof(entry));
-            natives.push_back(NativeMethod{entry[2], signatures[i]});
+            natives.push_back(NativeMethod{entry[2], signatures[i], names[i]});
             const std::uint32_t id = static_cast<std::uint32_t>(natives.size() - 1);
             void* trampoline = MakeTrampoline(id);
             if (trampoline == nullptr) {
@@ -2816,6 +2872,9 @@ struct JniBridge::Impl {
     static std::uint64_t ArmBatNativeDispatch(std::uint64_t* frame, std::uint64_t* stack_args,
                                               std::uint32_t id);
     std::uint64_t Dispatch(std::uint64_t* frame, std::uint64_t* stack_args, std::uint32_t id);
+
+    std::string SilenceLibraries(const std::vector<std::string>& libraries);
+    bool AnswersInstead(NativeMethod& method);
 
     // ---- guest calls into the framework ------------------------------------
 
@@ -3165,6 +3224,63 @@ struct JniBridge::Impl {
     // point takes its arguments in registers, V a va_list and A a jvalue array.
     // All three end in the host's NewObjectA, because a guest va_list cannot be
     // forwarded to a host variadic function.
+    bool IsPathObjectType(jclass type) {
+        JNIEnv* env = HostEnv();
+        if (file_class == nullptr) {
+            jclass local = env->FindClass("java/io/File");
+            if (local == nullptr) {
+                env->ExceptionClear();
+                return false;
+            }
+            file_class = static_cast<jclass>(env->NewGlobalRef(local));
+            env->DeleteLocalRef(local);
+            if (file_class == nullptr) {
+                return false;
+            }
+        }
+        return env->IsSameObject(type, file_class) == JNI_TRUE;
+    }
+
+    // A guest's own code spells a path the way a device does --
+    // /data/data/<package>, /data/app/<package>-<n>/lib/arm -- while the
+    // framework answers paths inside the container's tree. Java and native
+    // halves of one application then disagree about where a file is: a
+    // descriptor that opens the guest's own saves sees nothing through
+    // `new File(<guest path>)`. The translation happens once, where the object
+    // is born, and everything derived from it carries the real path.
+    jstring TranslatedFilePath(jclass type, const MethodRef& ref,
+                               std::vector<jvalue>& values) {
+        if (ref.signature != "(Ljava/lang/String;)V" || values.empty() ||
+            values[0].l == nullptr) {
+            return nullptr;
+        }
+        JNIEnv* env = HostEnv();
+        if (!IsPathObjectType(type)) {
+            return nullptr;
+        }
+        auto* text = static_cast<jstring>(values[0].l);
+        const char* raw = env->GetStringUTFChars(text, nullptr);
+        if (raw == nullptr) {
+            return nullptr;
+        }
+        const std::string original(raw);
+        env->ReleaseStringUTFChars(text, raw);
+        const std::string mapped = container.MapPath(original);
+        if (mapped == original) {
+            return nullptr;
+        }
+        jstring translated = env->NewStringUTF(mapped.c_str());
+        if (translated == nullptr) {
+            env->ExceptionClear();
+            return nullptr;
+        }
+        if (LogAllowed("jni-file", 64)) {
+            ARMBAT_LOG_INFO("Armbat", "jni: file path %s -> %s", original.c_str(),
+                            mapped.c_str());
+        }
+        return translated;
+    }
+
     void NewObjectThrough(HleCall& call, int form) {
         JNIEnv* env = HostEnv();
         const jclass type = static_cast<jclass>(Resolve(call.Arg(1)));
@@ -3196,8 +3312,15 @@ struct JniBridge::Impl {
         }
         const std::string previous = current_call;
         current_call = ref.name + ref.signature;
+        jstring translated = TranslatedFilePath(type, ref, values);
+        if (translated != nullptr) {
+            values[0].l = translated;
+        }
         const jobject created =
             env->NewObjectA(type, ref.method, values.empty() ? nullptr : values.data());
+        if (translated != nullptr) {
+            env->DeleteLocalRef(translated);
+        }
         current_call = previous;
         call.Return(Handle(env, created));
     }
@@ -3565,7 +3688,7 @@ struct JniBridge::Impl {
             }
 
             for (const std::string& signature : signatures) {
-                natives.push_back(NativeMethod{address, signature});
+                natives.push_back(NativeMethod{address, signature, native_name});
                 const std::uint32_t id = static_cast<std::uint32_t>(natives.size() - 1);
                 void* trampoline = MakeTrampoline(id);
                 if (trampoline == nullptr) {
@@ -3670,12 +3793,63 @@ std::uint64_t JniBridge::Impl::ArmBatNativeDispatch(std::uint64_t* frame,
     return bridge->Dispatch(frame, stack_args, id);
 }
 
+// Whether this container answers `method` instead of calling it. Decided on the
+// first call and kept: a native method does not move between images, and the
+// list never changes once the guest runs.
+bool JniBridge::Impl::AnswersInstead(NativeMethod& method) {
+    if (method.answered < 0) {
+        const std::string where = DescribeGuestAddress(method.entry);
+        bool match = false;
+        for (const std::string& library : silenced_libraries) {
+            if (library.empty()) {
+                continue;
+            }
+            if (where.find(library) != std::string::npos ||
+                method.name.find(library) != std::string::npos) {
+                match = true;
+                break;
+            }
+        }
+        method.answered = match ? 1 : 0;
+        if (match) {
+            ARMBAT_LOG_INFO("Armbat", "jni: %s%s answered, not run (%s)", method.name.c_str(),
+                            method.signature.c_str(), where.c_str());
+        }
+    }
+    return method.answered == 1;
+}
+
+std::string JniBridge::Impl::SilenceLibraries(const std::vector<std::string>& libraries) {
+    silenced_libraries = libraries;
+    silencing.store(!libraries.empty(), std::memory_order_relaxed);
+    // A method registered before this call may carry a decision made against the
+    // old list -- an archive library's initializer runs before the launcher gets
+    // here -- so every entry is reconsidered on its next call.
+    for (NativeMethod& method : natives) {
+        method.answered = -1;
+    }
+    std::string report;
+    for (const std::string& library : libraries) {
+        if (!library.empty()) {
+            report += "silenced: " + library + "\n";
+        }
+    }
+    return report;
+}
+
 std::uint64_t JniBridge::Impl::Dispatch(std::uint64_t* frame, std::uint64_t* stack_args,
                                         std::uint32_t id) {
     if (id >= natives_published.load(std::memory_order_acquire)) {
         return 0;
     }
     NativeMethod& method = natives[id];
+    if (silencing.load(std::memory_order_relaxed) && AnswersInstead(method)) {
+        // The method's caller gets a zero: an int or a boolean answer of "no",
+        // and a void one ignores it. Nothing else is done on its behalf -- in
+        // particular no JNIEnv is built and no direct buffer is refreshed, since
+        // no guest code runs.
+        return 0;
+    }
     JNIEnv* env = HostEnv();
     if (env == nullptr) {
         return 0;
@@ -3954,6 +4128,10 @@ std::string JniBridge::RegisterExports(JNIEnv* env, jobject loader) {
     }
     const std::lock_guard lock(impl_->mutex);
     return impl_->RegisterExports(env, loader);
+}
+
+std::string JniBridge::SilenceLibraries(const std::vector<std::string>& libraries) {
+    return impl_->SilenceLibraries(libraries);
 }
 
 std::uint32_t JniBridge::GuestEnv() const { return impl_->env_pointer; }

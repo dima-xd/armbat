@@ -8,6 +8,7 @@
 #include <csignal>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <mutex>
@@ -28,6 +29,7 @@
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/random.h>
 #include <sys/resource.h>
 #include <sys/select.h>
@@ -47,6 +49,7 @@
 #include "armbat/guest_abi.h"
 #include "armbat/guest_arena.h"
 #include "armbat/guest_modules.h"
+#include "armbat/guest_properties.h"
 #include "armbat/guest_pthread.h"
 #include "armbat/guest_signal.h"
 #include "armbat/guest_stdio.h"
@@ -81,6 +84,10 @@ constexpr std::uint32_t kArmbatBootReady = kArmNrBase + 0x100;
 // has none. The guest's libarmbat_net.so carries the question out through this
 // trap and receives the addresses packed by the host's resolver.
 constexpr std::uint32_t kArmbatResolve = kArmNrBase + 0x101;
+// A platform property the guest reads: bionic keeps them in an area this
+// container does not map, so the guest's libarmbat_props.so carries the name out
+// and receives the answer for the device the container presents.
+constexpr std::uint32_t kArmbatProperty = kArmNrBase + 0x102;
 
 // ARM uses the asm-generic syscall table, so these numbers are stable.
 enum SyscallNumber : std::uint32_t {
@@ -92,6 +99,9 @@ enum SyscallNumber : std::uint32_t {
     kSysLseek = 19,
     kSysGetpid = 20,
     kSysGetuid = 24,
+    // Android's policy denies ptrace to an application outright, and a guest
+    // that probes for a tracer has to be refused the way a device refuses it.
+    kSysPtrace = 26,
     kSysAccess = 33,
     kSysKill = 37,
     kSysDup = 41,
@@ -621,6 +631,78 @@ void FutexWaitEnd() {
     slot.tid.store(0, std::memory_order_release);
 }
 
+// `/proc/<number>/...` names a thread entry. On a real device the application is
+// its own process leader, so a path built from gettid() -- `/proc/<tid>/maps` is
+// the common one -- resolves for the main thread. The guest here runs off the
+// container's main thread, and the host only knows its threads as
+// `/proc/<pid>/task/<tid>`; without the translation such a path is missing, while
+// the same request succeeds on a phone.
+bool ParseProcEntry(const std::string& path, std::string* number, std::string* rest) {
+    constexpr std::string_view prefix = "/proc/";
+    if (path.compare(0, prefix.size(), prefix) != 0) {
+        return false;
+    }
+    const std::size_t begin = prefix.size();
+    std::size_t end = path.find('/', begin);
+    if (end == std::string::npos) {
+        end = path.size();
+    }
+    if (end == begin) {
+        return false;
+    }
+    for (std::size_t index = begin; index < end; ++index) {
+        if (path[index] < '0' || path[index] > '9') {
+            return false;
+        }
+    }
+    *number = path.substr(begin, end - begin);
+    *rest = path.substr(end);
+    return true;
+}
+
+// tgkill would be the cheap answer, but the question is only whether the number
+// names one of this process's threads, and the thread directory says that
+// directly.
+bool IsOwnTask(std::int32_t tid) {
+    if (tid <= 0) {
+        return false;
+    }
+    char link[64];
+    std::snprintf(link, sizeof(link), "/proc/self/task/%d", static_cast<int>(tid));
+    struct stat host {};
+    return ::stat(link, &host) == 0;
+}
+
+std::string TranslateProcThreadPath(const std::string& path) {
+    std::string number;
+    std::string rest;
+    if (!ParseProcEntry(path, &number, &rest)) {
+        return path;
+    }
+    const std::int32_t entry = static_cast<std::int32_t>(std::strtol(number.c_str(), nullptr, 10));
+    if (entry == ::getpid() || !IsOwnTask(entry)) {
+        return path;
+    }
+    return "/proc/" + std::to_string(::getpid()) + "/task/" + number + rest;
+}
+
+// The maps of the guest's own process, whichever of its names the caller used.
+bool IsGuestMapsPath(const std::string& path) {
+    if (path == "/proc/self/maps") {
+        return true;
+    }
+    std::string number;
+    std::string rest;
+    if (!ParseProcEntry(path, &number, &rest) || rest != "/maps") {
+        return false;
+    }
+    const std::int32_t entry = static_cast<std::int32_t>(std::strtol(number.c_str(), nullptr, 10));
+    if (entry == ::getpid() || IsOwnTask(entry)) {
+        return true;
+    }
+    return false;
+}
+
 // A guest that hands the kernel a buffer it does not fully own is worth one
 // line: the kernel's Linux-faithful answer (a short count) hides the mistake
 // from the guest, and the caller then carries on with a buffer whose tail was
@@ -785,10 +867,11 @@ bool GuestKernel::WriteGuest(std::uint32_t address, const void* data, std::size_
 }
 
 std::string GuestKernel::MapPath(const std::string& guest_path) const {
+    const std::string translated = TranslateProcThreadPath(guest_path);
     if (path_mapper_) {
-        return path_mapper_(guest_path);
+        return path_mapper_(translated);
     }
-    return guest_path;
+    return translated;
 }
 
 int GuestKernel::ServeMaps() {
@@ -1108,6 +1191,30 @@ std::int32_t GuestKernel::DispatchPrivate(std::uint32_t number, const std::uint3
         std::memcpy(arena_.Ptr(args[1]), packed.data(), packed.size());
         return static_cast<std::int32_t>(packed.size());
     }
+    case kArmbatProperty: {
+        // The name the guest's preloaded property shim asks for. The answer is
+        // the device the container presents, never the host's identity: bionic
+        // would read an area this container does not map, and an empty answer is
+        // a device that does not exist.
+        std::string name;
+        if (!ReadString(args[0], name) || name.empty()) {
+            return -EINVAL;
+        }
+        constexpr std::uint32_t kPropertyValueMax = 92;  // PROP_VALUE_MAX
+        if (!arena_.IsMapped(args[1], kPropertyValueMax)) {
+            return -EFAULT;
+        }
+        std::string value;
+        const bool known = ResolveGuestProperty(name, &value);
+        if (value.size() >= kPropertyValueMax) {
+            value.resize(kPropertyValueMax - 1);
+        }
+        std::memcpy(arena_.Ptr(args[1]), value.c_str(), value.size() + 1);
+        if (!known) {
+            return -ENOENT;
+        }
+        return static_cast<std::int32_t>(value.size());
+    }
     default:
         last_unimplemented_ = number;
         return -ENOSYS;
@@ -1276,7 +1383,7 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
         if (directory == AT_FDCWD) {
             path = ResolveGuestPath(std::move(path));
         }
-        if (path == "/proc/self/maps") {
+        if (IsGuestMapsPath(path)) {
             const int maps = ServeMaps();
             if (maps < 0) {
                 return maps;
@@ -2023,8 +2130,89 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
         ::sched_yield();
         return 0;
 
-    case kSysPrctl:
-        return 0;
+    // ptrace is a probe as much as a call: an anti-tamper engine asks whether
+    // somebody is already attached, and the answer it is written against is the
+    // one Android gives an application -- a refusal, because the platform's
+    // policy forbids an untrusted process from tracing anything at all. A
+    // blanket success or ENOSYS here is a sandbox signal, not a device one.
+    case kSysPtrace:
+        return -EPERM;
+
+    case kSysPrctl: {
+        // prctl is a grab bag whose getters are the only calls that write
+        // memory. Answering every option with success leaves a caller's buffer
+        // untouched, so a process that asks for its own thread name reads back
+        // whatever the buffer happened to hold.
+        constexpr std::uint32_t kPrSetPdeathsig = 1;
+        constexpr std::uint32_t kPrGetPdeathsig = 2;
+        constexpr std::uint32_t kPrGetDumpable = 3;
+        constexpr std::uint32_t kPrSetDumpable = 4;
+        constexpr std::uint32_t kPrSetKeepcaps = 8;
+        constexpr std::uint32_t kPrSetName = 15;
+        constexpr std::uint32_t kPrGetName = 16;
+        constexpr std::uint32_t kPrGetSeccomp = 21;
+        constexpr std::uint32_t kPrSetSeccomp = 22;
+        constexpr std::uint32_t kPrSetTimerslack = 29;
+        constexpr std::uint32_t kPrGetTimerslack = 30;
+        constexpr std::uint32_t kPrSetNoNewPrivs = 38;
+        constexpr std::uint32_t kPrGetNoNewPrivs = 39;
+        constexpr std::uint32_t kPrGetTidAddress = 40;
+        switch (args[0]) {
+        case kPrGetName: {
+            // The guest's threads are the host's threads, so the name the
+            // platform keeps for this thread is already the guest's answer.
+            char name[16] = {};
+            if (::prctl(PR_GET_NAME, name, 0, 0, 0) != 0) {
+                return -errno;
+            }
+            return WriteGuest(args[1], name, sizeof(name)) ? 0 : -EFAULT;
+        }
+        case kPrSetName: {
+            std::string name;
+            if (!ReadString(args[1], name)) {
+                return -EFAULT;
+            }
+            return ::prctl(PR_SET_NAME, name.c_str(), 0, 0, 0) == 0 ? 0 : -errno;
+        }
+        case kPrGetDumpable:
+            // A normal application is dumpable; the container's own process is
+            // not, and the difference is exactly what a checker looks for.
+            return 1;
+        case kPrSetPdeathsig:
+        case kPrSetDumpable:
+        case kPrSetKeepcaps:
+        case kPrSetTimerslack:
+        case kPrSetNoNewPrivs:
+            return 0;
+        case kPrGetPdeathsig: {
+            const std::int32_t death_signal = 0;
+            return WriteGuest(args[1], &death_signal, sizeof(death_signal)) ? 0 : -EFAULT;
+        }
+        case kPrGetSeccomp:
+            return 0;  // SECCOMP_MODE_DISABLED
+        case kPrGetNoNewPrivs:
+            return 1;
+        case kPrGetTimerslack:
+            return 50000;  // the 50 us every device boots with
+        case kPrSetSeccomp:
+            // A filter cannot be installed: the emulated kernel is not the host
+            // one, and a guest that believed its syscalls were filtered would
+            // draw the wrong conclusion from every call it makes. An application
+            // has no CAP_SYS_ADMIN, so a device refuses it the same way.
+            return -EPERM;
+        case kPrGetTidAddress: {
+            const std::int32_t tid = static_cast<std::int32_t>(::gettid());
+            if (args[1] != 0 && !WriteGuest(args[1], &tid, sizeof(tid))) {
+                return -EFAULT;
+            }
+            return tid;
+        }
+        default:
+            // Linux answers EINVAL for an option the kernel does not know. A
+            // value that means "supported" would hide the gap instead.
+            return -EINVAL;
+        }
+    }
 
     case kSysUname: {
         const std::uint32_t buffer = args[0];
@@ -2659,6 +2847,22 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
                                 "signal: guest raised %d at %s (tid=%u, process ends)", signal,
                                 armbat::DescribeGuestAddress(caller.Reg(15)).c_str(),
                                 static_cast<unsigned>(::gettid()));
+            // Which threads were involved: the platform keeps the names the
+            // guest set, and a runtime that kills itself is usually one named
+            // for its job (a collector, a message pump) talking to another.
+            char sender_name[16] = {};
+            ::prctl(PR_GET_NAME, sender_name, 0, 0, 0);
+            char target_name[32] = {};
+            char comm_path[64];
+            std::snprintf(comm_path, sizeof(comm_path), "/proc/self/task/%u/comm", target);
+            if (const int comm = ::open(comm_path, O_RDONLY); comm >= 0) {
+                const ssize_t got = ::read(comm, target_name, sizeof(target_name) - 1);
+                if (got > 0) {
+                    target_name[got - 1] = '\0';  // the file ends with a newline
+                }
+                ::close(comm);
+            }
+            ARMBAT_LOG_WARN("Armbat", "signal: from \"%s\" to \"%s\"", sender_name, target_name);
             // The frames of an aborting thread are the only record of where it
             // gave up: nothing else is logged between the fault and the exit.
             const std::uint32_t sp = caller.Reg(13);
@@ -2667,6 +2871,23 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
                 frames += " " + armbat::DescribeGuestAddress(address);
             }
             ARMBAT_LOG_WARN("Armbat", "signal: frames:%s", frames.c_str());
+            // The walking above follows only words that look like calls, and
+            // Thumb code without frame pointers leaves several candidates. The
+            // raw words name every module the aborting thread walked through,
+            // which is what says who raised the signal.
+            std::string walked;
+            for (std::uint32_t offset = 0; offset < 0xC0; offset += 4) {
+                std::uint32_t word = 0;
+                if (!caller.ReadGuestWord(sp + offset, &word)) {
+                    break;
+                }
+                const std::string where = armbat::DescribeGuestAddress(word & ~1u);
+                if (where.empty() || where[0] == '0') {
+                    continue;
+                }
+                walked += " " + where;
+            }
+            ARMBAT_LOG_WARN("Armbat", "signal: words:%s", walked.c_str());
             // The frame that failed its check is just above the abort frames, so
             // dump enough of it to see what was written over the guard.
             for (int row = 0; row < 24; ++row) {

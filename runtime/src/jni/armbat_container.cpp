@@ -14,6 +14,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 #include "armbat/guest_container.h"
 #include "armbat/guest_input.h"
@@ -137,6 +138,34 @@ Java_dev_armbat_GuestNatives_loadArchive(JNIEnv* env, jobject /*self*/, jstring 
         g_container->Jni().DropGuestException("before the native entry point returned");
     }
     return env->NewStringUTF(text.c_str());
+}
+
+// Services an archive asks the container not to run: one library name (a
+// substring of the image's path, e.g. "libguard") per line. See
+// JniBridge::SilenceLibraries for why a container would take such a request.
+extern "C" JNIEXPORT jstring JNICALL
+Java_dev_armbat_GuestNatives_silence(JNIEnv* env, jobject /*self*/, jstring libraries) {
+    if (g_container == nullptr) {
+        return env->NewStringUTF("silence: nothing loaded\n");
+    }
+    std::vector<std::string> names;
+    const std::string text = StringOf(env, libraries);
+    std::size_t start = 0;
+    while (start < text.size()) {
+        std::size_t end = text.find('\n', start);
+        if (end == std::string::npos) {
+            end = text.size();
+        }
+        std::size_t first = text.find_first_not_of(" \t\r", start);
+        if (first != std::string::npos && first < end) {
+            const std::size_t last = text.find_last_not_of(" \t\r", end - 1);
+            names.push_back(text.substr(first, last - first + 1));
+        }
+        start = end + 1;
+    }
+    const std::string report = g_container->Jni().SilenceLibraries(names);
+    g_container->Jni().DropGuestException("before the native entry point returned");
+    return env->NewStringUTF(report.c_str());
 }
 
 // Binds the archive's Java_* entry points to its classes. The guest loader is

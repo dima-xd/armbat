@@ -149,7 +149,7 @@ class GuestLauncher(private val host: Activity) {
          * an SDK reads its own <meta-data> and its own version through this, and
          * the platform would answer both from the container's manifest.
          */
-        private val guestPackageManager: android.content.pm.PackageManager by lazy {
+        private val guestPackageManager: GuestPackageManager by lazy {
             GuestPackageManager(
                 baseContext.packageManager,
                 guestArchive,
@@ -286,8 +286,12 @@ class GuestLauncher(private val host: Activity) {
             }
             info.sourceDir = guestApkPath
             info.publicSourceDir = guestApkPath
-            if (guestLibraryDir != null) {
-                info.nativeLibraryDir = guestLibraryDir
+            // The directory a device installs an application's libraries into,
+            // not the container's own: the runtime answers that path from the
+            // directory the archive's libraries were unpacked into.
+            val presentedLibraryDir = guestPackageManager.presentedLibraryDir()
+            if (presentedLibraryDir != null) {
+                info.nativeLibraryDir = presentedLibraryDir
             }
             info
         }
@@ -804,6 +808,12 @@ class GuestLauncher(private val host: Activity) {
     private var hosted: Hosted? = null
 
     /**
+     * Keeps the archive's own protection flags at their values while it runs
+     * (see [holdFlags]); null unless the archive asked for it.
+     */
+    private var protectionTimer: java.util.Timer? = null
+
+    /**
      * Whether this process has already been claimed by a guest world.
      *
      * The native side keeps exactly one container per process: a second
@@ -945,31 +955,6 @@ class GuestLauncher(private val host: Activity) {
             host.classLoader,
             apkPath,
         )
-        // The archive's own libraries have to be mapped before its static
-        // initializers run: they call System.loadLibrary and then straight
-        // into native code. The two data roots are the guest's folders on the
-        // shared storage; the runtime answers /data/data/<package> and
-        // /sdcard/Android/{data,obb}/<package> from them, and /sdcard in general
-        // from the container's own folder, which is the root its Java half sees.
-        GuestNatives.loadArchive(
-            apkPath,
-            host.codeCacheDir.absolutePath,
-            targetSdk,
-            GuestStorage.dataDir(archivePackage).absolutePath,
-            GuestStorage.obbDir(archivePackage).absolutePath,
-            archivePackage,
-            GuestStorage.root().absolutePath,
-        )
-        // From here the process belongs to this guest world; a second launch
-        // cannot build another one (see worldLoaded).
-        worldLoaded = true
-        // The archive's native methods have to be bound before its Java part
-        // calls any of them, which starts with onCreate.
-        GuestNatives.registerNatives(loader)
-        val type = loader.loadClass(name)
-        if (!Activity::class.java.isAssignableFrom(type)) {
-            throw IllegalStateException(host.getString(R.string.error_not_activity, name))
-        }
         // The screen the guest is going to draw on is fixed here, before its
         // resources exist: an archive layouts its interface from the screen the
         // resources describe, and those have to be the pixels of the surface it
@@ -1003,8 +988,136 @@ class GuestLauncher(private val host: Activity) {
     }
 
     /**
-     * Builds the guest's world and hosts the archive's first activity. Runs on
-     * the main thread: everything it creates belongs to the view hierarchy.
+     * What the archive asked the container to keep out of its own way, or null.
+     *
+     * A file at armbat/silence/<package> holds one entry per line:
+     *
+     *     libstub                                          a library, or a native
+     *                                                      method, the container
+     *                                                      answers instead of runs
+     *     flag:android.support.v4.security.coM5#true=true  a static field of the
+     *                                                      archive kept at a value
+     *
+     * It exists because an archive may carry a protection SDK that decides
+     * inside its own code whether the process is the device it expects, and ends
+     * the process from there when it is not: an emulated device is exactly what
+     * such an SDK refuses, and no container fix changes that, because the SDK is
+     * working. This file is how the user tells the container to leave that SDK
+     * out of the picture -- its native half is not called, and the flag its
+     * engine raises to say "I am running" is held raised, which is the state a
+     * process on an accepted device is in.
+     *
+     * Deliberately a file the user places and not a default: with no file the
+     * container behaves exactly as before, and what is silenced is a decision
+     * about one archive.
+     */
+    private class Protection(
+        /** Library or method names for [GuestNatives.silence], one per line. */
+        val silenced: String,
+        /** Static fields to hold, "class#field=value". */
+        val holds: List<String>,
+    )
+
+    private fun protection(packageName: String): Protection? {
+        val marker = File(GuestStorage.root(), "silence/$packageName")
+        if (!marker.isFile) {
+            return null
+        }
+        val lines = runCatching { marker.readLines() }.getOrNull() ?: return null
+        val silenced = StringBuilder()
+        val holds = ArrayList<String>()
+        for (line in lines) {
+            val entry = line.trim()
+            if (entry.isEmpty() || entry.startsWith("#")) {
+                continue
+            }
+            if (entry.startsWith("flag:")) {
+                holds.add(entry.removePrefix("flag:").trim())
+            } else {
+                silenced.append(entry).append('\n')
+            }
+        }
+        if (silenced.isEmpty() && holds.isEmpty()) {
+            return null
+        }
+        return Protection(silenced.toString().trim(), holds)
+    }
+
+    /**
+     * Keeps the archive's own state flags at their values, and reports every
+     * write it has to undo.
+     *
+     * A guard reads such a flag long after the moment it expects it set -- this
+     * one sleeps three minutes from the process start and then ends the process
+     * unless the flag says its engine is running -- and the flag is raised from
+     * the guard's native half, which is exactly the half that is not called
+     * here. Holding it raised is what a process the guard accepts looks like. The
+     * value is written before the archive's own code starts, and the class is
+     * initialized then too, so the guard's own default (written by its static
+     * initializer) cannot overwrite it later.
+     *
+     * Runs on its own timer: the guest's main thread is its UI thread and must
+     * not be scheduled on.
+     */
+    private fun holdFlags(prepared: Prepared, holds: List<String>): java.util.Timer? {
+        val fields = ArrayList<Triple<java.lang.reflect.Field, Any, String>>()
+        for (entry in holds) {
+            val typeName = entry.substringBefore('#', "")
+            val rest = entry.substringAfter('#', "")
+            val fieldName = rest.substringBefore('=', "")
+            val text = rest.substringAfter('=', "")
+            if (typeName.isEmpty() || fieldName.isEmpty() || text.isEmpty()) {
+                ArmbatLog.w(TAG, "protection: unusable flag \"$entry\"")
+                continue
+            }
+            val type = runCatching { Class.forName(typeName, true, prepared.loader) }.getOrNull()
+            val field = type
+                ?.let { runCatching { it.getDeclaredField(fieldName) }.getOrNull() }
+                ?.also { it.isAccessible = true }
+            if (field == null) {
+                ArmbatLog.w(TAG, "protection: no field $typeName#$fieldName")
+                continue
+            }
+            val value: Any = when (field.type) {
+                java.lang.Boolean.TYPE -> text == "true" || text == "1"
+                Integer.TYPE -> text.toIntOrNull() ?: 0
+                else -> {
+                    ArmbatLog.w(TAG, "protection: $typeName#$fieldName has no held type")
+                    continue
+                }
+            }
+            runCatching { field.set(null, value) }
+            fields.add(Triple(field, value, "$typeName#$fieldName"))
+        }
+        if (fields.isEmpty()) {
+            return null
+        }
+        val timer = java.util.Timer("armbat-protection", true)
+        timer.schedule(object : java.util.TimerTask() {
+            private var reported = 0
+
+            override fun run() {
+                for ((field, value, name) in fields) {
+                    val current = runCatching { field.get(null) }.getOrNull() ?: continue
+                    if (current == value) {
+                        continue
+                    }
+                    if (reported < 8) {
+                        reported++
+                        ArmbatLog.i(TAG, "protection: the archive set $name to $current")
+                    }
+                    runCatching { field.set(null, value) }
+                }
+            }
+        }, 200L, 500L)
+        return timer
+    }
+
+    /**
+     * Builds the guest's native world and hosts the archive's first activity.
+     * Runs on the main thread: everything it creates belongs to the view
+     * hierarchy, and the guest's own code has to start on the thread the
+     * platform would have started it on (see loadArchive below).
      */
     private fun start(prepared: Prepared) {
         // From here on the process carries an application: it has to keep the
@@ -1050,6 +1163,52 @@ class GuestLauncher(private val host: Activity) {
             prepared.packageName,
             startGuest = { startGuestActivity(it, -1) },
         )
+        // The archive's own libraries are mapped here and not on the thread that
+        // read the dex: mapping runs their initializers, and native code that
+        // records the thread it was loaded on records the main thread on a
+        // device, where that thread is the process itself (tid == pid). A worker
+        // is gone by the time the guest asks about "its" thread, and the guest
+        // sees a stale id where a device would answer.
+        //
+        // The two data roots are the guest's folders on the shared storage; the
+        // runtime answers /data/data/<package> and /sdcard/Android/{data,obb}/
+        // <package> from them, and /sdcard in general from the container's own
+        // folder, which is the root its Java half sees.
+        GuestNatives.loadArchive(
+            prepared.apkPath,
+            host.codeCacheDir.absolutePath,
+            targetSdk,
+            GuestStorage.dataDir(prepared.packageName).absolutePath,
+            GuestStorage.obbDir(prepared.packageName).absolutePath,
+            prepared.packageName,
+            GuestStorage.root().absolutePath,
+        )
+        // An archive that shipped a protection SDK may have asked the container
+        // to leave it out of the picture (see protection). Applied before any of
+        // the archive's own code runs, and usually absent.
+        protection(prepared.packageName)?.let { guard ->
+            ArmbatLog.i(
+                TAG,
+                "guest protection: silenced=[" + guard.silenced.replace('\n', ' ') + "]" +
+                    " held=" + guard.holds.joinToString(" "),
+            )
+            if (guard.silenced.isNotEmpty()) {
+                ArmbatLog.i(TAG, GuestNatives.silence(guard.silenced).trim())
+            }
+            protectionTimer = holdFlags(prepared, guard.holds)
+        }
+        // From here the process belongs to this guest world; a second launch
+        // cannot build another one (see worldLoaded).
+        worldLoaded = true
+        // The archive's native methods have to be bound before its Java part
+        // calls any of them, which starts with onCreate.
+        GuestNatives.registerNatives(prepared.loader)
+        val guestActivity = prepared.loader.loadClass(prepared.name)
+        if (!Activity::class.java.isAssignableFrom(guestActivity)) {
+            throw IllegalStateException(
+                host.getString(R.string.error_not_activity, prepared.name),
+            )
+        }
         // The platform creates the archive's Application before its first
         // activity and answers getApplication() with it. An archive keeps
         // process-wide state there (Fruit Ninja's Application caches its own
@@ -1638,9 +1797,10 @@ class GuestLauncher(private val host: Activity) {
     }
 
     /**
-     * Starts an archive. The native world is built on a worker thread and the
-     * guest's window and lifecycle are then created on the main thread; the
-     * callback reports null on success.
+     * Starts an archive. Reading the archive's dex happens on a worker thread
+     * (a cold run rewrites it for seconds); the guest's native world, its
+     * window and its lifecycle are then created on the main thread.
+     * The callback reports null on success.
      */
     fun launch(apkPath: String, onResult: (String?) -> Unit) {
         stage(LaunchStage.PREPARE)
@@ -1914,6 +2074,7 @@ class GuestLauncher(private val host: Activity) {
             return
         }
         ArmbatLog.i(TAG, "guest world ends with the process")
+        protectionTimer?.cancel()
         ArmbatLog.flush()
         android.os.Process.killProcess(android.os.Process.myPid())
     }

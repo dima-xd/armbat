@@ -24,8 +24,20 @@ final class GuestPackageManager extends PackageManager {
     private final String nativeLibraryDir;
     private final String hostPackage;
     private final String[] requestedPermissions;
+    /**
+     * The library directory the guest reports for itself: the layout a device
+     * installs an application into, {@code /data/app/<package>-<version>/lib/<abi>}.
+     * The container's own directory is not a path any device produces, and a
+     * checker that compares this field with the installed layout -- or opens a
+     * library through it -- reads a repackaged application instead. Native opens
+     * of the path are answered by the runtime, which maps it onto the directory
+     * the archive's libraries were unpacked into.
+     */
+    private final String presentedNativeLibraryDir;
     private volatile java.util.Map<String, android.content.pm.ActivityInfo> archiveActivities;
+    private volatile android.content.pm.Signature[] archiveSignatureCache;
 
+    @SuppressWarnings("deprecation")
     GuestPackageManager(PackageManager base, ApplicationInfo archive, String archivePath,
                         String nativeLibraryDir, String hostPackage) {
         this.base = base;
@@ -39,17 +51,28 @@ final class GuestPackageManager extends PackageManager {
         // package, however, has to see the manifest it was built with, or an SDK
         // takes a path for a permission the application never asked for.
         String[] permissions = null;
+        String presentedLibraryDir = nativeLibraryDir;
         try {
-            @SuppressWarnings("deprecation")
             PackageInfo archived =
                     base.getPackageArchiveInfo(archivePath, PackageManager.GET_PERMISSIONS);
             if (archived != null) {
                 permissions = archived.requestedPermissions;
+                if (archived.packageName != null) {
+                    String installed = "/data/app/" + archived.packageName + "-"
+                            + archived.versionCode;
+                    presentedLibraryDir = installed + "/lib/arm";
+                }
             }
         } catch (RuntimeException ignored) {
             // An archive the platform cannot parse keeps the container's answer.
         }
         this.requestedPermissions = permissions;
+        this.presentedNativeLibraryDir = presentedLibraryDir;
+    }
+
+    /** The library directory to report for the archive; see the field. */
+    String presentedLibraryDir() {
+        return presentedNativeLibraryDir;
     }
 
     /**
@@ -90,8 +113,8 @@ final class GuestPackageManager extends PackageManager {
             copy.theme = archive.theme;
             copy.sourceDir = archivePath;
             copy.publicSourceDir = archivePath;
-            if (nativeLibraryDir != null) {
-                copy.nativeLibraryDir = nativeLibraryDir;
+            if (presentedNativeLibraryDir != null) {
+                copy.nativeLibraryDir = presentedNativeLibraryDir;
             }
         }
         return copy;
@@ -211,12 +234,17 @@ final class GuestPackageManager extends PackageManager {
             throws NameNotFoundException {
         ApplicationInfo copy = new ApplicationInfo(archive);
         ApplicationInfo installed = base.getApplicationInfo(hostPackage, flags);
+        // A package is never debuggable on the device it was installed on. An
+        // archive that a repacker signed with android:debuggable="true" carries
+        // the bit in its own manifest, and the guest must not be told that the
+        // application it runs is a debug build.
+        copy.flags &= ~ApplicationInfo.FLAG_DEBUGGABLE;
         copy.uid = installed.uid;
         copy.dataDir = installed.dataDir;
         copy.sourceDir = archivePath;
         copy.publicSourceDir = archivePath;
-        if (nativeLibraryDir != null) {
-            copy.nativeLibraryDir = nativeLibraryDir;
+        if (presentedNativeLibraryDir != null) {
+            copy.nativeLibraryDir = presentedNativeLibraryDir;
         }
         if ((flags & PackageManager.GET_META_DATA) == 0) {
             copy.metaData = null;
@@ -257,6 +285,18 @@ final class GuestPackageManager extends PackageManager {
             if (archived != null) {
                 info.versionCode = archived.versionCode;
                 info.versionName = archived.versionName;
+                // The signature is the archive's, not the container's: the guest
+                // is that application, and a check that reads the certificate
+                // must see the one the archive was signed with. Answering with
+                // this process's own certificate tells the guest it has been
+                // repackaged.
+                if ((flags & PackageManager.GET_SIGNATURES) != 0 && archived.signatures != null) {
+                    info.signatures = archived.signatures;
+                }
+                if ((flags & PackageManager.GET_SIGNING_CERTIFICATES) != 0 &&
+                        archived.signingInfo != null) {
+                    info.signingInfo = archived.signingInfo;
+                }
                 // The components a caller asked about are the archive's, not the
                 // container's. The platform answers with the container's own
                 // manifest, which declares a startup provider and the launcher
@@ -396,9 +436,79 @@ final class GuestPackageManager extends PackageManager {
         return base.checkSignatures(arg0, arg1);
     }
 
+    /**
+     * Whether two packages are signed with the same certificate.
+     *
+     * The archive is not installed, so the platform answers
+     * {@code SIGNATURE_UNKNOWN_PACKAGE} for it -- including when a caller asks
+     * about the archive against itself, which is how an anti-tamper check asks
+     * "is the application I am running signed by the key I expect". The guest's
+     * own package has to exist here, so the comparison is done against the
+     * certificate the archive was signed with.
+     */
     @Override
     public int checkSignatures(java.lang.String arg0, java.lang.String arg1) {
-        return base.checkSignatures(arg0, arg1);
+        final boolean first = isArchivePackage(arg0);
+        final boolean second = isArchivePackage(arg1);
+        if (!first && !second) {
+            return base.checkSignatures(arg0, arg1);
+        }
+        if (first && second) {
+            return SIGNATURE_MATCH;
+        }
+        final android.content.pm.Signature[] mine = archiveSignatures();
+        if (mine == null) {
+            return SIGNATURE_UNKNOWN_PACKAGE;
+        }
+        final String other = first ? arg1 : arg0;
+        final PackageInfo otherInfo;
+        try {
+            otherInfo = base.getPackageInfo(other, PackageManager.GET_SIGNATURES);
+        } catch (NameNotFoundException error) {
+            return SIGNATURE_UNKNOWN_PACKAGE;
+        }
+        final android.content.pm.Signature[] theirs = otherInfo.signatures;
+        if (theirs == null) {
+            return SIGNATURE_UNKNOWN_PACKAGE;
+        }
+        if (theirs.length != mine.length) {
+            return SIGNATURE_NO_MATCH;
+        }
+        for (android.content.pm.Signature one : mine) {
+            boolean found = false;
+            for (android.content.pm.Signature two : theirs) {
+                if (one.equals(two)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                return SIGNATURE_NO_MATCH;
+            }
+        }
+        return SIGNATURE_MATCH;
+    }
+
+    /**
+     * The certificates the archive was signed with, read once: every signature
+     * question about the guest's own package needs them, and a check that runs
+     * in a loop would otherwise parse the archive each time.
+     */
+    private android.content.pm.Signature[] archiveSignatures() {
+        if (archiveSignatureCache != null) {
+            return archiveSignatureCache;
+        }
+        try {
+            @SuppressWarnings("deprecation")
+            PackageInfo archived = base.getPackageArchiveInfo(archivePath,
+                    PackageManager.GET_SIGNATURES);
+            if (archived != null) {
+                archiveSignatureCache = archived.signatures;
+            }
+        } catch (RuntimeException ignored) {
+            // An archive the platform cannot parse has no signatures to offer.
+        }
+        return archiveSignatureCache;
     }
 
     @Override

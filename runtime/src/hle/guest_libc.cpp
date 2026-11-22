@@ -14,6 +14,7 @@
 #include <ctime>
 #include <cwchar>
 #include <cwctype>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -24,12 +25,14 @@
 #include <sys/sendfile.h>
 #include <sys/statvfs.h>
 #include <sys/syscall.h>
+#include <sys/system_properties.h>
 #include <unistd.h>
 
 #include "armbat/a32_machine.h"
 #include "armbat/guest_abi.h"
 #include "armbat/guest_arena.h"
 #include "armbat/guest_heap.h"
+#include "armbat/guest_properties.h"
 #include "armbat/hle.h"
 
 #include "hle_format.h"
@@ -586,6 +589,20 @@ void GuestLibc::State::Register() {
         const std::uint32_t cell = self.EnvCell();
         PutString(call, cell, value);
         call.Return(cell);
+    });
+
+    // A device always answers these, and the guest cannot read its property
+    // area at all: an empty answer is what a repackaged application looks like,
+    // so the answer is the guest's own platform field or the host's real one,
+    // never nothing (see ResolveGuestProperty). The guest's libc resolves this
+    // name to itself, so the answer actually reaches it through the preloaded
+    // libarmbat_props.so, which traps here; this entry is the same answer for a
+    // library that imports the name instead.
+    registry.Add("__system_property_get", [](HleCall& call) {
+        std::string value;
+        ResolveGuestProperty(ArgString(call, call.Arg(0), 256), &value);
+        PutString(call, call.Arg(1), value);
+        call.Return(static_cast<std::uint32_t>(value.size()));
     });
 
     registry.Add("getcwd", [&self](HleCall& call) {

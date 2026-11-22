@@ -15,7 +15,10 @@
 
 #include "guest_boot.h"
 #include "guest_net.h"
+#include "guest_props.h"
 #include "shim_libandroid.h"
+#include "shim_libart.h"
+#include "shim_libdvm.h"
 #include "shim_libegl.h"
 #include "shim_libglesv1.h"
 #include "shim_libglesv2.h"
@@ -60,10 +63,20 @@ const Image kImages[] = {
      shims::kJnigraphicsSize},
     {"liblog.so", "/system/lib/liblog.so", shims::kLogImage, shims::kLogSize},
     {"libOpenSLES.so", "/system/lib/libOpenSLES.so", shims::kOpenslesImage, shims::kOpenslesSize},
+    // The runtime image is where a native library finds the JavaVM. ART devices
+    // carry libart.so and Dalvik ones libdvm.so; the container answers both
+    // names with the guest's own VM, so a game that opens either gets a VM that
+    // its JNIEnv, method ids and threads already belong to.
+    {"libart.so", "/system/lib/libart.so", shims::kArtImage, shims::kArtSize},
+    {"libdvm.so", "/system/lib/libdvm.so", shims::kDvmImage, shims::kDvmSize},
     // Not part of the platform image: the container's answer to a name lookup,
     // mapped before the application so its getaddrinfo() is the one that wins.
     {"libarmbat_net.so", "/system/lib/libarmbat_net.so", guest_net::kNetImage,
      guest_net::kNetSize},
+    // The same for the property reads: bionic has no property area in this
+    // container, so __system_property_get() answers from the guest profile.
+    {"libarmbat_props.so", "/system/lib/libarmbat_props.so", guest_props::kPropsImage,
+     guest_props::kPropsSize},
 };
 
 bool FileSize(const std::string& path, std::uint32_t* size) {

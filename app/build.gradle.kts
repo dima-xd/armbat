@@ -90,8 +90,17 @@ android {
         // A debug build installs beside the release one instead of replacing it:
         // its own package means its own data directory and its own library, so a
         // guest imported for testing never touches the real library.
+        //
+        // The process is not debuggable, deliberately. A guest that runs inside
+        // a debuggable process is not what a device ever runs, and an
+        // application's own anti-tamper code is entitled to answer that
+        // question: Debug.isDebuggerConnected() reports a debuggable process,
+        // and at least one shipped anti-cheat ends the process a few minutes
+        // after seeing it. Pass -ParmbatDebuggable=true to keep a debuggable
+        // container when the container itself is what is being debugged.
         debug {
             applicationIdSuffix = ".debug"
+            isDebuggable = (project.findProperty("armbatDebuggable") as String?) == "true"
         }
     }
 

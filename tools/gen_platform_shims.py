@@ -18,7 +18,9 @@ counterpart and contains one tiny trampoline per symbol:
 
 Nothing is hard-coded per game or per SDK: the symbol list comes from the NDK's
 own API-24 stub library for that platform library, which is the same list a real
-device exposes. A name the container does not implement yet resolves and returns
+device exposes. The one exception is the runtime image (libart.so / libdvm.so),
+which no NDK stub carries; its symbol list is the JNI invocation API, the part of
+that image a native library is allowed to use. A name the container does not implement yet resolves and returns
 zero, and logs itself once.
 
 Exported objects (the SL_IID_* interface identifiers) become pointers to a
@@ -60,6 +62,21 @@ DEFAULT_LIBRARIES = [
     "liblog",
     "libOpenSLES",
 ]
+
+# The runtime image does not exist in the NDK stubs, but it is the platform's
+# own API surface: a game that wants to reach the running JavaVM opens libart.so
+# (or libdvm.so on a Dalvik image) by name and looks up the invocation entry
+# points. Both names are provided, since a build that cannot read
+# ro.build.version.sdk cannot tell which one a device would carry.
+JNI_INVOCATION_API = [
+    "JNI_CreateJavaVM",
+    "JNI_GetCreatedJavaVMs",
+    "JNI_GetDefaultJavaVMInitArgs",
+]
+FIXED_API = {
+    "libart": JNI_INVOCATION_API,
+    "libdvm": JNI_INVOCATION_API,
+}
 
 
 def read_dynsym(path: str) -> list[tuple[str, int]]:
@@ -193,10 +210,13 @@ def build(ndk: str, out_dir: str, api: int, libraries: list[str]) -> int:
 
     for library in libraries:
         stub = os.path.join(stub_root, library + ".so")
-        if not os.path.isfile(stub):
+        if os.path.isfile(stub):
+            symbols = read_dynsym(stub)
+        elif library in FIXED_API:
+            symbols = [(name, STT_FUNC) for name in FIXED_API[library]]
+        else:
             print(f"skip {library}: no API {api} stub", file=sys.stderr)
             continue
-        symbols = read_dynsym(stub)
         funcs = sum(1 for _, kind in symbols if kind == STT_FUNC)
         source = os.path.join(text_dir, library + ".S")
         with open(source, "w", encoding="ascii", newline="\n") as handle:

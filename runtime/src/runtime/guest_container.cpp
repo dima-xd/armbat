@@ -992,8 +992,10 @@ struct GuestContainer::Impl {
         const int cores =
             std::clamp(static_cast<int>(std::thread::hardware_concurrency()), 1, 8);
         const std::string cpu_info_path = cache_dir + "/cpuinfo";
+        const std::string proc_stat_path = cache_dir + "/proc-stat";
         const std::string cpu_topology_path = cache_dir + "/cpu-topology";
         if (!WriteTextFile(cpu_info_path, GuestCpuInfo(cores)) ||
+            !WriteTextFile(proc_stat_path, GuestProcStat(cores)) ||
             !WriteTextFile(cpu_topology_path, "0-" + std::to_string(cores - 1) + "\n")) {
             *error = "cannot write the guest cpu description";
             return false;
@@ -1040,8 +1042,8 @@ struct GuestContainer::Impl {
         const std::string host_shared_dir =
             guest_shared_root.empty() ? std::string() : guest_shared_root + "/";
         kernel->SetPathMapper([this, host_data_dir, data_alias, cache_dir, cpu_info_path,
-                               cpu_topology_path, guest_package, guest_obb_root,
-                               guest_shared_root,
+                               proc_stat_path, cpu_topology_path, guest_package,
+                               guest_obb_root, guest_shared_root,
                                host_shared_dir](const std::string& path) -> std::string {
             // A library name resolved through the guest's class loader lands in
             // the container's stand-in directory, whose files are 64-bit: a
@@ -1068,6 +1070,11 @@ struct GuestContainer::Impl {
             if (path == "/proc/cpuinfo") {
                 return cpu_info_path;
             }
+            // The same device in the shape the collector reads its processor
+            // count from.
+            if (path == "/proc/stat") {
+                return proc_stat_path;
+            }
             for (const std::string_view topology : {"/sys/devices/system/cpu/present",
                                                     "/sys/devices/system/cpu/possible",
                                                     "/sys/devices/system/cpu/online"}) {
@@ -1088,6 +1095,38 @@ struct GuestContainer::Impl {
             constexpr std::string_view prefix = "/armbat/";
             if (path.compare(0, prefix.size(), prefix) == 0) {
                 return armbat_root + "/" + path.substr(prefix.size());
+            }
+            // An installed application keeps its native libraries in a
+            // versioned directory of /data/app, and that is the path the
+            // framework reports and a guest hands to its own loader. The
+            // container's libraries are one directory, so anything under the
+            // application's installed-lib path is that same file.
+            const std::string install_prefix = "/data/app/" + guest_package + "-";
+            if (path.compare(0, install_prefix.size(), install_prefix) == 0) {
+                const std::string rest = path.substr(install_prefix.size());
+                // The installed code path, /data/app/<package>-<version>/base.apk.
+                // The container reports the archive's own path, and an
+                // application that derives this one from the installed layout
+                // still has to reach the archive: no such file exists on the
+                // host, and a missing code path is a state no installed
+                // application is in.
+                if (rest.size() > 9 && rest.compare(rest.size() - 9, 9, "/base.apk") == 0 &&
+                    apk != nullptr) {
+                    return apk->Path();
+                }
+                const std::size_t library = rest.find("/lib/");
+                if (library != std::string::npos) {
+                    // Both the directory the framework reports and a file
+                    // inside it: the container keeps those files in one
+                    // directory, so the directory is that directory and a name
+                    // below it is that file.
+                    const std::string after = rest.substr(library + 5);
+                    const std::size_t name = after.find('/');
+                    if (name == std::string::npos) {
+                        return app_lib_dir;
+                    }
+                    return app_lib_dir + after.substr(name);
+                }
             }
             for (const std::string_view data_prefix : {"/data/data/", "/data/user/0/"}) {
                 if (path.compare(0, data_prefix.size(), data_prefix) == 0) {
@@ -1627,6 +1666,13 @@ std::string GuestContainer::StartNativeActivity(const std::string& data_path) {
     return report;
 }
 
+std::string GuestContainer::MapPath(const std::string& guest_path) const {
+    if (!impl_->kernel) {
+        return guest_path;
+    }
+    return impl_->kernel->MapPath(guest_path);
+}
+
 std::string GuestContainer::DescribeAddress(std::uint32_t address) const {
     for (const LoadedLibrary& library : impl_->dynamic->Libraries()) {
         if (address < library.base || address >= library.base + library.image_size) {
@@ -1853,6 +1899,23 @@ std::string GuestContainer::LoadApk(const std::string& apk_path, const std::stri
         ARMBAT_LOG_WARN("Armbat", "network: resolver loaded but getaddrinfo is not exported");
     } else {
         ARMBAT_LOG_INFO("Armbat", "network: guest DNS resolver loaded and exported");
+    }
+
+    // bionic reads properties from /dev/__properties__, which this container
+    // does not have: every name would answer an empty string, a state no device
+    // produces. The shim answers from the guest's device profile and goes into
+    // the global symbol group before the application for the same reason the
+    // resolver does -- a library mapped later binds its property reads to it.
+    const std::uint32_t props_handle =
+        impl_->bionic->Dlopen("/system/lib/libarmbat_props.so", 2 /*RTLD_NOW*/);
+    if (props_handle == 0) {
+        ARMBAT_LOG_WARN("Armbat", "property shim not loaded: %s",
+                        impl_->bionic->LastError().c_str());
+    } else if (impl_->bionic->Dlsym(props_handle, "__system_property_get") == 0) {
+        ARMBAT_LOG_WARN("Armbat",
+                        "property shim loaded but __system_property_get is not exported");
+    } else {
+        ARMBAT_LOG_INFO("Armbat", "platform properties: guest profile loaded and exported");
     }
 
     std::vector<GuestApk::ExtractedNative> extracted;

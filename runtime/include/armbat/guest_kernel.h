@@ -117,12 +117,16 @@ public:
     // not open: the mapped host path is the part the guest never sees.
     std::string RecentPaths() const;
 
+    // The host path behind a guest path. The syscall layer translates every
+    // path it opens this way, and a guest's Java half has to name the same
+    // files, so it asks here instead of carrying a second table.
+    std::string MapPath(const std::string& guest_path) const;
+
 private:
     bool Handle(std::uint32_t svc, A32Machine& machine);
     std::int32_t Dispatch(std::uint32_t number, const std::uint32_t* args);
     std::int32_t DispatchPrivate(std::uint32_t number, const std::uint32_t* args);
     bool ReadString(std::uint32_t address, std::string& out) const;
-    std::string MapPath(const std::string& guest_path) const;
     // /proc/self/maps answered from the guest's own address space. Returns a
     // descriptor holding the text, or -errno.
     //

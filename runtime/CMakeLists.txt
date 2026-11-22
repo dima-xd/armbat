@@ -1,6 +1,7 @@
 add_library(armbat_core STATIC
     src/armbat/version.cpp
     src/bionic/bionic_boot.cpp
+    src/bionic/guest_properties.cpp
     src/bionic/guest_sysroot.cpp
     src/bionic/kernel_helpers.cpp
     src/cpu/guest_arena.cpp
@@ -258,6 +259,23 @@ armbat_embed_binary("${_guest_net_so}" "${_guest_net_header}" guest_net kNet)
 add_custom_target(guest_net DEPENDS "${_guest_net_header}")
 add_dependencies(armbat_core guest_net)
 
+# --- Guest property shim -----------------------------------------------------
+# The guest's bionic has no property area to read (see guest_properties.cpp), so
+# the names it asks for are answered by the container. Like the resolver, the
+# library is loaded ahead of the application and marked global, so libraries the
+# game loads later bind their property reads to it.
+set(_guest_props_so "${_guest_lib_dir}/libarmbat_props.so")
+set(_guest_props_flags ${ARMBAT_GUEST_LINKED_FLAGS} "-Wl,-z,global")
+armbat_guest_module("${_guest_props_so}" "libarmbat_props.so"
+    "${PROJECT_SOURCE_DIR}/runtime/guest/props.c"
+    "${CMAKE_C_COMPILER}" "${_guest_props_flags}")
+
+set(_guest_props_header "${CMAKE_BINARY_DIR}/generated/guest_props.h")
+armbat_embed_binary("${_guest_props_so}" "${_guest_props_header}" guest_props kProps)
+
+add_custom_target(guest_props DEPENDS "${_guest_props_header}")
+add_dependencies(armbat_core guest_props)
+
 # --- Guest bionic sysroot ----------------------------------------------------
 # The guest runs the real Android userland: the linker from the ARMv7 system
 # image plus the libc/libm/libdl family it loads. The files are pinned copies
@@ -328,7 +346,7 @@ add_custom_target(guest_sysroot DEPENDS ${_sysroot_header_list} "${_boot_header}
 # library - as trampolines that trap into the HLE registry by symbol name.
 set(_shim_work "${CMAKE_BINARY_DIR}/shims")
 set(_shim_libraries
-    libEGL libGLESv1_CM libGLESv2 libandroid libjnigraphics liblog libOpenSLES)
+    libEGL libGLESv1_CM libGLESv2 libandroid libjnigraphics liblog libOpenSLES libart libdvm)
 set(_shim_outputs "")
 # The generator reads the NDK stubs; a re-installed NDK has to rebuild the shims.
 set(_shim_stub_deps "")
@@ -359,6 +377,8 @@ set(_shim_embeds
     "libjnigraphics:libjnigraphics:kJnigraphics"
     "liblog:liblog:kLog"
     "libOpenSLES:libopensles:kOpensles"
+    "libart:libart:kArt"
+    "libdvm:libdvm:kDvm"
 )
 set(_shim_header_list "")
 foreach(_entry IN LISTS _shim_embeds)

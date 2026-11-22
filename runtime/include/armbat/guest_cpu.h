@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <string>
 
 namespace armbat {
@@ -60,6 +61,67 @@ inline std::string GuestCpuInfo(int cores) {
     text += "Hardware\t: armbat\n";
     text += "Revision\t: 0000\n";
     text += "Serial\t\t: 0000000000000000\n";
+    return text;
+}
+
+// The same emulated device, in the shape /proc/stat has. Boehm's collector --
+// the heap every Mono and Unity guest links -- asks this file how many
+// processors there are and sizes its marker threads from the answer; with the
+// file missing it reports -1 and configures the heap for an unknown machine.
+// The host's own file cannot be forwarded instead: it describes the phone's
+// cores, and a guest that counts them would size its thread pools for a
+// different machine than the one HWCAP and cpuinfo describe.
+inline std::string GuestProcStat(int cores) {
+    cores = std::clamp(cores, 1, 8);
+    std::uint64_t total[8] = {};
+    std::string text;
+    text.reserve(static_cast<std::size_t>(cores) * 64 + 192);
+    constexpr const char* kFormat = "cpu%s %llu %llu %llu %llu %llu %llu %llu %llu\n";
+    for (int cpu = 0; cpu < cores; ++cpu) {
+        const std::uint64_t values[8] = {
+            552000ull + 1379ull * static_cast<std::uint64_t>(cpu),  // user
+            1900ull,                                                // nice
+            123000ull + 419ull * static_cast<std::uint64_t>(cpu),   // system
+            2230000ull + 811ull * static_cast<std::uint64_t>(cpu),  // idle
+            5150ull,                                                // iowait
+            0ull,                                                   // irq
+            3390ull,                                                // softirq
+            0ull,                                                   // steal
+        };
+        for (int field = 0; field < 8; ++field) {
+            total[field] += values[field];
+        }
+        const std::string suffix = std::to_string(cpu);
+        char line[160];
+        std::snprintf(line, sizeof(line), kFormat, suffix.c_str(),
+                      static_cast<unsigned long long>(values[0]),
+                      static_cast<unsigned long long>(values[1]),
+                      static_cast<unsigned long long>(values[2]),
+                      static_cast<unsigned long long>(values[3]),
+                      static_cast<unsigned long long>(values[4]),
+                      static_cast<unsigned long long>(values[5]),
+                      static_cast<unsigned long long>(values[6]),
+                      static_cast<unsigned long long>(values[7]));
+        text += line;
+    }
+    char aggregate[192];
+    std::snprintf(aggregate, sizeof(aggregate), kFormat, "",
+                  static_cast<unsigned long long>(total[0]),
+                  static_cast<unsigned long long>(total[1]),
+                  static_cast<unsigned long long>(total[2]),
+                  static_cast<unsigned long long>(total[3]),
+                  static_cast<unsigned long long>(total[4]),
+                  static_cast<unsigned long long>(total[5]),
+                  static_cast<unsigned long long>(total[6]),
+                  static_cast<unsigned long long>(total[7]));
+    text = aggregate + text;
+    text += "intr 0 0 0 0 0 0 0 0 0 0 0\n";
+    text += "ctxt 8123456\n";
+    text += "btime 1546300800\n";
+    text += "processes 51234\n";
+    text += "procs_running 1\n";
+    text += "procs_blocked 0\n";
+    text += "softirq 1234567 0 0 0 0 0 0 0 0 0 0\n";
     return text;
 }
 

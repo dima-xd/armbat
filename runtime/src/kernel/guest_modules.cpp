@@ -90,8 +90,12 @@ std::vector<GuestModule> GuestModules() {
 
 bool IsGuestModuleAddress(std::uint32_t address) {
     std::lock_guard<std::mutex> lock(g_mutex);
-    for (const GuestModule& module : Merged()) {
-        if (address >= module.base && address < module.end) {
+    // The live mappings, not the merged view: an image whose head was mapped,
+    // unmapped and mapped again appears twice, and the merged range would claim
+    // the span between the two -- including addresses that belong to other
+    // images.
+    for (const GuestMapping& mapping : g_mappings) {
+        if (address >= mapping.base && address < mapping.base + mapping.length) {
             return true;
         }
     }
@@ -139,15 +143,26 @@ bool DescribeGuestAddressInline(std::uint32_t address, char* out, std::size_t si
 
 std::string DescribeGuestAddress(std::uint32_t address) {
     std::string path;
-    std::uint32_t offset = 0;
+    std::uint32_t base = 0;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        for (const GuestModule& module : Merged()) {
-            if (address >= module.base && address < module.end) {
-                path = module.path;
-                offset = address - module.base;
-                break;
+        // The mapping that actually covers the address names the image; the
+        // offset is taken against the lowest address that image was mapped at,
+        // which is what its symbol table is relative to. Describing against the
+        // merged range instead attributes every address between two mappings of
+        // one image to that image, and the numbers come out far past its size.
+        for (const GuestMapping& mapping : g_mappings) {
+            if (address < mapping.base || address >= mapping.base + mapping.length) {
+                continue;
             }
+            path = mapping.path;
+            base = mapping.base;
+            for (const GuestMapping& other : g_mappings) {
+                if (other.path == path && other.base < base) {
+                    base = other.base;
+                }
+            }
+            break;
         }
     }
     if (path.empty()) {
@@ -155,6 +170,7 @@ std::string DescribeGuestAddress(std::uint32_t address) {
         std::snprintf(plain, sizeof(plain), "0x%08x", address);
         return plain;
     }
+    const std::uint32_t offset = address - base;
     char suffix[24];
     std::snprintf(suffix, sizeof(suffix), "+0x%x", offset);
     std::string text = BaseName(path) + suffix;

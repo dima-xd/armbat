@@ -49,6 +49,20 @@ internal object GuestNatives {
     external fun registerNatives(loader: ClassLoader): String
 
     /**
+     * Answers, instead of running, the native methods of the libraries whose
+     * image path, or whose method name, contains one of the given names: one
+     * substring per line.
+     *
+     * For an archive that carries a protection SDK which ends the process from
+     * its own code when it does not like the device it runs on. The SDK's Java
+     * half cannot tell a check that ran and found nothing from one that never
+     * ran, so answering its native methods with zero leaves the archive working
+     * and the SDK's engine out of the process. Explicit and per archive: with an
+     * empty string nothing changes.
+     */
+    external fun silence(libraries: String): String
+
+    /**
      * Runs the archive's JNI_OnLoad for the library its Java side is loading
      * through System.loadLibrary, the point where the platform calls it: the
      * entry reads Java state the caller has set up by then (Unity's proxy asks

@@ -127,6 +127,13 @@ public:
     // "libminecraftpe.so+0x12345 in SomeSymbol", for crash reports.
     std::string DescribeAddress(std::uint32_t address) const;
 
+    // The host path behind a guest path, by the same table the syscalls use.
+    // Java code inside the guest constructs the paths a device uses
+    // (/data/data/<package>, /data/app/<package>-<n>/lib/arm) and hands them to
+    // the framework, which stats them on the host: without this they name
+    // directories that do not exist and a guest sees an empty world there.
+    std::string MapPath(const std::string& guest_path) const;
+
     // Runs a guest entry point that a platform thread reached, on a guest
     // context attached to that very thread, and returns its answer in `result`
     // (r0) and `result_high` (r1, the high half of a long). The thread is the

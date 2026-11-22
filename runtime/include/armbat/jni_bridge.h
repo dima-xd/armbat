@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace armbat {
 
@@ -35,6 +36,26 @@ public:
     // Problems with individual classes are reported, not fatal: an archive may
     // carry code for SDKs the container does not have.
     std::string RegisterExports(JNIEnv* env, jobject loader);
+
+    // Answers, instead of running, every native method that lives in a library
+    // whose path -- or whose method name -- contains one of `libraries`, and
+    // reports what it answered.
+    //
+    // A few archives ship a protection SDK that decides inside its own guest
+    // code whether the process is the device it expects and ends the process
+    // from there when it is not. Nothing in the container is broken then: an
+    // emulated device is exactly what such an SDK refuses. Its Java half,
+    // however, sends every decision through a handful of native methods, and the
+    // application's own callers cannot tell "the engine ran and found nothing"
+    // from "the engine never ran" -- neither produces an event to report. Being
+    // answered with zero leaves the SDK's Java half working and its engine out
+    // of the picture.
+    //
+    // Explicit and per archive, never a default: the library names come from the
+    // user (see the marker file the launcher reads). This is not emulation of
+    // the SDK -- nothing is faked -- it is the container declining to run code
+    // whose only product is the death of the process.
+    std::string SilenceLibraries(const std::vector<std::string>& libraries);
 
     // The JNIEnv a guest native method sees, and a JavaVM for JNI_OnLoad.
     std::uint32_t GuestEnv() const;
