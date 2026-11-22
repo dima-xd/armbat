@@ -88,4 +88,11 @@
     <string name="update_later">LATER</string>
     <string name="install_permission_title">Allow installing updates</string>
     <string name="install_permission_detail">Allow Armbat to install unknown apps in the system settings, then choose UPDATE again.</string>
+    <string name="silence">Bypass checks</string>
+    <string name="silence_state_default">Default</string>
+    <string name="silence_state_edited">Custom file</string>
+    <string name="silence_state_off">Off</string>
+    <string name="silence_hint">One entry per line. Empty means off.</string>
+    <string name="silence_save">SAVE</string>
+    <string name="silence_reset">RESET</string>
 </resources>

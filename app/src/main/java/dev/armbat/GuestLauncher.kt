@@ -988,62 +988,6 @@ class GuestLauncher(private val host: Activity) {
     }
 
     /**
-     * What the archive asked the container to keep out of its own way, or null.
-     *
-     * A file at armbat/silence/<package> holds one entry per line:
-     *
-     *     libstub                                          a library, or a native
-     *                                                      method, the container
-     *                                                      answers instead of runs
-     *     flag:android.support.v4.security.coM5#true=true  a static field of the
-     *                                                      archive kept at a value
-     *
-     * It exists because an archive may carry a protection SDK that decides
-     * inside its own code whether the process is the device it expects, and ends
-     * the process from there when it is not: an emulated device is exactly what
-     * such an SDK refuses, and no container fix changes that, because the SDK is
-     * working. This file is how the user tells the container to leave that SDK
-     * out of the picture -- its native half is not called, and the flag its
-     * engine raises to say "I am running" is held raised, which is the state a
-     * process on an accepted device is in.
-     *
-     * Deliberately a file the user places and not a default: with no file the
-     * container behaves exactly as before, and what is silenced is a decision
-     * about one archive.
-     */
-    private class Protection(
-        /** Library or method names for [GuestNatives.silence], one per line. */
-        val silenced: String,
-        /** Static fields to hold, "class#field=value". */
-        val holds: List<String>,
-    )
-
-    private fun protection(packageName: String): Protection? {
-        val marker = File(GuestStorage.root(), "silence/$packageName")
-        if (!marker.isFile) {
-            return null
-        }
-        val lines = runCatching { marker.readLines() }.getOrNull() ?: return null
-        val silenced = StringBuilder()
-        val holds = ArrayList<String>()
-        for (line in lines) {
-            val entry = line.trim()
-            if (entry.isEmpty() || entry.startsWith("#")) {
-                continue
-            }
-            if (entry.startsWith("flag:")) {
-                holds.add(entry.removePrefix("flag:").trim())
-            } else {
-                silenced.append(entry).append('\n')
-            }
-        }
-        if (silenced.isEmpty() && holds.isEmpty()) {
-            return null
-        }
-        return Protection(silenced.toString().trim(), holds)
-    }
-
-    /**
      * Keeps the archive's own state flags at their values, and reports every
      * write it has to undo.
      *
@@ -1184,12 +1128,12 @@ class GuestLauncher(private val host: Activity) {
             GuestStorage.root().absolutePath,
         )
         // An archive that shipped a protection SDK may have asked the container
-        // to leave it out of the picture (see protection). Applied before any of
+        // to leave it out of the picture (see Silence). Applied before any of
         // the archive's own code runs, and usually absent.
-        protection(prepared.packageName)?.let { guard ->
+        Silence.plan(prepared.packageName)?.let { guard ->
             ArmbatLog.i(
                 TAG,
-                "guest protection: silenced=[" + guard.silenced.replace('\n', ' ') + "]" +
+                "guest silence: silenced=[" + guard.silenced.replace('\n', ' ') + "]" +
                     " held=" + guard.holds.joinToString(" "),
             )
             if (guard.silenced.isNotEmpty()) {

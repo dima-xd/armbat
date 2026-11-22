@@ -88,4 +88,11 @@
     <string name="update_later">ПОЗЖЕ</string>
     <string name="install_permission_title">Разрешите установку обновлений</string>
     <string name="install_permission_detail">Разрешите Armbat устанавливать неизвестные приложения в настройках системы и снова нажмите «ОБНОВИТЬ».</string>
+    <string name="silence">Обход проверок</string>
+    <string name="silence_state_default">По умолчанию</string>
+    <string name="silence_state_edited">Свой файл</string>
+    <string name="silence_state_off">Выключено</string>
+    <string name="silence_hint">По одной записи на строку. Пусто — выключено.</string>
+    <string name="silence_save">СОХРАНИТЬ</string>
+    <string name="silence_reset">СБРОСИТЬ</string>
 </resources>

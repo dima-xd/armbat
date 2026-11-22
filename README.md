@@ -98,6 +98,7 @@ own `/sdcard`.
 /sdcard/armbat/
   logs/                            runtime and guest log files
   <package>-<version>.apk          imported archives
+  silence/<package>                entries for Bypass checks
   android/data/<package>/
     files/                         Context.getFilesDir()
     cache/                         Context.getCacheDir()
@@ -120,6 +121,13 @@ only has to be copied into `android/obb/<package>/`, a save into `files/` or
 
 Without "all files access" the folder cannot be read and the library stays empty
 until the grant is given.
+
+## Bypass checks
+
+An archive that ships a protection SDK can be told to leave it alone, per app.
+The switch is the last row of the app card (long-press the icon); the file
+format, the shipped defaults and the limits are described in
+[guides/silence.md](guides/silence.md).
 
 ## Build requirements
 

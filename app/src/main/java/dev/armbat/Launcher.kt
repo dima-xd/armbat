@@ -60,6 +60,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -547,6 +548,7 @@ fun DetailsScreen(
     launching: Boolean,
     launchError: String,
     onLaunch: () -> Unit,
+    onSilence: () -> Unit,
     onDelete: () -> Unit,
 ) {
     Column(Modifier.fillMaxSize().background(HoloBlack)) {
@@ -597,6 +599,21 @@ fun DetailsScreen(
                 }
             }
         }
+        Box(Modifier.fillMaxWidth().height(1.dp).background(HoloRule))
+        // The entries that keep this archive's own protection SDK out of the
+        // way are its data, so they are edited here and not for every app at
+        // once.
+        SettingsRow(
+            title = stringResource(R.string.silence),
+            summary = stringResource(
+                when (Silence.state(app.packageName)) {
+                    Silence.State.DEFAULT -> R.string.silence_state_default
+                    Silence.State.EDITED -> R.string.silence_state_edited
+                    Silence.State.OFF -> R.string.silence_state_off
+                },
+            ),
+            onClick = onSilence,
+        )
 
         if (launching || launchError.isNotEmpty()) {
             Text(
@@ -743,6 +760,72 @@ fun SettingsScreen(
                 },
                 onDismiss = { channelOpen = false },
             )
+        }
+    }
+}
+
+/**
+ * The entries of one package as raw text: the file format is the interface, so
+ * what is edited here is exactly what the file holds.
+ */
+@Composable
+fun SilenceEditorScreen(packageName: String, title: String, onDone: () -> Unit) {
+    var text by remember(packageName) { mutableStateOf(Silence.effective(packageName) ?: "") }
+    Column(Modifier.fillMaxSize().background(HoloBlack)) {
+        HoloHeader(title)
+        Column(Modifier.weight(1f).padding(horizontal = 16.dp, vertical = 12.dp)) {
+            Text(
+                packageName,
+                color = HoloDim,
+                fontSize = 11.sp,
+                fontFamily = FontFamily.Monospace,
+            )
+            Spacer(Modifier.height(4.dp))
+            Text(stringResource(R.string.silence_hint), color = HoloDim, fontSize = 11.sp)
+            Spacer(Modifier.height(10.dp))
+            Box(
+                Modifier
+                    .fillMaxWidth()
+                    .weight(1f)
+                    .background(HoloRow)
+                    .border(1.dp, HoloRule),
+            ) {
+                BasicTextField(
+                    value = text,
+                    onValueChange = { text = it },
+                    modifier = Modifier.fillMaxSize().padding(12.dp),
+                    textStyle = TextStyle(
+                        color = HoloText,
+                        fontSize = 13.sp,
+                        fontFamily = FontFamily.Monospace,
+                        lineHeight = 20.sp,
+                    ),
+                    cursorBrush = SolidColor(HoloBlue),
+                )
+            }
+        }
+        Row(
+            Modifier.fillMaxWidth().padding(16.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            HoloButton(
+                label = stringResource(R.string.silence_save),
+                enabled = true,
+                modifier = Modifier.weight(1f),
+            ) {
+                Silence.save(packageName, text)
+                onDone()
+            }
+            HoloButton(
+                label = stringResource(R.string.silence_reset),
+                enabled = true,
+                modifier = Modifier.weight(1f),
+            ) {
+                // Deleting the file returns the package to its shipped
+                // default; the field then shows what will actually run.
+                Silence.reset(packageName)
+                text = Silence.effective(packageName) ?: ""
+            }
         }
     }
 }

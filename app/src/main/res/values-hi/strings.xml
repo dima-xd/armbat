@@ -85,4 +85,11 @@
     <string name="update_later">बाद में</string>
     <string name="install_permission_title">अपडेट इंस्टॉल करने की अनुमति दें</string>
     <string name="install_permission_detail">सिस्टम सेटिंग्स में Armbat को अज्ञात ऐप इंस्टॉल करने की अनुमति दें, फिर दोबारा अपडेट करें चुनें।</string>
+    <string name="silence">जाँच से बचें</string>
+    <string name="silence_state_default">डिफ़ॉल्ट</string>
+    <string name="silence_state_edited">अपनी फ़ाइल</string>
+    <string name="silence_state_off">बंद</string>
+    <string name="silence_hint">प्रति पंक्ति एक प्रविष्टि। खाली रहने पर बंद।</string>
+    <string name="silence_save">सहेजें</string>
+    <string name="silence_reset">रीसेट</string>
 </resources>

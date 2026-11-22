@@ -55,6 +55,7 @@ class MainActivity : ComponentActivity() {
         data object Home : Screen
         data class Details(val app: ApkInfo) : Screen
         data object Settings : Screen
+        data class SilenceEdit(val app: ApkInfo) : Screen
         data object About : Screen
         data object Apps : Screen
     }
@@ -645,7 +646,12 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        BackHandler(enabled = screen != Screen.Home) { screen = Screen.Home }
+        BackHandler(enabled = screen != Screen.Home) {
+            screen = when (val current = screen) {
+                is Screen.SilenceEdit -> Screen.Details(current.app)
+                else -> Screen.Home
+            }
+        }
         BackHandler(enabled = notice != null) { notice = null }
 
         Box(Modifier.fillMaxSize().background(HoloBlack)) {
@@ -676,6 +682,7 @@ class MainActivity : ComponentActivity() {
                             launching = running == current.app.path,
                             launchError = launchError,
                             onLaunch = { run(current.app) },
+                            onSilence = { screen = Screen.SilenceEdit(current.app) },
                             onDelete = {
                                 scope.launch {
                                     busy = true
@@ -720,6 +727,12 @@ class MainActivity : ComponentActivity() {
                             },
                             onCheckUpdates = { scope.launch { checkUpdates(manual = true) } },
                             onAbout = { screen = Screen.About },
+                        )
+
+                        is Screen.SilenceEdit -> SilenceEditorScreen(
+                            packageName = current.app.packageName,
+                            title = current.app.label,
+                            onDone = { screen = Screen.Details(current.app) },
                         )
 
                         Screen.About -> AboutScreen(

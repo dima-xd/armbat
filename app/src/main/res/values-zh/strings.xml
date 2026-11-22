@@ -87,4 +87,11 @@
     <string name="update_later">稍后</string>
     <string name="install_permission_title">允许安装更新</string>
     <string name="install_permission_detail">请在系统设置中允许 Armbat 安装未知应用，然后再次点按“更新”。</string>
+    <string name="silence">绕过校验</string>
+    <string name="silence_state_default">默认</string>
+    <string name="silence_state_edited">自有文件</string>
+    <string name="silence_state_off">已关闭</string>
+    <string name="silence_hint">每行一条记录。留空即关闭。</string>
+    <string name="silence_save">保存</string>
+    <string name="silence_reset">重置</string>
 </resources>

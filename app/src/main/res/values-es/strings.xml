@@ -86,4 +86,11 @@
     <string name="update_later">MÁS TARDE</string>
     <string name="install_permission_title">Permite instalar actualizaciones</string>
     <string name="install_permission_detail">Permite que Armbat instale aplicaciones desconocidas en los ajustes del sistema y vuelve a pulsar ACTUALIZAR.</string>
+    <string name="silence">Evitar comprobaciones</string>
+    <string name="silence_state_default">Predeterminado</string>
+    <string name="silence_state_edited">Archivo propio</string>
+    <string name="silence_state_off">Desactivado</string>
+    <string name="silence_hint">Una entrada por línea. Vacío significa desactivado.</string>
+    <string name="silence_save">GUARDAR</string>
+    <string name="silence_reset">RESTABLECER</string>
 </resources>
