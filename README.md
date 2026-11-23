@@ -1,52 +1,63 @@
-[English](README.md) · [中文](README.zh.md)
+English · [中文](README.zh.md) · [Website](https://armbat-web.vercel.app/) · [Discord](https://discord.gg/dSpQ7XamWT)
 
-[![Discord](https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?logo=discord&logoColor=white)](https://discord.gg/dSpQ7XamWT)
+[![Latest release](https://img.shields.io/github/v/release/dima-xd/armbat?sort=semver&label=release)](https://github.com/dima-xd/armbat/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/dima-xd/armbat/total?label=downloads)](https://github.com/dima-xd/armbat/releases)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![Android](https://img.shields.io/badge/Android-12%2B%20%C2%B7%20arm64--v8a-3DDC84?logo=android&logoColor=white)](#requirements)
+[![Stars](https://img.shields.io/github/stars/dima-xd/armbat?label=stars)](https://github.com/dima-xd/armbat/stargazers)
 
 # Armbat
 
-Armbat is a container for 32-bit ARM Android applications running on a 64-bit
-device that has no 32-bit ABI. Guest Java code runs on the platform's ART; guest
-machine code is translated from A32 to ARM64 by a JIT built on Dynarmic. Root is
-not required.
+Armbat runs 32-bit ARMv7 Android games on phones that no longer support them.
+Import an APK, tap it, play. No root, no repackaging, no second Android inside.
 
-On the surface it is a small library: import an APK, launch it, delete it. The
-work sits underneath, in a C++20 runtime with its own ELF loader, syscall layer
-and platform stubs.
+Plenty of phones sold in the last few years have dropped the 32-bit ABI
+completely: an `armeabi-v7a` APK refuses to install, and Play says the game is not
+compatible with your device. Armbat gives those archives somewhere to run. A game
+that goes through it stays a file in a folder you can open from any file manager;
+nothing is patched and nothing is installed.
 
-## How it works
+## Download
 
-- **One flat 4 GiB arena.** A guest address is a 32-bit offset into it, so
-  fastmem works without translating pointers.
-- **Real bionic userland.** The guest is not run against a re-implementation of
-  libc: `runtime/sysroot` carries the linker, libc, libm, libdl and libstdc++
-  from an official `armeabi-v7a` system image, and the container boots them.
-- **Syscalls** go through `SVC #0`, Linux ARM EABI, dispatch by `r7`.
-- **HLE only where the platform cannot be reused:** JNI, `AAssetManager`, EGL and
-  GLES (forwarded to the host driver), `liblog`, `ANativeWindow`, OpenSLES.
-  Guest libraries importing them get trampolines that trap into the container by
-  symbol name.
-- **Input** is a `MotionEvent` pass-through: the decor view is scaled to the
-  guest surface, and the framework translates window to guest pixels per pointer,
-  keeping id, action index, pressure and time.
-- **ELF32 loader** handles segments, `DT_NEEDED`, `dlopen`/`dlsym`, ARM
-  relocations (`R_ARM_RELATIVE`, `ABS32`, `GLOB_DAT`, `JUMP_SLOT`, `PREL31`) and
-  `DT_INIT_ARRAY`.
+| Build | Where |
+|---|---|
+| Stable | [releases/latest](https://github.com/dima-xd/armbat/releases/latest) |
+| Nightly | [releases/tag/nightly](https://github.com/dima-xd/armbat/releases/tag/nightly) |
+| Every build and changelog | [armbat-web.vercel.app](https://armbat-web.vercel.app/builds) |
 
-The single real acceptance test is Minecraft 1.2.0.81 (`com.mojang.minecraftpe`):
-menu, world creation and loading, rendering, playable frame rate, multitouch. The
-synthetic suites under `tests/` are a development aid, not proof.
+The app can also switch between the two channels in its settings.
+
+## What it does
+
+- Runs unmodified `armeabi-v7a` archives. 64-bit packages are not translated.
+- A game keeps its own resolution, and rotation works.
+- Touch reaches the guest as the platform delivered it: pointer ids, action index,
+  pressure and timing are preserved, so multitouch in a game behaves as it does on
+  a device that still has 32-bit support.
+- Motion sensors work.
+- Audio goes through OpenSLES.
+- Saves, settings and expansion files live in `/sdcard/armbat/`, so a save can be
+  copied in before the first launch and backed up later.
+- A game that ships a protection SDK and refuses its own environment can be told
+  to skip it, per app ([guides/silence.md](guides/silence.md)).
 
 ## Screenshots
 
-|                     N.O.V.A. 3                     |                      The Sims 3                      |
-|:--------------------------------------------------:|:----------------------------------------------------:|
-| ![N.O.V.A. 3](screenshots/nova3.jpg)               | ![The Sims 3](screenshots/sims3.jpg)                 |
+All of these run on a phone with no 32-bit ABI at all.
 
-|                     Subway Surfers                     |                     Minecraft                      |
-|:------------------------------------------------------:|:--------------------------------------------------:|
-| ![Subway Surfers](screenshots/subway.jpg)              | ![Minecraft](screenshots/minecraft.jpg)            |
+| N.O.V.A. 3 | Subway Surfers | The Sims 3 |
+|:---:|:---:|:---:|
+| ![N.O.V.A. 3](screenshots/nova3.jpg) | ![Subway Surfers](screenshots/subway.jpg) | ![The Sims 3](screenshots/sims3.jpg) |
 
-## Device requirements
+## Compatibility
+
+Games are checked one at a time on real hardware, and the reports are collected on
+the site: [armbat-web.vercel.app/compatibility](https://armbat-web.vercel.app/compatibility).
+If something runs for you and is missing from that list, add a report with the
+[game compatibility template](https://github.com/dima-xd/armbat/issues/new?template=game_compatibility.yml).
+A log from a game that fails is just as useful as one from a game that works.
+
+## Requirements
 
 - Android 12 (API 31) or newer on `arm64-v8a`. The device may have no 32-bit ABI
   at all; that is the case the container exists for.
@@ -55,6 +66,54 @@ synthetic suites under `tests/` are a development aid, not proof.
 - "All files access" granted to the app: the library, a game's data and its
   expansion files live under shared storage.
 - Only 32-bit ARMv7 (`armeabi-v7a`) archives are supported. For now.
+
+## Install
+
+1. Download the APK from [releases](https://github.com/dima-xd/armbat/releases/latest)
+   and install it, allowing installs from this source.
+2. Grant "All files access" when the app asks. Without the grant the library stays
+   empty.
+3. Put a game APK into `/sdcard/armbat/`, or use Import in the app.
+4. Tap the game in the library.
+
+An archive can be deleted from the same card it was imported from. Deleting it
+removes the APK from `/sdcard/armbat/`, not the save data.
+
+## Where files live
+
+The container keeps everything under one folder on shared storage: `armbat` in
+the root of the user storage, `/sdcard/armbat` on most devices. A private app
+directory would not do, because imported APKs, saves and expansion files have to
+be reachable from a file manager. The same folder is what the guest sees as its
+own `/sdcard`.
+
+```
+/sdcard/armbat/
+  logs/                            runtime and guest log files
+  <package>-<version>.apk          imported archives
+  silence/<package>                entries for Bypass checks
+  android/data/<package>/
+    files/                         Context.getFilesDir()
+    cache/                         Context.getCacheDir()
+    databases/                     SQLite databases
+    shared_prefs/                  SharedPreferences
+    external/files/                Context.getExternalFilesDir()
+    external/cache/                Context.getExternalCacheDir()
+  android/obb/<package>/           expansion files, main.*.obb and patch.*.obb
+```
+
+An imported archive is stored as `<packageName>-<versionName>.apk`, for example
+`com.example.game-1.2.3.apk`. Importing another version of the same package
+deletes the previous file, so the library keeps one copy per package. An APK
+copied into the folder by hand is picked up as well.
+
+Data can be put in place before the first launch: these directories are created
+when the archive is imported, and again whenever the guest asks for one. An obb
+only has to be copied into `android/obb/<package>/`, a save into `files/` or
+`external/files/`.
+
+Without "all files access" the folder cannot be read and the library stays empty
+until the grant is given.
 
 ## Permissions
 
@@ -86,41 +145,32 @@ anyway, because the library, a game's data and its expansion files live on share
 storage, so the guest is answered from that grant and the two legacy names are
 not requested at all.
 
-## Where files live
+## How it works
 
-The container keeps everything under one folder on shared storage: `armbat` in
-the root of the user storage, `/sdcard/armbat` on most devices. A private app
-directory would not do, because imported APKs, saves and expansion files have to
-be reachable from a file manager. The same folder is what the guest sees as its
-own `/sdcard`.
+Guest Java code runs on the platform's ART. Guest machine code is translated from
+A32 to ARM64 by a JIT built on Dynarmic. There is no emulated Android and no
+virtual disk: the game talks to the real framework, the real GPU driver and the
+real filesystem.
 
-```
-/sdcard/armbat/
-  logs/                            runtime and guest log files
-  <package>-<version>.apk          imported archives
-  silence/<package>                entries for Bypass checks
-  android/data/<package>/
-    files/                         Context.getFilesDir()
-    cache/                         Context.getCacheDir()
-    databases/                     SQLite databases
-    shared_prefs/                  SharedPreferences
-    external/files/                Context.getExternalFilesDir()
-    external/cache/                Context.getExternalCacheDir()
-  android/obb/<package>/           expansion files, main.*.obb and patch.*.obb
-```
+- **One flat 4 GiB arena.** A guest address is a 32-bit offset into it, so
+  fastmem works without translating pointers.
+- **Real bionic userland.** The guest is not run against a re-implementation of
+  libc: `runtime/sysroot` carries the linker, libc, libm, libdl and libstdc++
+  from an official `armeabi-v7a` system image, and the container boots them.
+- **Syscalls** go through `SVC #0`, Linux ARM EABI, dispatch by `r7`.
+- **HLE only where the platform cannot be reused:** JNI, `AAssetManager`, EGL and
+  GLES (forwarded to the host driver), `liblog`, `ANativeWindow`, OpenSLES.
+  Guest libraries importing them get trampolines that trap into the container by
+  symbol name.
+- **Input** is a `MotionEvent` pass-through: the decor view is scaled to the
+  guest surface, and the framework translates window to guest pixels per pointer,
+  keeping id, action index, pressure and time.
+- **ELF32 loader** handles segments, `DT_NEEDED`, `dlopen`/`dlsym`, ARM
+  relocations (`R_ARM_RELATIVE`, `ABS32`, `GLOB_DAT`, `JUMP_SLOT`, `PREL31`) and
+  `DT_INIT_ARRAY`.
 
-An imported archive is stored as `<packageName>-<versionName>.apk`, for example
-`com.mojang.minecraftpe-1.2.0.81.apk`. Importing another version of the same
-package deletes the previous file, so the library keeps one copy per package. An
-APK copied into the folder by hand is picked up as well.
-
-Data can be put in place before the first launch: these directories are created
-when the archive is imported, and again whenever the guest asks for one. An obb
-only has to be copied into `android/obb/<package>/`, a save into `files/` or
-`external/files/`.
-
-Without "all files access" the folder cannot be read and the library stays empty
-until the grant is given.
+A guest that dies leaves a fault report with module-relative offsets, so a crash
+can be read without a second run: see [docs/debugging.md](docs/debugging.md).
 
 ## Bypass checks
 
@@ -128,6 +178,15 @@ An archive that ships a protection SDK can be told to leave it alone, per app.
 The switch is the last row of the app card (long-press the icon); the file
 format, the shipped defaults and the limits are described in
 [guides/silence.md](guides/silence.md).
+
+## Known limitations
+
+- Only `armeabi-v7a` archives run. `arm64-v8a` games do not need Armbat and are
+  not translated.
+- There are no Google services. A game that needs a Play account, a license check
+  or an online login will not get far; offline archives are the ones that work.
+- Some launchers and engines still fail. Each one is investigated from a log
+  rather than worked around per package.
 
 ## Build requirements
 
@@ -165,7 +224,6 @@ cmake --build --preset arm64
 The binaries land in `build/arm64/tests/`. The suites and their fixtures (guest
 libraries, test APKs, libc++) are not part of the APK build. To get the in-app
 `Native.runSelfTest` entry point, configure with `-DARMBAT_SELFTEST_IN_APK=ON`.
-
 
 ## Repository layout
 
@@ -211,6 +269,15 @@ file. All of it is AOSP bionic under Apache-2.0; see `NOTICE`.
 Building these libraries from AOSP sources for `armeabi-v7a` API 24 is the
 planned next step. Until then the pinned official image is the source of truth,
 and no binary in this repository comes from anywhere else.
+
+## Community
+
+- Website: [armbat-web.vercel.app](https://armbat-web.vercel.app/)
+- Discord: [discord.gg/dSpQ7XamWT](https://discord.gg/dSpQ7XamWT)
+- Bugs and game reports: [issues](https://github.com/dima-xd/armbat/issues)
+
+When a game fails, attach the log from `/sdcard/armbat/logs/`. It already contains
+module-relative offsets, so it can be read without the exact APK.
 
 ## License
 

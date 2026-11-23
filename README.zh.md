@@ -1,45 +1,58 @@
-[English](README.md) · [中文](README.zh.md)
+[English](README.md) · 中文 · [网站](https://armbat-web.vercel.app/) · [Discord](https://discord.gg/dSpQ7XamWT)
 
-[![Discord](https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?logo=discord&logoColor=white)](https://discord.gg/dSpQ7XamWT)
+[![最新版本](https://img.shields.io/github/v/release/dima-xd/armbat?sort=semver&label=release)](https://github.com/dima-xd/armbat/releases/latest)
+[![下载量](https://img.shields.io/github/downloads/dima-xd/armbat/total?label=downloads)](https://github.com/dima-xd/armbat/releases)
+[![许可证](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![Android](https://img.shields.io/badge/Android-12%2B%20%C2%B7%20arm64--v8a-3DDC84?logo=android&logoColor=white)](#设备要求)
+[![Stars](https://img.shields.io/github/stars/dima-xd/armbat?label=stars)](https://github.com/dima-xd/armbat/stargazers)
 
 # Armbat
 
-Armbat 是一个容器，用于在没有 32 位 ABI 的 64 位设备上运行 32 位 ARM Android
-应用。访客 Java 代码由平台自带的 ART 执行；访客机器码由基于 Dynarmic 的 JIT 从 A32
-翻译为 ARM64。无需 root。
+Armbat 让 32 位 ARMv7 的 Android 游戏运行在已经不支持它们的手机上。导入 APK，点一下，
+开玩。不需要 root，不需要重新打包，也不需要装第二个 Android。
 
-表面上看，它只是一个小型应用库：导入 APK、启动、删除。真正的工作在底层：一个 C++20
-运行时，自带 ELF 加载器、系统调用层和平台桩。
+最近几年出厂的很多手机彻底取消了 32 位 ABI：`armeabi-v7a` 的 APK 根本装不上，Play 会
+直接说游戏与设备不兼容。Armbat 给这些归档一个运行的地方。经过它的游戏仍然只是文件夹里
+的一个文件，用任何文件管理器都能打开，不会被修改，也不会被安装。
 
-## 工作原理
+## 下载
 
-- **一块扁平的 4 GiB 地址空间。** 访客地址就是其中的 32 位偏移，因此 fastmem 无需转换
-  指针即可工作。
-- **真正的 bionic 用户态。** 访客不是跑在 libc 的重实现上：`runtime/sysroot` 带有官方
-  `armeabi-v7a` 系统镜像中的 linker、libc、libm、libdl 和 libstdc++，由容器负责启动
-  它们。
-- **系统调用** 走 `SVC #0`，Linux ARM EABI，按 `r7` 分发。
-- **只在平台无法复用时使用 HLE：** JNI、`AAssetManager`、EGL 与 GLES（转发给宿主
-  驱动）、`liblog`、`ANativeWindow`、OpenSLES。导入这些符号的访客库会得到跳板，按
-  符号名陷入容器。
-- **输入** 是 `MotionEvent` 直通：decor 视图缩放到访客表面，框架逐指将窗口坐标换算为
-  访客像素，保留 id、action index、压力和时间。
-- **ELF32 加载器** 处理段、`DT_NEEDED`、`dlopen`/`dlsym`、ARM 重定位
-  （`R_ARM_RELATIVE`、`ABS32`、`GLOB_DAT`、`JUMP_SLOT`、`PREL31`）和
-  `DT_INIT_ARRAY`。
+| 构建 | 位置 |
+|---|---|
+| 稳定版 | [releases/latest](https://github.com/dima-xd/armbat/releases/latest) |
+| 每日构建 | [releases/tag/nightly](https://github.com/dima-xd/armbat/releases/tag/nightly) |
+| 所有构建与更新日志 | [armbat-web.vercel.app](https://armbat-web.vercel.app/builds) |
 
-唯一真正的验收测试是 Minecraft 1.2.0.81（`com.mojang.minecraftpe`）：菜单、创建并加载
-世界、渲染、可玩的帧率、多点触控。`tests/` 下的合成测试只是开发辅助，不是证明。
+应用内也可以在设置里切换这两个通道。
+
+## 功能
+
+- 运行未修改的 `armeabi-v7a` 归档。64 位包不会被翻译。
+- 游戏保持自己的分辨率，屏幕旋转正常工作。
+- 触摸以平台投递的原样到达访客：指针 id、action index、压力和时间都保留，因此游戏里的
+  多点触控和仍有 32 位支持的设备上表现一致。
+- 运动传感器可用。
+- 音频经 OpenSLES 输出。
+- 存档、设置和扩展文件都在 `/sdcard/armbat/` 下，可以在首次启动前放入存档，也可以随时
+  备份出来。
+- 带保护 SDK、拒绝自身运行环境的游戏，可以按应用关掉这套检查
+  （[guides/silence.md](guides/silence.md)）。
 
 ## 截图
 
-|                     N.O.V.A. 3                     |                      The Sims 3                      |
-|:--------------------------------------------------:|:----------------------------------------------------:|
-| ![N.O.V.A. 3](screenshots/nova3.jpg)               | ![The Sims 3](screenshots/sims3.jpg)                 |
+下面这些都运行在完全没有 32 位 ABI 的手机上。
 
-|                     Subway Surfers                     |                     Minecraft                      |
-|:------------------------------------------------------:|:--------------------------------------------------:|
-| ![Subway Surfers](screenshots/subway.jpg)              | ![Minecraft](screenshots/minecraft.jpg)            |
+| N.O.V.A. 3 | Subway Surfers | The Sims 3 |
+|:---:|:---:|:---:|
+| ![N.O.V.A. 3](screenshots/nova3.jpg) | ![Subway Surfers](screenshots/subway.jpg) | ![The Sims 3](screenshots/sims3.jpg) |
+
+## 兼容性
+
+游戏是在真机上逐个验证的，报告收集在网站上：
+[armbat-web.vercel.app/compatibility](https://armbat-web.vercel.app/compatibility)。
+如果你跑通了列表里没有的游戏，可以用
+[游戏兼容性模板](https://github.com/dima-xd/armbat/issues/new?template=game_compatibility.yml)
+提交报告。失败游戏的日志和成功游戏的一样有用。
 
 ## 设备要求
 
@@ -48,6 +61,46 @@ Armbat 是一个容器，用于在没有 32 位 ABI 的 64 位设备上运行 32
 - GPU 驱动需支持 EGL 和 GLES 2.0 或更高；渲染会转发给宿主驱动。
 - 需要授予应用“所有文件访问权限”：应用库、游戏数据及其扩展文件都位于共享存储中。
 - 目前只支持 32 位 ARMv7（`armeabi-v7a`）归档。
+
+## 安装
+
+1. 从 [releases](https://github.com/dima-xd/armbat/releases/latest) 下载 APK 并安装，
+   允许来自该来源的安装。
+2. 应用请求时授予“所有文件访问权限”。没有这个授权，应用库会一直是空的。
+3. 把游戏 APK 放进 `/sdcard/armbat/`，或者在应用里用导入功能。
+4. 在应用库里点击游戏。
+
+归档可以直接从导入它的卡片上删除。删除只移除 `/sdcard/armbat/` 里的 APK，不会动存档。
+
+## 文件位置
+
+容器把所有内容放在共享存储的一个文件夹下：用户存储根目录中的 `armbat`，在大多数设备上
+是 `/sdcard/armbat`。私有应用目录不行，因为导入的 APK、存档和扩展文件必须能从文件管理
+器访问。访客看到的自己的 `/sdcard` 就是同一个文件夹。
+
+```
+/sdcard/armbat/
+  logs/                            运行时和访客日志文件
+  <package>-<version>.apk          导入的归档
+  silence/<package>                Bypass checks 的条目
+  android/data/<package>/
+    files/                         Context.getFilesDir()
+    cache/                         Context.getCacheDir()
+    databases/                     SQLite 数据库
+    shared_prefs/                  SharedPreferences
+    external/files/                Context.getExternalFilesDir()
+    external/cache/                Context.getExternalCacheDir()
+  android/obb/<package>/           扩展文件，main.*.obb 和 patch.*.obb
+```
+
+导入的归档保存为 `<packageName>-<versionName>.apk`，例如
+`com.example.game-1.2.3.apk`。导入同一包名的另一个版本会删除之前的文件，因此应用库每个
+包只保留一份。手动复制到该文件夹的 APK 也会被识别。
+
+可以在首次启动前把数据放好：这些目录会在导入归档时创建，并在访客每次请求时再次创建。
+obb 只需复制到 `android/obb/<package>/`，存档复制到 `files/` 或 `external/files/`。
+
+没有“所有文件访问权限”，就无法读取该文件夹，应用库会一直为空，直到获得授权。
 
 ## 权限
 
@@ -70,34 +123,41 @@ Armbat 是一个容器，用于在没有 32 位 ABI 的 64 位设备上运行 32
 权限，因为应用库、游戏数据及扩展文件都在共享存储上，所以访客会从该授权得到答案，而这两
 个旧权限名根本不会被请求。
 
-## 文件位置
+## 工作原理
 
-容器把所有内容放在共享存储的一个文件夹下：用户存储根目录中的 `armbat`，在大多数设备上
-是 `/sdcard/armbat`。私有应用目录不行，因为导入的 APK、存档和扩展文件必须能从文件管理
-器访问。访客看到的自己的 `/sdcard` 就是同一个文件夹。
+访客的 Java 代码由平台自带的 ART 执行，访客机器码由基于 Dynarmic 的 JIT 从 A32 翻译为
+ARM64。没有模拟的 Android，也没有虚拟磁盘：游戏面对的是真实的框架、真实的 GPU 驱动和
+真实的文件系统。
 
-```
-/sdcard/armbat/
-  logs/                            运行时和访客日志文件
-  <package>-<version>.apk          导入的归档
-  android/data/<package>/
-    files/                         Context.getFilesDir()
-    cache/                         Context.getCacheDir()
-    databases/                     SQLite 数据库
-    shared_prefs/                  SharedPreferences
-    external/files/                Context.getExternalFilesDir()
-    external/cache/                Context.getExternalCacheDir()
-  android/obb/<package>/           扩展文件，main.*.obb 和 patch.*.obb
-```
+- **一块扁平的 4 GiB 地址空间。** 访客地址就是其中的 32 位偏移，因此 fastmem 无需转换
+  指针即可工作。
+- **真正的 bionic 用户态。** 访客不是跑在 libc 的重实现上：`runtime/sysroot` 带有官方
+  `armeabi-v7a` 系统镜像中的 linker、libc、libm、libdl 和 libstdc++，由容器负责启动
+  它们。
+- **系统调用** 走 `SVC #0`，Linux ARM EABI，按 `r7` 分发。
+- **只在平台无法复用时使用 HLE：** JNI、`AAssetManager`、EGL 与 GLES（转发给宿主
+  驱动）、`liblog`、`ANativeWindow`、OpenSLES。导入这些符号的访客库会得到跳板，按
+  符号名陷入容器。
+- **输入** 是 `MotionEvent` 直通：decor 视图缩放到访客表面，框架逐指将窗口坐标换算为
+  访客像素，保留 id、action index、压力和时间。
+- **ELF32 加载器** 处理段、`DT_NEEDED`、`dlopen`/`dlsym`、ARM 重定位
+  （`R_ARM_RELATIVE`、`ABS32`、`GLOB_DAT`、`JUMP_SLOT`、`PREL31`）和
+  `DT_INIT_ARRAY`。
 
-导入的归档保存为 `<packageName>-<versionName>.apk`，例如
-`com.mojang.minecraftpe-1.2.0.81.apk`。导入同一包名的另一个版本会删除之前的文件，因此
-应用库每个包只保留一份。手动复制到该文件夹的 APK 也会被识别。
+访客崩溃时会留下带模块相对偏移的故障报告，不用重跑也能读懂：
+见 [docs/debugging.md](docs/debugging.md)。
 
-可以在首次启动前把数据放好：这些目录会在导入归档时创建，并在访客每次请求时再次创建。
-obb 只需复制到 `android/obb/<package>/`，存档复制到 `files/` 或 `external/files/`。
+## Bypass checks
 
-没有“所有文件访问权限”，就无法读取该文件夹，应用库会一直为空，直到获得授权。
+带保护 SDK 的归档可以按应用让它跳过检查。开关在应用卡片的最后一行（长按图标）；文件
+格式、内置默认值和限制见 [guides/silence.md](guides/silence.md)。
+
+## 已知限制
+
+- 只运行 `armeabi-v7a` 归档。`arm64-v8a` 的游戏本来就不需要 Armbat，也不会被翻译。
+- 没有 Google 服务。需要 Play 账号、许可校验或在线登录的游戏走不远；能离线运行的归档才
+  是能跑起来的那些。
+- 仍有部分启动器和引擎会失败。每一个都是从日志里查原因，而不是按包名做特殊处理。
 
 ## 构建要求
 
@@ -134,7 +194,6 @@ cmake --build --preset arm64
 生成的二进制位于 `build/arm64/tests/`。这些套件及其夹具（访客库、测试 APK、libc++）
 不属于 APK 构建。要获得应用内的 `Native.runSelfTest` 入口，请使用
 `-DARMBAT_SELFTEST_IN_APK=ON` 配置。
-
 
 ## 仓库结构
 
@@ -177,6 +236,15 @@ AOSP bionic；参见 `NOTICE`。
 
 从 AOSP 源码为 `armeabi-v7a` API 24 构建这些库是计划中的下一步。在此之前，固定的官方
 镜像是唯一事实来源，本仓库中没有任何二进制来自别处。
+
+## 社区
+
+- 网站：[armbat-web.vercel.app](https://armbat-web.vercel.app/)
+- Discord：[discord.gg/dSpQ7XamWT](https://discord.gg/dSpQ7XamWT)
+- 缺陷与游戏报告：[issues](https://github.com/dima-xd/armbat/issues)
+
+游戏失败时请附上 `/sdcard/armbat/logs/` 里的日志。日志里已经是模块相对偏移，不需要
+原始 APK 也能读。
 
 ## 许可证
 
