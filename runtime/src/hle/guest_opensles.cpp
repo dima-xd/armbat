@@ -264,12 +264,12 @@ std::unordered_map<std::uint32_t, std::shared_ptr<Block>> g_blocks;
 std::unordered_map<std::string, std::uint32_t> g_vtables;
 std::uint64_t g_generation = 0;
 
-// ---- callback thread -----------------------------------------------------
+// ---- callbacks -----------------------------------------------------------
 //
-// The platform delivers buffer-queue, play and record callbacks on threads of
-// its own; entering the JIT from one of them would put guest code on the audio
-// mixer's deadline. One container thread therefore runs them, in the order the
-// platform produced them, which is the order the guest's mixer expects.
+// The platform delivers play and record callbacks on threads of its own; one
+// container thread runs those, in the order the platform produced them, which is
+// the order the guest's mixer expects. The buffer queue is the exception and
+// runs on the platform's thread -- see RunCallbackHere.
 struct CallbackRequest {
     std::uint32_t callback = 0;
     std::uint32_t itf = 0;
@@ -282,9 +282,59 @@ struct CallbackRequest {
 GuestCallRunner g_guest_call;
 std::mutex g_callback_mutex;
 std::condition_variable g_callback_ready;
+std::condition_variable g_callback_idle;
 std::deque<CallbackRequest> g_callback_queue;
 std::thread g_callback_thread;
 bool g_callback_stopping = false;
+unsigned g_callbacks_running = 0;
+
+// Whether the guest may still be entered with the block a request names.
+bool CallbackStillCurrent(const CallbackRequest& request) {
+    const std::lock_guard lock(g_mutex);
+    const auto block = g_blocks.find(request.itf);
+    return block != g_blocks.end() && block->second->generation == request.generation;
+}
+
+// Runs one callback on the thread the platform called it from.
+//
+// The buffer queue is the one callback that must not be moved off that thread:
+// the platform calls it from its audio thread and, before returning to its own
+// work, decides whether the head has reached the end of the stream. A refill
+// that arrives from another thread is too late, the queue is still empty, and
+// the platform raises SL_PLAYEVENT_HEADATEND at every buffer boundary. Measured
+// here with the same player twice: refilling inside the callback gave 0
+// head-at-end events in 3 s, refilling 3 ms later from another thread gave 23.
+// A guest that keeps one buffer in flight -- this one does -- is then told after
+// its first buffer that the sound ended, and stops it: every dialogue and sound
+// effect was cut after two buffers, while the looping ambiences, which ignore
+// the event, played on.
+bool RunCallbackHere(const CallbackRequest& request) {
+    GuestCallRunner runner;
+    {
+        const std::lock_guard lock(g_callback_mutex);
+        if (g_callback_stopping || !g_guest_call) {
+            return false;
+        }
+        runner = g_guest_call;
+        ++g_callbacks_running;
+    }
+    if (!CallbackStillCurrent(request)) {
+        const std::lock_guard lock(g_callback_mutex);
+        --g_callbacks_running;
+        return false;
+    }
+    if (request.has_event) {
+        runner(request.callback, {request.itf, request.context, request.event});
+    } else {
+        runner(request.callback, {request.itf, request.context});
+    }
+    {
+        const std::lock_guard lock(g_callback_mutex);
+        --g_callbacks_running;
+    }
+    g_callback_idle.notify_all();
+    return true;
+}
 
 void CallbackLoop() {
     for (;;) {
@@ -304,14 +354,7 @@ void CallbackLoop() {
         // The object may have been destroyed between the platform raising the
         // event and this thread delivering it. The generation tells a block from
         // a later one that happens to reuse the address.
-        bool current = false;
-        {
-            const std::lock_guard lock(g_mutex);
-            const auto block = g_blocks.find(request.itf);
-            current =
-                block != g_blocks.end() && block->second->generation == request.generation;
-        }
-        if (!current || !runner) {
+        if (!CallbackStillCurrent(request) || !runner) {
             continue;
         }
         if (request.has_event) {
@@ -601,7 +644,7 @@ void QueueCallback(SLAndroidSimpleBufferQueueItf queue, void* context) {
     (void)queue;
     CallbackRequest request;
     if (ClaimCallback(ContextBlock(context), &request)) {
-        PostCallback(request);
+        RunCallbackHere(request);
     }
 }
 
@@ -1642,7 +1685,7 @@ void QueueRegisterCallback(HleCall& call) {
                 (void)caller;
                 CallbackRequest request;
                 if (ClaimCallback(ContextBlock(context), &request)) {
-                    PostCallback(request);
+                    RunCallbackHere(request);
                 }
             },
             BlockContext(self)));
@@ -1928,8 +1971,14 @@ void SlCreateEngine(HleCall& call) {
 }  // namespace
 
 void SetGuestCallRunner(GuestCallRunner runner) {
-    const std::lock_guard lock(g_callback_mutex);
+    std::unique_lock lock(g_callback_mutex);
+    const bool closing = !runner;
     g_guest_call = std::move(runner);
+    if (closing) {
+        // A queue callback may be inside guest code on a platform thread right
+        // now; the arena it runs on is about to go away.
+        g_callback_idle.wait(lock, [] { return g_callbacks_running == 0; });
+    }
 }
 
 void StopGuestCallThread() {
