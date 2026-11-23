@@ -358,6 +358,8 @@ class MainActivity : ComponentActivity() {
         var localeTag by remember { mutableStateOf(AppLocale.current(context)) }
         var logLevel by remember { mutableStateOf(ArmbatLog.level()) }
         var widescreen by remember { mutableStateOf(GuestScreen.widescreen(context)) }
+        var resolution by remember { mutableStateOf(GuestScreen.resolution(context, null)) }
+        var screenRate by remember { mutableStateOf(GuestScreen.refreshRate(context, null)) }
         var channel by remember { mutableStateOf(Updates.channel(context)) }
         var updateStatus by remember { mutableStateOf<Updates.Status>(Updates.Status.Idle) }
         var updateOffer by remember { mutableStateOf<Updates.Update?>(null) }
@@ -698,6 +700,8 @@ class MainActivity : ComponentActivity() {
                             localeTag = localeTag,
                             logLevel = logLevel,
                             widescreen = widescreen,
+                            resolution = resolution,
+                            refreshRate = screenRate,
                             channel = channel,
                             version = version,
                             updateStatus = updateStatus,
@@ -712,6 +716,14 @@ class MainActivity : ComponentActivity() {
                             onWidescreen = { on ->
                                 widescreen = on
                                 GuestScreen.setWidescreen(this@MainActivity, on)
+                            },
+                            onResolution = { picked ->
+                                resolution = picked
+                                GuestScreen.setResolution(this@MainActivity, null, picked)
+                            },
+                            onRefreshRate = { hz ->
+                                screenRate = hz
+                                GuestScreen.setRefreshRate(this@MainActivity, null, hz)
                             },
                             onChannel = { picked ->
                                 channel = picked

@@ -18,6 +18,7 @@ import android.content.res.Resources
 import android.graphics.SurfaceTexture
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
+import android.hardware.display.VirtualDisplayConfig
 import android.os.Build
 import android.os.IBinder
 import android.os.Looper
@@ -55,7 +56,8 @@ import kotlin.math.min
  * container has to set anyway.
  *
  * The guest sees a virtual display sized after the application's own era (see
- * [virtualSize]), not the physical one. Old games read the display size to lay
+ * [virtualSize]) unless a size was chosen in Settings, not the physical one.
+ * Old games read the display size to lay
  * out their interface and then compare raw touch coordinates against it, so both
  * have to agree, and the physical screen of a current phone is far too tall for
  * them. The guest's picture is scaled to fit and the leftover space is left
@@ -907,6 +909,8 @@ class GuestLauncher(private val host: Activity) {
         val virtualWidth: Int,
         val virtualHeight: Int,
         val densityDpi: Int,
+        val resolution: GuestScreen.Resolution,
+        val refreshRate: Float,
     )
 
     private fun prepare(apkPath: String): Prepared {
@@ -958,10 +962,15 @@ class GuestLauncher(private val host: Activity) {
         // The screen the guest is going to draw on is fixed here, before its
         // resources exist: an archive layouts its interface from the screen the
         // resources describe, and those have to be the pixels of the surface it
-        // renders into, not the panel's.
+        // renders into, not the panel's. A size or a rate the user picked is
+        // read here for the same reason: the guest's resources and its display
+        // are built once, so a change made while it runs belongs to the next
+        // launch.
         val landscape = wantsLandscape(activity.screenOrientation)
-        val (virtualWidth, virtualHeight) = virtualSize(targetSdk, landscape)
-        val densityDpi = virtualDensity(minOf(virtualWidth, virtualHeight))
+        val resolution = GuestScreen.resolution(host, archivePackage)
+        val (virtualWidth, virtualHeight) = virtualSize(resolution, targetSdk, landscape)
+        val densityDpi = virtualDensity(resolution, minOf(virtualWidth, virtualHeight))
+        val refreshRate = guestRefreshRate(GuestScreen.refreshRate(host, archivePackage))
         val screen = ApkResources.Screen(virtualWidth, virtualHeight, densityDpi)
         stage(LaunchStage.RESOURCES)
         val resources = ApkResources.of(host, apkPath, screen) ?: host.resources
@@ -984,6 +993,8 @@ class GuestLauncher(private val host: Activity) {
             virtualWidth = virtualWidth,
             virtualHeight = virtualHeight,
             densityDpi = densityDpi,
+            resolution = resolution,
+            refreshRate = refreshRate,
         )
     }
 
@@ -1084,18 +1095,23 @@ class GuestLauncher(private val host: Activity) {
         }
         // The window belongs to a current application, so a 120 Hz phone gives
         // it 120 frames a second, and a guest that steps its world once per
-        // frame runs at double speed. Ask the display for the rate the guest
-        // was written for; a zero rate means "no preference".
+        // frame runs at double speed. Ask the display for the rate the guest is
+        // meant to see: the era's sixty unless the user chose another one.
         val panel = host.window.attributes
-        panel.preferredRefreshRate = GUEST_FRAME_RATE
+        panel.preferredRefreshRate = prepared.refreshRate
         host.window.attributes = panel
         val (virtualWidth, virtualHeight) = prepared.virtualWidth to prepared.virtualHeight
         ArmbatLog.i(
             TAG,
             "guest screen ${virtualWidth}x$virtualHeight at ${prepared.densityDpi}dpi " +
-                "for targetSdk $targetSdk",
+                "for targetSdk $targetSdk, ${prepared.resolution} ${prepared.refreshRate}Hz",
         )
-        val screen = createVirtualDisplay(virtualWidth, virtualHeight, prepared.densityDpi)
+        val screen = createVirtualDisplay(
+            virtualWidth,
+            virtualHeight,
+            prepared.densityDpi,
+            prepared.refreshRate,
+        )
         val context = GuestContext(
             host,
             prepared.resources,
@@ -1948,9 +1964,10 @@ class GuestLauncher(private val host: Activity) {
         if (landscape == session.virtualWidth > session.virtualHeight) {
             return
         }
-        val (width, height) = virtualSize(session.prepared.targetSdk, landscape)
+        val resolution = session.prepared.resolution
+        val (width, height) = virtualSize(resolution, session.prepared.targetSdk, landscape)
         ArmbatLog.i(TAG, "guest screen rotated: ${width}x$height")
-        val densityDpi = session.prepared.densityDpi
+        val densityDpi = virtualDensity(resolution, minOf(width, height))
         val metrics = android.util.DisplayMetrics()
         metrics.setTo(session.prepared.resources.displayMetrics)
         metrics.widthPixels = width
@@ -2082,34 +2099,48 @@ class GuestLauncher(private val host: Activity) {
     }
 
     /**
-     * The screen the application was written for.
+     * The screen the application was written for, or the one the user picked.
      *
      * Games of the Android 2.x/4.x era were laid out for a 480x800 "normal"
      * phone or a 720p panel, and draw their interface in display pixels; later
      * ones expect a modern 1080p screen. The guest is given that size and the
-     * picture is then scaled to the real display.
+     * picture is then scaled to the real display. A fixed size in Settings
+     * replaces the era's, and the panel's own pixels replace both (see
+     * GuestScreen.Resolution).
      *
      * In widescreen the short side keeps that size and the long one follows the
      * panel: these games scale their width and their height independently and
      * only lay out along the short side, so on a 19.5:9 phone the same
      * interface simply has more room, and the picture fills the display the way
-     * it does when the application is installed on the device.
+     * it does when the application is installed on the device. The panel's own
+     * size needs neither: it already has the panel's aspect.
      */
-    private fun virtualSize(targetSdk: Int, landscape: Boolean): Pair<Int, Int> {
-        val (width, height) = when {
-            targetSdk <= android.os.Build.VERSION_CODES.KITKAT -> 480 to 800
-            targetSdk <= android.os.Build.VERSION_CODES.LOLLIPOP_MR1 -> 720 to 1280
-            else -> 1080 to 1920
+    private fun virtualSize(
+        resolution: GuestScreen.Resolution,
+        targetSdk: Int,
+        landscape: Boolean,
+    ): Pair<Int, Int> {
+        if (resolution == GuestScreen.Resolution.NATIVE) {
+            val (short, long) = GuestScreen.panelSize(host)
+            return if (landscape) long to short else short to long
+        }
+        val (short, long) = when (resolution) {
+            GuestScreen.Resolution.P720 -> 720 to 1280
+            GuestScreen.Resolution.P1080 -> 1080 to 1920
+            else -> when {
+                targetSdk <= Build.VERSION_CODES.KITKAT -> 480 to 800
+                targetSdk <= Build.VERSION_CODES.LOLLIPOP_MR1 -> 720 to 1280
+                else -> 1080 to 1920
+            }
         }
         if (!GuestScreen.widescreen(host)) {
-            return if (landscape) height to width else width to height
+            return if (landscape) long to short else short to long
         }
         val panel = host.resources.displayMetrics
         val ratio = maxOf(panel.widthPixels, panel.heightPixels).toFloat() /
             minOf(panel.widthPixels, panel.heightPixels)
-        val short = minOf(width, height)
-        val long = (short * ratio).toInt()
-        return if (landscape) long to short else short to long
+        val wide = (short * ratio).toInt()
+        return if (landscape) wide to short else short to wide
     }
 
     /**
@@ -2120,8 +2151,15 @@ class GuestLauncher(private val host: Activity) {
      * phone: 720p at xhdpi is the phone this era was written for, and the panel's
      * density on a 720p screen would draw every menu and dialog three times its
      * intended size. The bucket is the one nearest to that reference.
+     *
+     * A screen that is the panel itself answers with the panel's own density:
+     * the guest then lays its interface out in the dp a real application gets on
+     * this phone, which is the point of asking for the panel's pixels.
      */
-    private fun virtualDensity(shortSide: Int): Int {
+    private fun virtualDensity(resolution: GuestScreen.Resolution, shortSide: Int): Int {
+        if (resolution == GuestScreen.Resolution.NATIVE) {
+            return host.resources.displayMetrics.densityDpi
+        }
         val wanted = shortSide * 320 / 720
         return DENSITY_BUCKETS.minByOrNull { kotlin.math.abs(it - wanted) } ?: 320
     }
@@ -2163,19 +2201,57 @@ class GuestLauncher(private val host: Activity) {
     }.getOrNull()
         ?: (host.resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE)
 
-    private fun createVirtualDisplay(width: Int, height: Int, densityDpi: Int): VirtualScreen {
+    /**
+     * The rate asked of the window and of the guest's display.
+     *
+     * [GuestScreen.AUTO_RATE] means the rate the guest was written for, and that
+     * is the era's sixty (see GUEST_FRAME_RATE); a chosen rate is passed through
+     * as the preference it is, and the platform may still settle on another
+     * mode when the panel is busy or the request is unsupported.
+     */
+    private fun guestRefreshRate(hz: Int): Float =
+        if (hz <= GuestScreen.AUTO_RATE) GUEST_FRAME_RATE else hz.toFloat()
+
+    private fun createVirtualDisplay(
+        width: Int,
+        height: Int,
+        densityDpi: Int,
+        refreshRate: Float,
+    ): VirtualScreen {
         val manager = host.getSystemService(DisplayManager::class.java)
         val texture = SurfaceTexture(0)
         texture.setDefaultBufferSize(width, height)
         val surface = Surface(texture)
-        val display = manager.createVirtualDisplay(
-            "armbat-guest",
-            width,
-            height,
-            densityDpi,
-            surface,
-            0,
-        )
+        // The guest paces itself after the display it draws on -- its
+        // Choreographer, and any engine that asks the display for its rate,
+        // read the virtual display's mode -- so the rate has to belong to that
+        // display and not only to the host window. VirtualDisplayConfig is the
+        // first public API that carries it, and it arrived in Android 14; below
+        // it the display follows the panel and only the window requests a rate.
+        val configurable = Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE
+        val display: VirtualDisplay? = if (configurable) {
+            val config = VirtualDisplayConfig.Builder("armbat-guest", width, height, densityDpi)
+                .setSurface(surface)
+                .setRequestedRefreshRate(refreshRate)
+                .build()
+            manager.createVirtualDisplay(config)
+        } else {
+            manager.createVirtualDisplay(
+                "armbat-guest",
+                width,
+                height,
+                densityDpi,
+                surface,
+                0,
+            )
+        }
+        if (display == null) {
+            // Nothing will consume these; releasing them here keeps a refused
+            // launch from leaving a large buffer behind in a live process.
+            surface.release()
+            texture.release()
+            error("the platform refused the guest's virtual display")
+        }
         return VirtualScreen(display, surface, texture)
     }
 

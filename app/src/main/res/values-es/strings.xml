@@ -70,6 +70,13 @@
     <string name="widescreen_on">Activado: ocupa toda la pantalla</string>
     <string name="widescreen_off">Desactivado: mantiene la pantalla original</string>
 
+    <string name="screen_size">Tamaño de pantalla</string>
+    <string name="refresh_rate">Frecuencia de actualización</string>
+    <string name="resolution_auto">Automático: la pantalla de la app</string>
+    <string name="resolution_native">Nativa: %1$d × %2$d</string>
+    <string name="refresh_auto">Automática: la tasa de la app (60 Hz)</string>
+    <string name="display_inherit">Global: %1$s</string>
+
     <string name="updates">Actualizaciones</string>
     <string name="update_channel">Canal de actualizaciones</string>
     <string name="update_channel_release">Versión estable</string>

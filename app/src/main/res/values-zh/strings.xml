@@ -71,6 +71,13 @@
     <string name="widescreen_on">开 — 占满整个屏幕</string>
     <string name="widescreen_off">关 — 保持应用原本的屏幕比例</string>
 
+    <string name="screen_size">屏幕分辨率</string>
+    <string name="refresh_rate">刷新率</string>
+    <string name="resolution_auto">自动 — 应用原本的屏幕</string>
+    <string name="resolution_native">原生 — %1$d × %2$d</string>
+    <string name="refresh_auto">自动 — 应用原本的帧率 (60 Hz)</string>
+    <string name="display_inherit">全局 — %1$s</string>
+
     <string name="updates">更新</string>
     <string name="update_channel">更新通道</string>
     <string name="update_channel_release">正式版</string>

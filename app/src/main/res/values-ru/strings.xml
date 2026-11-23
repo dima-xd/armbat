@@ -72,6 +72,13 @@
     <string name="widescreen_on">Вкл. — на весь экран</string>
     <string name="widescreen_off">Выкл. — экран, под который сделано приложение</string>
 
+    <string name="screen_size">Размер экрана</string>
+    <string name="refresh_rate">Частота обновления</string>
+    <string name="resolution_auto">Авто — экран приложения</string>
+    <string name="resolution_native">Собственный — %1$d × %2$d</string>
+    <string name="refresh_auto">Авто — частота приложения (60 Гц)</string>
+    <string name="display_inherit">Общая — %1$s</string>
+
     <string name="updates">Обновления</string>
     <string name="update_channel">Канал обновлений</string>
     <string name="update_channel_release">Релиз</string>

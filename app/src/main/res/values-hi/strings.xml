@@ -69,6 +69,13 @@
     <string name="widescreen_on">चालू — पूरी स्क्रीन भरता है</string>
     <string name="widescreen_off">बंद — ऐप की मूल स्क्रीन रहती है</string>
 
+    <string name="screen_size">स्क्रीन का आकार</string>
+    <string name="refresh_rate">रिफ़्रेश दर</string>
+    <string name="resolution_auto">स्वतः — ऐप की अपनी स्क्रीन</string>
+    <string name="resolution_native">मूल — %1$d × %2$d</string>
+    <string name="refresh_auto">स्वतः — ऐप की दर (60 Hz)</string>
+    <string name="display_inherit">वैश्विक — %1$s</string>
+
     <string name="updates">अपडेट</string>
     <string name="update_channel">अपडेट चैनल</string>
     <string name="update_channel_release">रिलीज़</string>

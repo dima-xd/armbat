@@ -72,6 +72,13 @@
     <string name="widescreen_on">On — fills the whole screen</string>
     <string name="widescreen_off">Off — keeps the screen the app was made for</string>
 
+    <string name="screen_size">Screen size</string>
+    <string name="refresh_rate">Refresh rate</string>
+    <string name="resolution_auto">Auto — the app\'s own screen</string>
+    <string name="resolution_native">Native — %1$d × %2$d</string>
+    <string name="refresh_auto">Auto — the app\'s rate (60 Hz)</string>
+    <string name="display_inherit">Global — %1$s</string>
+
     <string name="updates">Updates</string>
     <string name="update_channel">Update channel</string>
     <string name="update_channel_release">Release</string>

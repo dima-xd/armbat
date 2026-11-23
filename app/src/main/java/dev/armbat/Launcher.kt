@@ -57,6 +57,7 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.TextStyle
@@ -551,90 +552,154 @@ fun DetailsScreen(
     onSilence: () -> Unit,
     onDelete: () -> Unit,
 ) {
-    Column(Modifier.fillMaxSize().background(HoloBlack)) {
-        Row(
-            Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            AppIcon(app, Modifier.size(56.dp))
-            Spacer(Modifier.width(14.dp))
-            Column(Modifier.weight(1f)) {
-                Text(
-                    app.label,
-                    color = HoloText,
-                    fontSize = 19.sp,
-                    fontWeight = FontWeight.Bold,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                Spacer(Modifier.height(3.dp))
-                Text(
-                    "${app.packageName} · ${app.version}",
-                    color = HoloDim,
-                    fontSize = 11.sp,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
-        }
-        Box(Modifier.fillMaxWidth().height(1.dp).background(HoloBlue.copy(alpha = 0.7f)))
+    val context = LocalContext.current
+    // The package's own screen choices, read once per archive and kept here so
+    // the summary follows a pick without a trip through the shell. Null means
+    // "follow the global setting", and the row then names that setting.
+    var resolution by remember(app.packageName) {
+        mutableStateOf(GuestScreen.resolutionOverride(context, app.packageName))
+    }
+    var refreshRate by remember(app.packageName) {
+        mutableStateOf(GuestScreen.refreshOverride(context, app.packageName))
+    }
+    var resolutionOpen by remember(app.packageName) { mutableStateOf(false) }
+    var refreshRateOpen by remember(app.packageName) { mutableStateOf(false) }
+    val globalResolution = GuestScreen.resolution(context, null)
+    val globalRefreshRate = GuestScreen.refreshRate(context, null)
 
-        Column(
-            Modifier
-                .weight(1f)
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 16.dp, vertical = 12.dp),
-        ) {
-            InfoLine(stringResource(R.string.size), sizeLabel(app.sizeBytes))
-            InfoLine(stringResource(R.string.version), app.version.ifBlank { "" })
-            InfoLine("ARMv7", arm32Label(app))
-            InfoLine("ARM64", arm64Label(app))
-            SectionLabel(stringResource(R.string.libraries))
-            val libraries = app.arm32 + app.arm64
-            if (libraries.isEmpty()) {
-                Text(stringResource(R.string.none), color = HoloDim, fontSize = 13.sp)
-            } else {
-                for (name in libraries) {
-                    Text(name, color = HoloText, fontSize = 12.sp, lineHeight = 18.sp)
+    Box(Modifier.fillMaxSize()) {
+        Column(Modifier.fillMaxSize().background(HoloBlack)) {
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                AppIcon(app, Modifier.size(56.dp))
+                Spacer(Modifier.width(14.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        app.label,
+                        color = HoloText,
+                        fontSize = 19.sp,
+                        fontWeight = FontWeight.Bold,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Spacer(Modifier.height(3.dp))
+                    Text(
+                        "${app.packageName} · ${app.version}",
+                        color = HoloDim,
+                        fontSize = 11.sp,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
                 }
             }
-        }
-        Box(Modifier.fillMaxWidth().height(1.dp).background(HoloRule))
-        // The entries that keep this archive's own protection SDK out of the
-        // way are its data, so they are edited here and not for every app at
-        // once.
-        SettingsRow(
-            title = stringResource(R.string.silence),
-            summary = stringResource(
-                when (Silence.state(app.packageName)) {
-                    Silence.State.DEFAULT -> R.string.silence_state_default
-                    Silence.State.EDITED -> R.string.silence_state_edited
-                    Silence.State.OFF -> R.string.silence_state_off
-                },
-            ),
-            onClick = onSilence,
-        )
+            Box(Modifier.fillMaxWidth().height(1.dp).background(HoloBlue.copy(alpha = 0.7f)))
 
-        if (launching || launchError.isNotEmpty()) {
-            Text(
-                if (launchError.isNotEmpty()) launchError else stringResource(R.string.launching),
-                color = if (launchError.isNotEmpty()) HoloRust else HoloDim,
-                fontSize = 12.sp,
-                modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
+            Column(
+                Modifier
+                    .weight(1f)
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 16.dp, vertical = 12.dp),
+            ) {
+                InfoLine(stringResource(R.string.size), sizeLabel(app.sizeBytes))
+                InfoLine(stringResource(R.string.version), app.version.ifBlank { "" })
+                InfoLine("ARMv7", arm32Label(app))
+                InfoLine("ARM64", arm64Label(app))
+                SectionLabel(stringResource(R.string.libraries))
+                val libraries = app.arm32 + app.arm64
+                if (libraries.isEmpty()) {
+                    Text(stringResource(R.string.none), color = HoloDim, fontSize = 13.sp)
+                } else {
+                    for (name in libraries) {
+                        Text(name, color = HoloText, fontSize = 12.sp, lineHeight = 18.sp)
+                    }
+                }
+            }
+            Box(Modifier.fillMaxWidth().height(1.dp).background(HoloRule))
+            // An engine that renders into its window draws what the window is
+            // worth, so the size belongs next to the archive that uses it. A
+            // package without a choice follows Settings.
+            SettingsRow(
+                title = stringResource(R.string.screen_size),
+                summary = if (resolution == null) {
+                    stringResource(R.string.display_inherit, resolutionLabel(globalResolution))
+                } else {
+                    resolutionLabel(resolution ?: globalResolution)
+                },
+                onClick = { resolutionOpen = true },
+            )
+            HoloDivider()
+            SettingsRow(
+                title = stringResource(R.string.refresh_rate),
+                summary = if (refreshRate == null) {
+                    stringResource(R.string.display_inherit, refreshLabel(globalRefreshRate))
+                } else {
+                    refreshLabel(refreshRate ?: globalRefreshRate)
+                },
+                onClick = { refreshRateOpen = true },
+            )
+            HoloDivider()
+            // The entries that keep this archive's own protection SDK out of the
+            // way are its data, so they are edited here and not for every app at
+            // once.
+            SettingsRow(
+                title = stringResource(R.string.silence),
+                summary = stringResource(
+                    when (Silence.state(app.packageName)) {
+                        Silence.State.DEFAULT -> R.string.silence_state_default
+                        Silence.State.EDITED -> R.string.silence_state_edited
+                        Silence.State.OFF -> R.string.silence_state_off
+                    },
+                ),
+                onClick = onSilence,
+            )
+
+            if (launching || launchError.isNotEmpty()) {
+                Text(
+                    if (launchError.isNotEmpty()) launchError else stringResource(R.string.launching),
+                    color = if (launchError.isNotEmpty()) HoloRust else HoloDim,
+                    fontSize = 12.sp,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
+                )
+            }
+            Row(Modifier.fillMaxWidth().padding(16.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                HoloButton(
+                    label = stringResource(R.string.launch),
+                    enabled = !launching,
+                    modifier = Modifier.weight(1f),
+                    onClick = onLaunch,
+                )
+                HoloButton(
+                    label = stringResource(R.string.delete),
+                    enabled = true,
+                    modifier = Modifier.weight(1f),
+                    onClick = onDelete,
+                )
+            }
+        }
+
+        if (resolutionOpen) {
+            PackageResolutionDialog(
+                selected = resolution,
+                onPick = {
+                    resolutionOpen = false
+                    resolution = it
+                    GuestScreen.setResolution(context, app.packageName, it)
+                },
+                onDismiss = { resolutionOpen = false },
             )
         }
-        Row(Modifier.fillMaxWidth().padding(16.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            HoloButton(
-                label = stringResource(R.string.launch),
-                enabled = !launching,
-                modifier = Modifier.weight(1f),
-                onClick = onLaunch,
-            )
-            HoloButton(
-                label = stringResource(R.string.delete),
-                enabled = true,
-                modifier = Modifier.weight(1f),
-                onClick = onDelete,
+
+        if (refreshRateOpen) {
+            PackageRefreshRateDialog(
+                selected = refreshRate,
+                onPick = {
+                    refreshRateOpen = false
+                    refreshRate = it
+                    GuestScreen.setRefreshRate(context, app.packageName, it)
+                },
+                onDismiss = { refreshRateOpen = false },
             )
         }
     }
@@ -659,18 +724,24 @@ fun SettingsScreen(
     localeTag: String,
     logLevel: Int,
     widescreen: Boolean,
+    resolution: GuestScreen.Resolution,
+    refreshRate: Int,
     channel: String,
     version: String,
     updateStatus: Updates.Status,
     onLocale: (String) -> Unit,
     onLogLevel: (Int) -> Unit,
     onWidescreen: (Boolean) -> Unit,
+    onResolution: (GuestScreen.Resolution) -> Unit,
+    onRefreshRate: (Int) -> Unit,
     onChannel: (String) -> Unit,
     onCheckUpdates: () -> Unit,
     onAbout: () -> Unit,
 ) {
     var languageOpen by remember { mutableStateOf(false) }
     var logLevelOpen by remember { mutableStateOf(false) }
+    var resolutionOpen by remember { mutableStateOf(false) }
+    var refreshRateOpen by remember { mutableStateOf(false) }
     var channelOpen by remember { mutableStateOf(false) }
 
     Box(Modifier.fillMaxSize()) {
@@ -699,6 +770,21 @@ fun SettingsScreen(
                     ),
                     checked = widescreen,
                     onToggle = { onWidescreen(!widescreen) },
+                )
+                HoloDivider()
+                // The two rows below describe the canvas and the pacing of every
+                // guest that has no entry of its own; an archive can override
+                // both in its details screen.
+                SettingsRow(
+                    title = stringResource(R.string.screen_size),
+                    summary = resolutionLabel(resolution),
+                    onClick = { resolutionOpen = true },
+                )
+                HoloDivider()
+                SettingsRow(
+                    title = stringResource(R.string.refresh_rate),
+                    summary = refreshLabel(refreshRate),
+                    onClick = { refreshRateOpen = true },
                 )
                 HoloDivider()
                 // Rows for the updater only exist where it can act: a debug
@@ -748,6 +834,28 @@ fun SettingsScreen(
                     onLogLevel(it)
                 },
                 onDismiss = { logLevelOpen = false },
+            )
+        }
+
+        if (resolutionOpen) {
+            ResolutionDialog(
+                selected = resolution,
+                onPick = {
+                    resolutionOpen = false
+                    onResolution(it)
+                },
+                onDismiss = { resolutionOpen = false },
+            )
+        }
+
+        if (refreshRateOpen) {
+            RefreshRateDialog(
+                selected = refreshRate,
+                onPick = {
+                    refreshRateOpen = false
+                    onRefreshRate(it)
+                },
+                onDismiss = { refreshRateOpen = false },
             )
         }
 
@@ -1000,6 +1108,113 @@ private fun ChannelDialog(
             Updates.NIGHTLY to stringResource(R.string.update_channel_nightly),
         ),
         selected = channel,
+        onPick = onPick,
+        onDismiss = onDismiss,
+    )
+}
+
+/**
+ * The canvas a size choice stands for, as the row and the picker show it.
+ *
+ * The native entry names the panel's own pixels because that is the whole
+ * promise of it: the largest mode the display has, not whatever it runs at.
+ */
+@Composable
+private fun resolutionLabel(resolution: GuestScreen.Resolution): String = when (resolution) {
+    GuestScreen.Resolution.AUTO -> stringResource(R.string.resolution_auto)
+    GuestScreen.Resolution.P720 -> "1280 × 720"
+    GuestScreen.Resolution.P1080 -> "1920 × 1080"
+    GuestScreen.Resolution.NATIVE -> {
+        val (short, long) = GuestScreen.panelSize(LocalContext.current)
+        stringResource(R.string.resolution_native, long, short)
+    }
+}
+
+/** The rate a choice stands for; the automatic one keeps the era's rate. */
+@Composable
+private fun refreshLabel(hz: Int): String =
+    if (hz == GuestScreen.AUTO_RATE) {
+        stringResource(R.string.refresh_auto)
+    } else {
+        "$hz Hz"
+    }
+
+/** The sizes offered for every archive that has no entry of its own. */
+@Composable
+private fun ResolutionDialog(
+    selected: GuestScreen.Resolution,
+    onPick: (GuestScreen.Resolution) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    ChoiceDialog(
+        title = stringResource(R.string.screen_size),
+        options = GuestScreen.Resolution.entries.map { it to resolutionLabel(it) },
+        selected = selected,
+        onPick = onPick,
+        onDismiss = onDismiss,
+    )
+}
+
+/** The rates this display can actually show (see GuestScreen.refreshChoices). */
+@Composable
+private fun RefreshRateDialog(
+    selected: Int,
+    onPick: (Int) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val context = LocalContext.current
+    ChoiceDialog(
+        title = stringResource(R.string.refresh_rate),
+        options = GuestScreen.refreshChoices(context, selected)
+            .map { it to refreshLabel(it) },
+        selected = selected,
+        onPick = onPick,
+        onDismiss = onDismiss,
+    )
+}
+
+/** The same size list with the global setting as the first entry. */
+@Composable
+private fun PackageResolutionDialog(
+    selected: GuestScreen.Resolution?,
+    onPick: (GuestScreen.Resolution?) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val context = LocalContext.current
+    val inherit = stringResource(
+        R.string.display_inherit,
+        resolutionLabel(GuestScreen.resolution(context, null)),
+    )
+    val options = listOf<Pair<GuestScreen.Resolution?, String>>(null to inherit) +
+        GuestScreen.Resolution.entries.map { it to resolutionLabel(it) }
+    ChoiceDialog(
+        title = stringResource(R.string.screen_size),
+        options = options,
+        selected = selected,
+        onPick = onPick,
+        onDismiss = onDismiss,
+    )
+}
+
+/** The same rate list with the global setting as the first entry. */
+@Composable
+private fun PackageRefreshRateDialog(
+    selected: Int?,
+    onPick: (Int?) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val context = LocalContext.current
+    val inherit = stringResource(
+        R.string.display_inherit,
+        refreshLabel(GuestScreen.refreshRate(context, null)),
+    )
+    val options = listOf<Pair<Int?, String>>(null to inherit) +
+        GuestScreen.refreshChoices(context, selected ?: GuestScreen.AUTO_RATE)
+            .map { it to refreshLabel(it) }
+    ChoiceDialog(
+        title = stringResource(R.string.refresh_rate),
+        options = options,
+        selected = selected,
         onPick = onPick,
         onDismiss = onDismiss,
     )
