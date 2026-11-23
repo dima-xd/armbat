@@ -225,7 +225,7 @@ bool GuestArena::Protect(std::uint32_t addr, std::uint64_t len, int prot) {
     return true;
 }
 
-std::uint64_t GuestArena::AccessibleEnd(std::uint32_t addr) const {
+std::uint64_t GuestArena::AccessibleEnd(std::uint32_t addr, std::uint64_t limit) const {
     if (pages_ == nullptr || addr >= size_) {
         return 0;
     }
@@ -234,7 +234,18 @@ std::uint64_t GuestArena::AccessibleEnd(std::uint32_t addr) const {
     if (index >= count || pages_[index].load(std::memory_order_acquire) == kPageFree) {
         return 0;
     }
-    while (index < count) {
+    // A caller that needs one request's worth of bytes must not walk the run of
+    // writable pages past it. The guest heap is one such run -- tens of thousands
+    // of pages -- and a reader that asked for 4 KiB at a time paid for the whole
+    // heap on every read.
+    std::uint64_t last = count - 1;
+    if (limit != 0 && limit <= size_) {
+        const std::uint64_t asked = (limit - 1) >> page_shift_;
+        if (asked < last) {
+            last = asked;
+        }
+    }
+    while (index <= last) {
         const std::uint8_t state = pages_[index].load(std::memory_order_acquire);
         if (state != kPageReadWrite) {
             break;

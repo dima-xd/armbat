@@ -19,6 +19,7 @@
 #include "armbat/guest_container.h"
 #include "armbat/guest_input.h"
 #include "armbat/guest_stdio.h"
+#include "armbat/handles.h"
 #include "armbat/jni_bridge.h"
 
 namespace {
@@ -337,16 +338,48 @@ Java_dev_armbat_GuestNatives_create(JNIEnv* env, jobject /*self*/, jobject /*sur
 
 // The host window behind the guest's surface. ANativeWindow_fromSurface is the
 // platform's own way in, and it keeps the surface's lifetime in the framework's
-// hands instead of the container's.
-extern "C" JNIEXPORT void JNICALL
-Java_dev_armbat_GuestNatives_windowCreated(JNIEnv* env, jobject /*self*/, jobject surface) {
-    using FromSurface = void* (*)(JNIEnv*, jobject);
-    static const auto from_surface = [] {
+// hands instead of the container's. A handle holds one reference to its window:
+// the one taken when the window was registered, given back when the surface is
+// gone, so a pause/resume cycle does not leave a buffer queue behind.
+namespace {
+
+using WindowFromSurface = void* (*)(JNIEnv*, jobject);
+
+WindowFromSurface WindowFromSurfaceEntry() {
+    static const auto entry = [] {
         void* library = ::dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL);
         return library != nullptr
-                   ? reinterpret_cast<FromSurface>(::dlsym(library, "ANativeWindow_fromSurface"))
+                   ? reinterpret_cast<WindowFromSurface>(::dlsym(library, "ANativeWindow_fromSurface"))
                    : nullptr;
     }();
+    return entry;
+}
+
+void ReleaseWindow(void* window) {
+    using Release = void (*)(void*);
+    static const auto release = [] {
+        void* library = ::dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL);
+        return library != nullptr
+                   ? reinterpret_cast<Release>(::dlsym(library, "ANativeWindow_release"))
+                   : nullptr;
+    }();
+    if (window != nullptr && release != nullptr) {
+        release(window);
+    }
+}
+
+// The window the current surface produced and whether its reference is the
+// container's to give back. A window the archive asked for itself is already in
+// the handle table with the archive's reference, and the container must not
+// release that one.
+void* g_window = nullptr;
+bool g_window_owned = false;
+
+}  // namespace
+
+extern "C" JNIEXPORT void JNICALL
+Java_dev_armbat_GuestNatives_windowCreated(JNIEnv* env, jobject /*self*/, jobject surface) {
+    const WindowFromSurface from_surface = WindowFromSurfaceEntry();
 
     const std::lock_guard lock(g_mutex);
     if (g_container == nullptr || !g_container->Started()) {
@@ -356,6 +389,11 @@ Java_dev_armbat_GuestNatives_windowCreated(JNIEnv* env, jobject /*self*/, jobjec
                        ? from_surface(env, surface)
                        : nullptr;
     ARMBAT_LOG_INFO("Armbat", "guest window: %p", window);
+    g_window_owned = window != nullptr && armbat::FindHostHandle(window) == 0;
+    if (!g_window_owned) {
+        ReleaseWindow(window);
+    }
+    g_window = window;
     LogLines(g_container->SetNativeWindow(window));
 }
 
@@ -365,14 +403,35 @@ Java_dev_armbat_GuestNatives_windowDestroyed(JNIEnv*, jobject /*self*/) {
     if (g_container == nullptr || !g_container->Started()) {
         return;
     }
+    // The archive is told first: onNativeWindowDestroyed is the last call that
+    // may still name the window.
     LogLines(g_container->SetNativeWindow(nullptr));
+    if (g_window_owned) {
+        ReleaseWindow(g_window);
+    }
+    g_window_owned = false;
+    g_window = nullptr;
+}
+
+// The window the archive draws into was re-laid out: its surface has a new
+// size. The platform tells the activity that its window was resized and that it
+// needs a redraw, and an engine that lays out from the callback -- rather than
+// asking EGL for the surface size every frame -- only learns about a rotation
+// this way.
+extern "C" JNIEXPORT void JNICALL
+Java_dev_armbat_GuestNatives_windowResized(JNIEnv*, jobject /*self*/) {
+    const std::lock_guard lock(g_mutex);
+    if (g_container == nullptr || !g_container->Started()) {
+        return;
+    }
+    LogLines(g_container->ResizeNativeWindow());
 }
 
 // A native activity reads its touches from the window's input queue, and the
 // platform hands that queue over when the window becomes active -- whatever
 // view the archive chose to put in it. The stand-in for android.app.NativeActivity
-// has no window callbacks of its own for an archive that installs its own
-// surface, so the queue is delivered on its own, once.
+// delivers it with the surface it hands over; this entry is for an archive that
+// installs its own surface and never names one to the container.
 extern "C" JNIEXPORT void JNICALL
 Java_dev_armbat_GuestNatives_inputQueue(JNIEnv*, jobject /*self*/) {
     const std::lock_guard lock(g_mutex);

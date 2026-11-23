@@ -42,4 +42,13 @@ void* LookupHostHandle(std::uint32_t guest) {
     return g_hosts[guest - 1];
 }
 
+std::uint32_t FindHostHandle(void* host) {
+    if (host == nullptr) {
+        return 0;
+    }
+    const std::lock_guard lock(g_mutex);
+    const auto existing = g_handles.find(host);
+    return existing != g_handles.end() ? existing->second : 0;
+}
+
 }  // namespace armbat

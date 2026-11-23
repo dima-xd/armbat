@@ -1,4 +1,4 @@
-﻿#include "armbat/guest_kernel.h"
+#include "armbat/guest_kernel.h"
 
 #include <algorithm>
 #include <atomic>
@@ -389,7 +389,12 @@ std::uint32_t MappedPrefix(const GuestArena& arena, std::uint32_t address,
     // from the address wraps into a span the size of the whole address space and
     // hands the copy a length the guest never mapped, which is a host store into
     // a page the guest made immutable.
-    const std::uint64_t end = arena.AccessibleEnd(address);
+    //
+    // The walk is bounded by the end of the request: nothing past it is used,
+    // and a buffer in the guest's heap sits in a run of writable pages the whole
+    // heap long, which made every small read pay for all of them.
+    const std::uint64_t end =
+        arena.AccessibleEnd(address, static_cast<std::uint64_t>(address) + count);
     if (end <= address) {
         return 0;
     }
@@ -729,18 +734,18 @@ std::int32_t GuestKernel::ReadInto(int fd, std::uint32_t buffer, std::uint32_t c
     if (length == 0) {
         return count == 0 ? 0 : -EFAULT;
     }
+    // The description is taken for every read, not only for a regular file: it
+    // also remembers what the host said this file is, and asking again per read
+    // is what made a cached read cost as much as a cold one.
+    const DescriptionLock description = DescriptionOf(fd);
     ssize_t result = 0;
-    if (IsRegularFile(fd)) {
-        // ReadFully takes several host reads whenever the storage answers short,
-        // and the file position is shared by every descriptor made from the same
-        // open file description. Holding the description for the whole request is
-        // what makes one guest read atomic: without it the other thread takes the
-        // bytes in between and both guests read a stream shifted by the other's
-        // read -- an asset bundle with a hole in the middle, or the same header
-        // twice, with nothing that looks like an error.
-        const DescriptionLock description = DescriptionOf(fd);
-        const std::lock_guard<std::mutex> held(*description);
-        result = ReadFully(fd, arena_.Ptr(buffer), length);
+    if (DescriptionRegular(fd, description)) {
+        // Held for the whole request: ReadWindowed may fill the window with
+        // several host reads, and the position it advances belongs to the
+        // description, not to this thread.
+        const std::lock_guard<std::mutex> held(description->mutex);
+        result = ReadWindowed(fd, *description, reinterpret_cast<std::uint8_t*>(arena_.Ptr(buffer)),
+                              length);
     } else {
         result = ::read(fd, arena_.Ptr(buffer), length);
     }
@@ -764,9 +769,11 @@ std::int32_t GuestKernel::PreadInto(int fd, std::uint32_t buffer, std::uint32_t 
         return count == 0 ? 0 : -EFAULT;
     }
     // No description lock: pread never touches the shared file position, which is
-    // the whole reason a guest that reads from several threads uses it.
+    // the whole reason a guest that reads from several threads uses it. The
+    // description is still where the file type was remembered.
+    const DescriptionLock description = DescriptionOf(fd);
     const ssize_t result =
-        IsRegularFile(fd)
+        DescriptionRegular(fd, description)
             ? PreadFully(fd, arena_.Ptr(buffer), length, static_cast<off_t>(offset))
             : ::pread(fd, arena_.Ptr(buffer), length, static_cast<off_t>(offset));
     if (result < 0) {
@@ -932,12 +939,13 @@ std::string GuestKernel::ResolveGuestPath(std::string guest_path) {
     return guest_path;
 }
 
-void GuestKernel::TrackGuestFd(int fd, DescriptionLock description) {
+void GuestKernel::TrackGuestFd(int fd, DescriptionLock description, bool read_only) {
     if (fd < 0) {
         return;
     }
     if (description == nullptr) {
-        description = std::make_shared<std::mutex>();
+        description = std::make_shared<FileDescription>();
+        description->read_only = read_only;
     }
     const std::lock_guard lock(fds_mutex_);
     guest_fds_[fd] = std::move(description);
@@ -946,6 +954,9 @@ void GuestKernel::TrackGuestFd(int fd, DescriptionLock description) {
 void GuestKernel::ForgetGuestFd(int fd) {
     const std::lock_guard lock(fds_mutex_);
     guest_fds_.erase(fd);
+    // The fallback entry remembers the file type of whatever this number was;
+    // the next owner of the number is a different file.
+    fallback_descriptions_.erase(fd);
 }
 
 bool GuestKernel::IsGuestFd(int fd) const {
@@ -965,9 +976,53 @@ GuestKernel::DescriptionLock GuestKernel::DescriptionOf(int fd) const {
     // set is what the guest is allowed to close.
     auto& fallback = fallback_descriptions_[fd];
     if (fallback == nullptr) {
-        fallback = std::make_shared<std::mutex>();
+        fallback = std::make_shared<FileDescription>();
     }
     return fallback;
+}
+
+bool GuestKernel::DescriptionRegular(int fd, const DescriptionLock& description) {
+    int known = description->regular.load(std::memory_order_acquire);
+    if (known < 0) {
+        struct stat host {};
+        if (::fstat(fd, &host) == 0) {
+            description->window.SetSize(static_cast<std::uint64_t>(host.st_size));
+            known = S_ISREG(host.st_mode) ? 1 : 0;
+        } else {
+            known = 0;
+        }
+        description->regular.store(known, std::memory_order_release);
+    }
+    return known != 0;
+}
+
+std::int32_t GuestKernel::ReadWindowed(int fd, FileDescription& description, std::uint8_t* out,
+                                       std::uint32_t length) {
+    if (!description.read_only) {
+        return ClampSize(ReadFully(fd, out, length));
+    }
+    const std::uint64_t generation = io_generation_.load(std::memory_order_acquire);
+    if (description.window.Holds(generation, length)) {
+        description.window.CopyHeld(out, length);
+        return ClampSize(static_cast<ssize_t>(length));
+    }
+    return ClampSize(static_cast<ssize_t>(description.window.Fill(fd, out, length, generation)));
+}
+
+bool GuestKernel::MoveWindowedPosition(FileDescription& description, std::int64_t offset,
+                                       int whence, std::int64_t* result) {
+    return description.window.Seek(offset, whence, result);
+}
+
+void GuestKernel::NoteWriteTo(int fd) {
+    // A window is a copy of what the file held when it was filled. A real kernel
+    // updates the page cache on a write; this copy is thrown away instead, so a
+    // guest that writes a file through one descriptor and reads it back through a
+    // descriptor it opened read-only cannot see the old bytes.
+    const DescriptionLock description = DescriptionOf(fd);
+    if (DescriptionRegular(fd, description)) {
+        io_generation_.fetch_add(1, std::memory_order_release);
+    }
 }
 
 // Only the caller is stopped here. The rest of the world belongs to whoever
@@ -1246,7 +1301,11 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
                          std::string_view(reinterpret_cast<const char*>(arena_.Ptr(buffer)), count));
         }
         const ssize_t result = ::write(fd, arena_.Ptr(buffer), count);
-        return result < 0 ? -errno : ClampSize(result);
+        if (result < 0) {
+            return -errno;
+        }
+        NoteWriteTo(fd);
+        return ClampSize(result);
     }
 
     case kSysWritev:
@@ -1306,15 +1365,22 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
                 ForwardStdio(fd, std::string_view(buffer.data(), buffer.size()));
             }
             const ssize_t result = ::write(fd, buffer.data(), buffer.size());
-            return result < 0 ? -errno : ClampSize(result);
+            if (result < 0) {
+                return -errno;
+            }
+            NoteWriteTo(fd);
+            return ClampSize(result);
         }
+        const DescriptionLock description = DescriptionOf(fd);
         ssize_t result = 0;
-        if (IsRegularFile(fd)) {
-            // Same rule as read(): the vector is completed with several host
-            // reads, so the description is held for the whole request.
-            const DescriptionLock description = DescriptionOf(fd);
-            const std::lock_guard<std::mutex> held(*description);
-            result = ReadFully(fd, buffer.data(), buffer.size());
+        if (DescriptionRegular(fd, description)) {
+            // Same rule as read(): the vector is one request, served from the
+            // description's window and holding the description while it fills.
+            const std::lock_guard<std::mutex> held(description->mutex);
+            const std::uint32_t wanted =
+                static_cast<std::uint32_t>(std::min<std::size_t>(buffer.size(), INT32_MAX));
+            result = ReadWindowed(fd, *description,
+                                  reinterpret_cast<std::uint8_t*>(buffer.data()), wanted);
         } else {
             result = ::read(fd, buffer.data(), buffer.size());
         }
@@ -1361,7 +1427,11 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
         }
         const ssize_t result = ::pwrite(fd, arena_.Ptr(buffer), count,
                                        static_cast<off_t>(offset));
-        return result < 0 ? -errno : ClampSize(result);
+        if (result < 0) {
+            return -errno;
+        }
+        NoteWriteTo(fd);
+        return ClampSize(result);
     }
 
     case kSysOpen:
@@ -1398,7 +1468,9 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
                            : ::open(host_path.c_str(), flags, mode);
         TracePath(path, host_path, fd < 0 ? -errno : 0);
         if (fd >= 0) {
-            TrackGuestFd(fd);
+            // A descriptor the guest may only read is served from a window: the
+            // position then lives in the description, not in the host descriptor.
+            TrackGuestFd(fd, nullptr, (flags & O_ACCMODE) == O_RDONLY);
         }
         return fd < 0 ? -errno : fd;
     }
@@ -1443,32 +1515,50 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
         if (!arena_.IsMapped(result_pointer, 8)) {
             return -EFAULT;
         }
-        off_t result = 0;
+        std::uint64_t guest = 0;
         {
             // Moving the position while another thread is halfway through a
             // completed regular-file read would send the rest of that read to the
             // new offset. Linux moves a position one syscall at a time; so does
             // this.
             const DescriptionLock description = DescriptionOf(fd);
-            const std::lock_guard<std::mutex> held(*description);
-            result = ::lseek(fd, static_cast<off_t>(offset), whence);
+            const std::lock_guard<std::mutex> held(description->mutex);
+            std::int64_t moved = 0;
+            if (description->read_only && DescriptionRegular(fd, description) &&
+                MoveWindowedPosition(*description, static_cast<std::int64_t>(offset), whence,
+                                     &moved)) {
+                // A read-only description's position lives here: the window left
+                // the host descriptor somewhere else, and asking it would both
+                // cost a syscall and answer the wrong number.
+                guest = static_cast<std::uint64_t>(moved);
+            } else {
+                const off_t result = ::lseek(fd, static_cast<off_t>(offset), whence);
+                if (result < 0) {
+                    return -errno;
+                }
+                guest = static_cast<std::uint64_t>(result);
+            }
         }
-        if (result < 0) {
-            return -errno;
-        }
-        const std::uint64_t guest = static_cast<std::uint64_t>(result);
         std::memcpy(arena_.Ptr(result_pointer), &guest, sizeof(guest));
         return 0;
     }
 
     case kSysLseek: {
         const int fd = static_cast<int>(args[0]);
+        const off_t offset = static_cast<off_t>(static_cast<std::int32_t>(args[1]));
+        const int whence = static_cast<int>(args[2]);
         off_t result = 0;
         {
             const DescriptionLock description = DescriptionOf(fd);
-            const std::lock_guard<std::mutex> held(*description);
-            result = ::lseek(fd, static_cast<off_t>(static_cast<std::int32_t>(args[1])),
-                             static_cast<int>(args[2]));
+            const std::lock_guard<std::mutex> held(description->mutex);
+            std::int64_t moved = 0;
+            if (description->read_only && DescriptionRegular(fd, description) &&
+                MoveWindowedPosition(*description, static_cast<std::int64_t>(offset), whence,
+                                     &moved)) {
+                result = static_cast<off_t>(moved);
+            } else {
+                result = ::lseek(fd, offset, whence);
+            }
         }
         return result < 0 ? -errno : static_cast<std::int32_t>(result);
     }
@@ -1662,7 +1752,14 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
             return -EFAULT;
         }
         const std::string host_path = MapPath(path);
-        return ::truncate(host_path.c_str(), static_cast<off_t>(args[1])) == 0 ? 0 : -errno;
+        if (::truncate(host_path.c_str(), static_cast<off_t>(args[1])) != 0) {
+            return -errno;
+        }
+        // Every window of this file is now a copy of bytes that may no longer be
+        // there. Dropping them all costs one host read each, and a wrong answer
+        // costs a save file.
+        io_generation_.fetch_add(1, std::memory_order_release);
+        return 0;
     }
 
     case kSysTruncate64: {
@@ -1675,14 +1772,21 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
         // the path the length occupies r2:r3 and r1 is padding. bionic's
         // truncate64 stub hands its registers to the kernel untouched.
         const std::uint64_t length = Split64(args[2], args[3]);
-        return ::truncate(host_path.c_str(), static_cast<off_t>(length)) == 0 ? 0 : -errno;
+        if (::truncate(host_path.c_str(), static_cast<off_t>(length)) != 0) {
+            return -errno;
+        }
+        io_generation_.fetch_add(1, std::memory_order_release);
+        return 0;
     }
 
     case kSysFtruncate64: {
         // ftruncate64(fd, off64_t): the same even-pair rule, length in r2:r3.
         const std::uint64_t length = Split64(args[2], args[3]);
-        return ::ftruncate(static_cast<int>(args[0]), static_cast<off_t>(length)) == 0 ? 0
-                                                                                        : -errno;
+        if (::ftruncate(static_cast<int>(args[0]), static_cast<off_t>(length)) != 0) {
+            return -errno;
+        }
+        NoteWriteTo(static_cast<int>(args[0]));
+        return 0;
     }
 
     case kSysSync:
@@ -3153,6 +3257,22 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
             }
             int value = 0;
             std::memcpy(&value, arena_.Ptr(argument), sizeof(value));
+            if (request == kFionread) {
+                // A read-only regular file is read through a window, so the host
+                // descriptor sits past the bytes the guest has consumed and the
+                // host would answer with the wrong remainder.
+                const DescriptionLock description = DescriptionOf(fd);
+                const std::lock_guard<std::mutex> held(description->mutex);
+                if (description->read_only && DescriptionRegular(fd, description) &&
+                    description->window.size_known()) {
+                    const std::uint64_t position = description->window.position();
+                    const std::uint64_t size = description->window.size();
+                    value = static_cast<int>(
+                        std::min<std::uint64_t>(size > position ? size - position : 0, INT32_MAX));
+                    std::memcpy(arena_.Ptr(argument), &value, sizeof(value));
+                    return 0;
+                }
+            }
             if (::ioctl(fd, static_cast<unsigned long>(request), &value) != 0) {
                 return -errno;
             }
@@ -3207,8 +3327,11 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
         // `ftruncate` sign-extends it and jumps straight to the 64-bit
         // variant, so this number only sees guests built against an older libc.
         const std::uint32_t length = args[1];
-        return ::ftruncate(static_cast<int>(args[0]), static_cast<off_t>(length)) == 0 ? 0
-                                                                                       : -errno;
+        if (::ftruncate(static_cast<int>(args[0]), static_cast<off_t>(length)) != 0) {
+            return -errno;
+        }
+        NoteWriteTo(static_cast<int>(args[0]));
+        return 0;
     }
 
     case kSysGetrandom: {

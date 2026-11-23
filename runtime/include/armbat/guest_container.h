@@ -121,8 +121,14 @@ public:
 
     // The queue the archive reads its touches from. The platform hands it over
     // when the activity's window becomes active, not when a view is created:
-    // an archive is free to install its own surface and never touch ours.
+    // an archive is free to install its own surface and never touch ours. It is
+    // therefore delivered with every window, and once on its own for an archive
+    // whose window never reaches the container.
     std::string SetNativeInputQueue();
+
+    // The window the archive was handed changed its size: the activity is told
+    // it was resized and that it needs to redraw, in the platform's order.
+    std::string ResizeNativeWindow();
 
     // "libminecraftpe.so+0x12345 in SomeSymbol", for crash reports.
     std::string DescribeAddress(std::uint32_t address) const;

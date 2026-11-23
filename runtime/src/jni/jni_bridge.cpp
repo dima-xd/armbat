@@ -2605,7 +2605,10 @@ struct JniBridge::Impl {
         if (bytes == 0) {
             return 0;
         }
-        const std::uint64_t end = arena.AccessibleEnd(block);
+        // Bounded by `bytes`: the run past it is never used, and it is the
+        // guest's whole heap long when the array sits in the middle of it.
+        const std::uint64_t end =
+            arena.AccessibleEnd(block, static_cast<std::uint64_t>(block) + bytes);
         const std::uint64_t room = end > block ? end - block : 0;
         return static_cast<std::uint32_t>(std::min<std::uint64_t>(room, bytes));
     }

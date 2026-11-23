@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "armbat/guest_memory.h"
+#include "armbat/read_window.h"
 
 namespace armbat {
 
@@ -176,11 +177,48 @@ private:
     // answers a regular-file read with several host reads when the storage
     // returns a short one -- two threads on one description would interleave
     // there and each would read a stream shifted by the other's bytes.
-    using DescriptionLock = std::shared_ptr<std::mutex>;
-    void TrackGuestFd(int fd, DescriptionLock description = nullptr);
+    // One open file description: the identity every descriptor made by dup()
+    // shares, and what a read holds while it completes.
+    struct FileDescription {
+        std::mutex mutex;
+        // Whether the host calls this a regular file, asked once and remembered.
+        // The stat is not the cost -- 0.6 us -- but on Android's FUSE-backed
+        // storage a stat in front of every read drops the page cache the previous
+        // read filled: the same 4 KiB read went from 2 us to 88 us, and a guest
+        // folding over an asset bundle does it thousands of times a second.
+        std::atomic<int> regular{-1};
+
+        // A descriptor the guest can only read does not need the host to hold the
+        // position: every read comes from the window below and every seek is
+        // answered here. A descriptor it can write keeps the host's position,
+        // because the host is then the only thing that must agree with itself.
+        bool read_only = false;
+        ReadWindow window;
+    };
+    using DescriptionLock = std::shared_ptr<FileDescription>;
+    void TrackGuestFd(int fd, DescriptionLock description = nullptr, bool read_only = false);
     void ForgetGuestFd(int fd);
     bool IsGuestFd(int fd) const;
     DescriptionLock DescriptionOf(int fd) const;
+
+    // Whether this description reads like a regular file, resolved once. Named
+    // apart from IsRegularFile because that one asks the host, and asking the
+    // host on every read is what cost an asset-heavy guest 40x its I/O.
+    bool DescriptionRegular(int fd, const DescriptionLock& description);
+
+    // read() for a regular descriptor: serves the request from the description's
+    // window when it is there and fills the window when it is not. Returns what
+    // the host read returned, or -errno.
+    std::int32_t ReadWindowed(int fd, FileDescription& description, std::uint8_t* out,
+                              std::uint32_t length);
+
+    // Moves a read-only description's position without asking the host, which is
+    // where the window left it. False when the answer needs the host.
+    bool MoveWindowedPosition(FileDescription& description, std::int64_t offset, int whence,
+                              std::int64_t* result);
+
+    // A write through any descriptor of a regular file makes every window stale.
+    void NoteWriteTo(int fd);
 
     // read() and pread() as the guest's kernel answers them. Members because the
     // read has to hold the open file description still while it completes.
@@ -200,6 +238,9 @@ private:
     std::string executable_path_;
     std::function<void(std::uint32_t)> boot_ready_;
     std::unordered_set<int> log_sockets_;
+    // Bumped by every write to a regular file; a window carries the generation it
+    // was filled at and is not used across one.
+    std::atomic<std::uint64_t> io_generation_{0};
     mutable std::mutex fds_mutex_;
     std::unordered_map<int, DescriptionLock> guest_fds_;
     // Descriptions for descriptors the guest did not open: they take part in the

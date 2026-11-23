@@ -18,6 +18,7 @@ add_library(armbat_core STATIC
     src/hle/guest_sensors.cpp
     src/hle/guest_gles.cpp
     src/kernel/guest_kernel.cpp
+    src/kernel/read_window.cpp
     src/kernel/guest_signal.cpp
     src/kernel/guest_memory.cpp
     src/kernel/guest_modules.cpp

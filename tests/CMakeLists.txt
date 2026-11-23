@@ -10,3 +10,9 @@ target_compile_features(armbat-selftest PRIVATE cxx_std_20)
 add_executable(armbat-apk apk_tool.cpp)
 target_link_libraries(armbat-apk PRIVATE armbat_core armbat_warnings)
 target_compile_features(armbat-apk PRIVATE cxx_std_20)
+
+# The read window the kernel serves read-only descriptors from: its own file, so
+# the position bookkeeping can be checked against read()/lseek() without a guest.
+add_executable(read_window_test read_window_test.cpp ../runtime/src/kernel/read_window.cpp)
+target_include_directories(read_window_test PRIVATE ../runtime/include)
+target_compile_features(read_window_test PRIVATE cxx_std_20)

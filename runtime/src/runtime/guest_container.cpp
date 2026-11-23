@@ -1331,7 +1331,6 @@ struct GuestContainer::Impl {
     // The AInputQueue the archive was handed; the container's own object, only
     // ever passed back to it.
     std::uint32_t native_input_queue = 0;
-    bool native_input_sent = false;
     // Handles the guest's own linker returned for the archive's libraries. The
     // HLE loader is empty on this path, so anything that has to look a symbol up
     // afterwards - ANativeActivity_onCreate above all - asks the guest.
@@ -1517,20 +1516,34 @@ std::string GuestContainer::SetNativeWindow(void* window) {
     std::string report = NotifyNative(7, impl_->native_window, true);   // created
     report += NotifyNative(8, impl_->native_window, true);              // resized
     report += NotifyNative(9, impl_->native_window, true);              // redraw needed
-    // The input queue follows the window. The glue's callback waits for its own
-    // thread to pick the queue up, and that thread only reaches the point where
-    // it does so once the window has been accepted -- exactly the order the
-    // platform uses on a device, where the queue arrives with the focused
-    // window and never during onCreate.
+    // The input queue belongs to the window that was just accepted: the platform
+    // hands the activity its input channel with the surface, again for every new
+    // window, and the activity answers it with a command of its own. That
+    // command is the last one in the queue for a launch, and it is what tells an
+    // engine whose window handling only stores the window that the window is
+    // ready -- an engine that creates its game from the *next* command stays
+    // parked in the poll it entered after handling the window without it.
     report += SetNativeInputQueue();
     return report;
 }
 
-std::string GuestContainer::SetNativeInputQueue() {
-    if (impl_->native_input_queue == 0 || impl_->native_input_sent) {
+std::string GuestContainer::ResizeNativeWindow() {
+    if (impl_->native_window == 0) {
         return std::string();
     }
-    impl_->native_input_sent = true;
+    // The platform calls the activity twice for a surface that changed size:
+    // resized, then redraw needed, both with the same window. An engine that
+    // reads its viewport from the callback instead of from eglQuerySurface
+    // needs both; the window handle itself does not change.
+    std::string report = NotifyNative(8, impl_->native_window, true);   // resized
+    report += NotifyNative(9, impl_->native_window, true);              // redraw needed
+    return report;
+}
+
+std::string GuestContainer::SetNativeInputQueue() {
+    if (impl_->native_input_queue == 0) {
+        return std::string();
+    }
     return NotifyNative(11, impl_->native_input_queue, true);   // input queue created
 }
 

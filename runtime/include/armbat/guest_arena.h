@@ -52,7 +52,12 @@ public:
     // itself may copy into or out of: the kernel writes a guest buffer with a
     // host memcpy, so a page the guest protected must end the range here even
     // though the mapping continues past it.
-    std::uint64_t AccessibleEnd(std::uint32_t addr) const;
+    //
+    // `limit` is the end of the range the caller actually cares about (0 for
+    // "all of it"). Passing it is not an optimisation of the answer but of the
+    // walk: the run of writable pages a heap buffer sits in can be megabytes
+    // long, and a request for a few kilobytes must not pay for all of it.
+    std::uint64_t AccessibleEnd(std::uint32_t addr, std::uint64_t limit = 0) const;
 
     // Whether the guest has mapped the range, whatever protection it put on it.
     // mprotect validates against this: a page the guest itself made inaccessible

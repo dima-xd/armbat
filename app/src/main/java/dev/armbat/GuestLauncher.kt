@@ -1520,6 +1520,20 @@ class GuestLauncher(private val host: Activity) {
         lifecycle(hosted.activity, "onResume")
         hosted.resumed = true
         ArmbatLog.i(TAG, "lifecycle: onResume returned")
+        // The archive's activity is a child of the host (see
+        // GuestNatives.setActivityParent), so its own setRequestedOrientation()
+        // reaches the host's window. On a device the manager keeps the
+        // orientation the activity was launched with across a stop and a start,
+        // and the container is the one that asked for it; the call is repeated
+        // here so the window comes back as the archive declared it instead of
+        // whatever the guest decided while resuming. Without it a title that
+        // pinned landscape returned from the background portrait, and the guest
+        // was given a portrait canvas to draw its landscape in.
+        if (hosted.info.screenOrientation != ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED) {
+            runCatching {
+                host.requestedOrientation = hosted.info.screenOrientation
+            }.onFailure { ArmbatLog.w(TAG, "guest orientation: $it") }
+        }
         // The platform reports the focus of the window to the activity right
         // after the resume, and an archive may drive its whole engine from
         // there: Unity's player only wakes up in onWindowFocusChanged. The
@@ -1536,10 +1550,11 @@ class GuestLauncher(private val host: Activity) {
         frame.setOnApplyWindowInsetsListener { _, _ -> android.view.WindowInsets.CONSUMED }
         stage(LaunchStage.READY)
         host.setContentView(frame)
-        // With the window on screen the activity gets the queue its window
-        // reads touches from, which is the moment the platform reports it: the
-        // queue belongs to the window and arrives once the window exists, not
-        // when the archive happens to create a surface of its own.
+        // The queue a native activity reads its touches from. It belongs to the
+        // window, and the container hands it over with every window the archive
+        // names to it (see windowCreated); this call is for an archive that
+        // installs its own surface and never names one, so the queue has to
+        // reach that archive without a window of ours.
         GuestNatives.inputQueue()
         androidx.core.view.WindowCompat.setDecorFitsSystemWindows(host.window, false)
         val bars = androidx.core.view.WindowCompat.getInsetsController(host.window, frame)

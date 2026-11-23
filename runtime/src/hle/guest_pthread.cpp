@@ -1124,7 +1124,8 @@ std::string GuestStackFramesForTid(std::uint32_t tid, std::uint32_t sp, std::uin
     return std::string();
 }
 
-std::vector<std::string> GuestThreadLocations() {    const std::lock_guard lock(g_live_mutex);
+std::vector<std::string> GuestThreadLocations() {
+    const std::lock_guard lock(g_live_mutex);
     std::vector<std::string> out;
     out.reserve(g_live.size() + 1);
     unsigned parked = 0;
@@ -1143,8 +1144,9 @@ std::vector<std::string> GuestThreadLocations() {    const std::lock_guard lock(
         if (blocked) {
             ++parked;
         }
-        char line[192];
-        std::snprintf(line, sizeof(line), "tid %d pc=%s hle=%s busy=%d syscall=%u%s", entry.tid,
+        char line[224];
+        std::snprintf(line, sizeof(line), "tid %d pc=%s hle=%s busy=%d syscall=%u%s",
+                      entry.tid,
                       DescribeGuestAddress(entry.machine->Reg(15)).c_str(),
                       hle != nullptr ? hle : "-", entry.machine->Busy() ? 1 : 0,
                       entry.machine->LastSyscall(), blocked ? " (blocked)" : "");

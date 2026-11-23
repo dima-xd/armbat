@@ -95,6 +95,42 @@ int WindowExtent(std::uint32_t handle, bool want_height) {
     return (window != nullptr && query != nullptr) ? query(window) : 0;
 }
 
+// The window entry points the archive may call on the window it was handed.
+// They have to reach the platform's own functions: the pointer the container
+// hands around is the framework's window, so a geometry change or a reference
+// taken on it acts on the surface the platform composes, exactly as it would
+// for a native library of the application.
+struct WindowFunctions {
+    int (*set_buffers_geometry)(void*, int, int, int) = nullptr;
+    void (*acquire)(void*) = nullptr;
+    void (*release)(void*) = nullptr;
+};
+
+const WindowFunctions& Windows() {
+    static const WindowFunctions functions = [] {
+        WindowFunctions loaded;
+        void* library = ::dlopen("libandroid.so", RTLD_NOW | RTLD_LOCAL);
+        if (library == nullptr) {
+            return loaded;
+        }
+        loaded.set_buffers_geometry = reinterpret_cast<int (*)(void*, int, int, int)>(
+            ::dlsym(library, "ANativeWindow_setBuffersGeometry"));
+        loaded.acquire =
+            reinterpret_cast<void (*)(void*)>(::dlsym(library, "ANativeWindow_acquire"));
+        loaded.release =
+            reinterpret_cast<void (*)(void*)>(::dlsym(library, "ANativeWindow_release"));
+        return loaded;
+    }();
+    return functions;
+}
+
+// References the archive itself took on a window handle. A handle always holds
+// one reference of its own -- the one the container took when the window was
+// registered -- so a release can only give back what an acquire took, never the
+// window under a guest that is still drawing on it.
+std::mutex g_window_lock;
+std::unordered_map<std::uint32_t, int> g_window_extra;
+
 // ---- assets ---------------------------------------------------------------
 //
 // The AssetManager is the platform's, not a copy of one. The Java half of the
@@ -983,9 +1019,13 @@ void RegisterAndroidFunctions(HleRegistry& registry) {
         }
         GuestArena& arena = g_memory->Arena();
         std::uint32_t total = 0;
+        // Bounded by the request: the run of writable pages a heap buffer sits
+        // in is the whole heap long, and walking past `wanted` measured it on
+        // every asset read.
+        const std::uint64_t wanted_end = static_cast<std::uint64_t>(address) + wanted;
         while (total < wanted) {
             const std::uint32_t cursor = address + total;
-            const std::uint64_t end = arena.AccessibleEnd(cursor);
+            const std::uint64_t end = arena.AccessibleEnd(cursor, wanted_end);
             if (end == 0) {
                 if (total == 0) {
                     // Android would have faulted the store. Answering the count
@@ -1261,7 +1301,21 @@ void RegisterAndroidFunctions(HleRegistry& registry) {
     }
 
     // ---- window and activity ---------------------------------------------
-    registry.Add("ANativeWindow_setBuffersGeometry", [](HleCall& call) { call.Return(0); });
+    // An engine that renders below the panel's resolution asks the window for a
+    // buffer geometry of its own and the platform composes the result scaled up.
+    // Answering 0 without doing it left the engine believing it had resized its
+    // framebuffer while the surface kept its laid-out size.
+    registry.Add("ANativeWindow_setBuffersGeometry", [](HleCall& call) {
+        void* window = LookupHostHandle(call.Arg(0));
+        const WindowFunctions& functions = Windows();
+        if (window == nullptr || functions.set_buffers_geometry == nullptr) {
+            call.Return(0);
+            return;
+        }
+        call.Return(static_cast<std::uint32_t>(functions.set_buffers_geometry(
+            window, static_cast<int>(call.Arg(1)), static_cast<int>(call.Arg(2)),
+            static_cast<int>(call.Arg(3)))));
+    });
     // The only way a Java-based engine (Unity above all) turns the Surface the
     // framework handed it into the window EGL draws on. The guest calls it with
     // one of the bridge's object handles, so the host reference has to come back
@@ -1283,7 +1337,19 @@ void RegisterAndroidFunctions(HleRegistry& registry) {
                            ? from_surface(env, surface)
                            : nullptr;
         // One host window is one handle: an engine that asks for the window of
-        // the same surface twice must not grow the table.
+        // the same surface twice must not grow the table. A handle holds one
+        // reference, so the reference the platform just took for the repeated
+        // call is given back here instead of being kept alive by the table.
+        const std::uint32_t known = FindHostHandle(window);
+        if (known != 0) {
+            if (window != nullptr && Windows().release != nullptr) {
+                Windows().release(window);
+            }
+            Log("ANativeWindow_fromSurface(handle=" + std::to_string(call.Arg(1)) +
+                ") -> " + std::to_string(known) + " (same window)");
+            call.Return(known);
+            return;
+        }
         const std::uint32_t handle = RegisterHostHandle(window);
         Log("ANativeWindow_fromSurface(handle=" + std::to_string(call.Arg(1)) + ") -> " +
             std::to_string(handle) + " host=" +
@@ -1291,9 +1357,40 @@ void RegisterAndroidFunctions(HleRegistry& registry) {
         call.Return(handle);
     });
     // The window outlives the guest's reference: it belongs to the view, and the
-    // container keeps it for as long as the guest's surface exists.
-    registry.Add("ANativeWindow_acquire", [](HleCall&) {});
-    registry.Add("ANativeWindow_release", [](HleCall&) {});
+    // container keeps its own reference for as long as the guest's surface
+    // exists. What the archive takes and gives back is counted here, so the
+    // framework's window is not destroyed under a guest that still draws on it.
+    registry.Add("ANativeWindow_acquire", [](HleCall& call) {
+        void* window = LookupHostHandle(call.Arg(0));
+        if (window == nullptr) {
+            return;
+        }
+        {
+            const std::lock_guard lock(g_window_lock);
+            ++g_window_extra[call.Arg(0)];
+        }
+        if (Windows().acquire != nullptr) {
+            Windows().acquire(window);
+        }
+    });
+    registry.Add("ANativeWindow_release", [](HleCall& call) {
+        void* window = LookupHostHandle(call.Arg(0));
+        if (window == nullptr) {
+            return;
+        }
+        bool taken = false;
+        {
+            const std::lock_guard lock(g_window_lock);
+            const auto found = g_window_extra.find(call.Arg(0));
+            if (found != g_window_extra.end() && found->second > 0) {
+                --found->second;
+                taken = true;
+            }
+        }
+        if (taken && Windows().release != nullptr) {
+            Windows().release(window);
+        }
+    });
     // The size of the window the framework handed over. An engine asks for it
     // before its first frame to size the framebuffer and the viewport; a zero
     // answer describes an empty surface.

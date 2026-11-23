@@ -118,9 +118,17 @@ internal object GuestNatives {
     external fun windowDestroyed()
 
     /**
+     * The surface changed size: the archive gets onNativeWindowResized and then
+     * onNativeWindowRedrawNeeded, the pair the platform sends for a surface of
+     * a new shape.
+     */
+    external fun windowResized()
+
+    /**
      * The window is active: the archive gets onInputQueueCreated, the way the
      * platform hands a native activity the queue it reads its touches from.
-     * Delivered once, whatever view the archive installs.
+     * The window carries the queue with it; this is for an archive whose window
+     * never reaches the container because it installs its own surface.
      */
     external fun inputQueue()
 

@@ -41,6 +41,11 @@ public class NativeActivity extends Activity {
 
             @Override
             public void surfaceChanged(SurfaceHolder holder, int format, int width, int height) {
+                // The platform reports a surface of a new shape to a native
+                // activity as resized plus redraw needed. The engine is told the
+                // same way, once surfaces exist and again whenever the window is
+                // re-laid out -- a rotation is exactly that.
+                call("windowResized", null, null);
             }
 
             @Override
