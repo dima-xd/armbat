@@ -1867,10 +1867,7 @@ class GuestLauncher(private val host: Activity) {
             ?.takeIf { it.startsWith(PERMISSION_WHO_PREFIX) }
             ?.removePrefix(PERMISSION_WHO_PREFIX)
         if (!fragmentWho.isNullOrEmpty()) {
-            val fragment = runCatching {
-                val find = findMethod(activity.fragmentManager, "findFragmentByWho", String::class.java)
-                find?.invoke(activity.fragmentManager, fragmentWho) as? android.app.Fragment
-            }.getOrNull()
+            val fragment = resolveGuestFragment(activity, fragmentWho)
             if (fragment != null) {
                 runCatching {
                     fragment.onRequestPermissionsResult(requestCode, names, grants)
@@ -1885,6 +1882,71 @@ class GuestLauncher(private val host: Activity) {
         runCatching {
             activity.onRequestPermissionsResult(requestCode, names, grants)
         }.onFailure { ArmbatLog.w(TAG, "guest permission result to activity: $it") }
+    }
+
+    /**
+     * The fragment the request came from, through the fragment machinery the
+     * platform keeps on the activity. The activity's own getFragmentManager()
+     * dereferences the host callback the container does not install, so the
+     * controller is reached through reflection and its manager is found by
+     * shape: an object whose type answers findFragmentByWho, whatever field
+     * holds it on this release.
+     */
+    private fun resolveGuestFragment(activity: Activity, who: String): android.app.Fragment? {
+        runCatching {
+            activity.fragmentManager?.let { manager ->
+                findMethod(manager, "findFragmentByWho", String::class.java)
+                    ?.invoke(manager, who) as? android.app.Fragment
+            }
+        }.getOrNull()?.let { return it }
+
+        val controller = runCatching {
+            Activity::class.java.getDeclaredField("mFragments").apply { isAccessible = true }
+                .get(activity)
+        }.getOrNull() ?: return null
+        val manager = findFragmentManager(controller) ?: return null
+        val find = findMethod(manager, "findFragmentByWho", String::class.java) ?: return null
+        return runCatching { find.invoke(manager, who) as? android.app.Fragment }.getOrNull()
+    }
+
+    /**
+     * The fragment manager below [holder], located by shape rather than name:
+     * the controller and its host callback rename their fields between
+     * releases, but the manager always answers findFragmentByWho.
+     */
+    private fun findFragmentManager(holder: Any): Any? {
+        if (hasMethod(holder, "findFragmentByWho")) {
+            return holder
+        }
+        var type: Class<*>? = holder.javaClass
+        while (type != null && type != Any::class.java) {
+            for (field in type.declaredFields) {
+                if (java.lang.reflect.Modifier.isStatic(field.modifiers)) {
+                    continue
+                }
+                val value = runCatching {
+                    field.isAccessible = true
+                    field.get(holder)
+                }.getOrNull() ?: continue
+                if (hasMethod(value, "findFragmentByWho")) {
+                    return value
+                }
+            }
+            type = type.superclass
+        }
+        return null
+    }
+
+    /** Whether the object's type or any superclass declares [name]. */
+    private fun hasMethod(instance: Any, name: String): Boolean {
+        var type: Class<*>? = instance.javaClass
+        while (type != null && type != Any::class.java) {
+            if (type.declaredMethods.any { it.name == name }) {
+                return true
+            }
+            type = type.superclass
+        }
+        return false
     }
 
     /**
