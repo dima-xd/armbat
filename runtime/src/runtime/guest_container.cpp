@@ -171,6 +171,204 @@ std::vector<unsigned char> ReadWholeFile(const std::string& path) {
     bytes.resize(filled);
     return bytes;
 }
+// The pthread key API has to answer in one key format for every caller inside
+// an image. The device's libc is a modern bionic build whose pthread keys carry
+// the high bit (0x80000000|index), while the archives this container runs were
+// built against bionic versions whose keys are plain small integers -- and the
+// s3e runtime of a Marmalade archive stores the key plus one and later asks for
+// the key, so a modern key turns into an out-of-range slot, the per-thread
+// pointer reads back null and the archive dies dereferencing it. The guest
+// linker binds an archive's imports straight to the device libc, so the four
+// key functions are rebound here instead: the GOT cells they landed in are
+// rewritten to the same-named HLE stubs, whose keys are plain integers for
+// every guest. Only the archive's own imports are touched; whatever libc uses
+// internally keeps its own implementation.
+constexpr std::uint32_t kPthreadKeyRelSize = 8;
+constexpr std::uint32_t kRArmJumpSlot = 21;
+
+bool PatchPthreadKeyImports(const std::vector<unsigned char>& image, GuestArena& arena,
+                            HleRegistry& hle, std::uint32_t handle,
+                            const std::function<std::uint32_t(const std::string&)>& dlsym,
+                            unsigned* patched) {
+    *patched = 0;
+    if (image.size() < 52) {
+        return false;
+    }
+    const auto read16 = [&image](std::size_t at) {
+        return static_cast<std::uint16_t>(image[at]) |
+               (static_cast<std::uint16_t>(image[at + 1]) << 8);
+    };
+    const auto read32 = [&image](std::size_t at) {
+        std::uint32_t value = 0;
+        std::memcpy(&value, image.data() + at, sizeof(value));
+        return value;
+    };
+    const std::uint32_t phoff = read32(28);
+    const std::uint16_t phentsize = read16(42);
+    const std::uint16_t phnum = read16(44);
+    if (phoff == 0 || phnum == 0 ||
+        phoff + static_cast<std::size_t>(phnum) * phentsize > image.size()) {
+        return false;
+    }
+
+    // Virtual address to file offset, through the load segments the image
+    // declares. The dynamic tables are file-backed, so a miss here means an
+    // image the container does not want to touch.
+    std::uint32_t dynamic_at = 0;
+    std::uint32_t dynamic_size = 0;
+    const auto file_offset = [&](std::uint32_t vaddr) -> std::size_t {
+        for (std::uint16_t i = 0; i < phnum; ++i) {
+            const std::size_t ph = phoff + static_cast<std::size_t>(i) * phentsize;
+            const std::uint32_t type = read32(ph);
+            if (type != 1 /* PT_LOAD */) {
+                if (type == 2 /* PT_DYNAMIC */) {
+                    dynamic_at = read32(ph + 8);
+                    dynamic_size = read32(ph + 16);
+                }
+                continue;
+            }
+            const std::uint32_t offset = read32(ph + 4);
+            const std::uint32_t begin = read32(ph + 8);
+            const std::uint32_t filesz = read32(ph + 16);
+            if (vaddr >= begin && vaddr - begin < filesz) {
+                return offset + (vaddr - begin);
+            }
+        }
+        return static_cast<std::size_t>(-1);
+    };
+    (void)file_offset(0);
+    if (dynamic_at == 0 || dynamic_size == 0 ||
+        dynamic_at + dynamic_size > image.size()) {
+        return false;
+    }
+
+    std::uint32_t jmprel = 0;
+    std::uint32_t pltrelsz = 0;
+    std::uint32_t symtab = 0;
+    std::uint32_t strtab = 0;
+    std::uint32_t syment = 16;
+    for (std::uint32_t at = dynamic_at; at + 8 <= dynamic_at + dynamic_size; at += 8) {
+        const std::uint32_t tag = read32(at);
+        const std::uint32_t value = read32(at + 4);
+        if (tag == 0) {
+            break;
+        }
+        switch (tag) {
+        case 5: strtab = value; break;    /* DT_STRTAB */
+        case 6: symtab = value; break;    /* DT_SYMTAB */
+        case 11: syment = value; break;   /* DT_SYMENT */
+        case 23: jmprel = value; break;   /* DT_JMPREL */
+        case 2: pltrelsz = value; break;  /* DT_PLTRELSZ */
+        default: break;
+        }
+    }
+    if (jmprel == 0 || pltrelsz == 0 || symtab == 0 || strtab == 0 || syment != 16) {
+        return false;
+    }
+
+    // The load bias: an exported symbol the guest linker answers and the
+    // address the file claims for it differ by exactly the base the image was
+    // mapped at.
+    std::uint32_t base = 0;
+    bool have_base = false;
+    const std::size_t strtab_off = file_offset(strtab);
+    const std::size_t symtab_off = file_offset(symtab);
+    if (strtab_off == static_cast<std::size_t>(-1) ||
+        symtab_off == static_cast<std::size_t>(-1)) {
+        return false;
+    }
+    for (std::size_t sym = 0; symtab_off + (sym + 1) * 16 <= image.size() && !have_base;
+         ++sym) {
+        const std::size_t at = symtab_off + sym * 16;
+        const std::uint32_t value = read32(at + 4);
+        const std::uint16_t shndx = read16(at + 14);
+        if (value == 0 || shndx == 0 || shndx >= 0xff00) {
+            continue;
+        }
+        const std::uint32_t name_at = read32(at);
+        if (name_at == 0) {
+            continue;
+        }
+        std::size_t end = strtab_off + name_at;
+        while (end < image.size() && image[end] != 0 && end - (strtab_off + name_at) < 128) {
+            ++end;
+        }
+        if (end >= image.size() || image[end] != 0) {
+            continue;
+        }
+        const std::string name(reinterpret_cast<const char*>(image.data()) + strtab_off + name_at,
+                               end - (strtab_off + name_at));
+        if (name.empty()) {
+            continue;
+        }
+        const std::uint32_t address = dlsym(name);
+        if (address != 0 && address > value) {
+            base = address - value;
+            have_base = true;
+        }
+    }
+    if (!have_base) {
+        return false;
+    }
+
+    const std::size_t rel_off = file_offset(jmprel);
+    if (rel_off == static_cast<std::size_t>(-1) ||
+        rel_off + pltrelsz > image.size()) {
+        return false;
+    }
+    static const char* const kKeyNames[] = {
+        "pthread_key_create", "pthread_key_delete", "pthread_setspecific",
+        "pthread_getspecific",
+    };
+    unsigned count = 0;
+    for (std::uint32_t at = 0; at + kPthreadKeyRelSize <= pltrelsz;
+         at += kPthreadKeyRelSize) {
+        const std::uint32_t info = read32(rel_off + at + 4);
+        if ((info & 0xff) != kRArmJumpSlot) {
+            continue;
+        }
+        const std::uint32_t sym_index = info >> 8;
+        const std::size_t sym_at = symtab_off + static_cast<std::size_t>(sym_index) * 16;
+        if (sym_at + 16 > image.size()) {
+            continue;
+        }
+        const std::uint32_t name_at = read32(sym_at);
+        if (strtab_off + name_at >= image.size()) {
+            continue;
+        }
+        std::size_t end = strtab_off + name_at;
+        while (end < image.size() && image[end] != 0 && end - (strtab_off + name_at) < 128) {
+            ++end;
+        }
+        if (end >= image.size() || image[end] != 0) {
+            continue;
+        }
+        const std::string name(reinterpret_cast<const char*>(image.data()) + strtab_off + name_at,
+                               end - (strtab_off + name_at));
+        bool wanted = false;
+        for (const char* wanted_name : kKeyNames) {
+            if (name == wanted_name) {
+                wanted = true;
+                break;
+            }
+        }
+        if (!wanted) {
+            continue;
+        }
+        const std::uint32_t stub = hle.Resolve(name);
+        if (stub == 0) {
+            continue;
+        }
+        const std::uint32_t got = base + read32(rel_off + at);
+        if (!arena.IsMapped(got, 4)) {
+            continue;
+        }
+        std::memcpy(arena.Ptr(got), &stub, sizeof(stub));
+        ++count;
+    }
+    *patched = count;
+    return true;
+}
 
 // Replaces a small text file in the container's own directory. The files that
 // describe the emulated device to the guest are written this way: they are
@@ -2018,6 +2216,23 @@ std::string GuestContainer::LoadApk(const std::string& apk_path, const std::stri
         if (on_load != 0) {
             impl_->on_load.push_back(PendingOnLoad{library.file, library.soname, on_load});
         }
+        // Rebind the pthread key API before anything in the image runs: the
+        // first key the archive creates must come from the implementation the
+        // image will later read back through, and the guest linker has just
+        // bound all four names to the device libc instead.
+        const std::vector<unsigned char> patch_image = ReadWholeFile(path);
+        unsigned key_imports = 0;
+        if (PatchPthreadKeyImports(patch_image, impl_->arena, *impl_->hle, handle,
+                                   [this, handle](const std::string& name) {
+                                       return impl_->bionic->Dlsym(handle, name);
+                                   },
+                                   &key_imports) &&
+            key_imports != 0) {
+            ARMBAT_LOG_INFO("Armbat",
+                                "startup: %s pthread key imports rebound (%u)",
+                                library.file.c_str(), key_imports);
+            report += "  pthread key imports rebound: " + std::to_string(key_imports) + "\n";
+        }
         impl_->bionic_handles.push_back(handle);
         impl_->loaded_libraries.push_back(
             Impl::LoadedLibrary{handle, path, library.file, library.soname, on_load});
@@ -2025,7 +2240,7 @@ std::string GuestContainer::LoadApk(const std::string& apk_path, const std::stri
         // the host runtime so the archive's Java side can call its own native
         // methods. Their names come from the file, their addresses from the
         // guest's linker.
-        const std::vector<unsigned char> image = ReadWholeFile(path);
+        const std::vector<unsigned char>& image = patch_image;
         std::size_t java_symbols = 0;
         for (const std::string& name : ReadDynamicFunctionNames(image.data(), image.size())) {
             if (name.rfind("Java_", 0) != 0) {
