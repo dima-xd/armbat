@@ -537,7 +537,12 @@ class GuestLauncher(private val host: Activity) {
                 ArmbatLog.i(TAG, "bindService refused: ${service.`package` ?: service.action} is not part of this device")
                 return false
             }
-            return super.bindService(service, conn, flags)
+            return try {
+                super.bindService(service, conn, flags)
+            } catch (error: IllegalArgumentException) {
+                refusedService(service)
+                false
+            }
         }
 
         override fun startService(service: Intent): ComponentName? {
@@ -545,7 +550,41 @@ class GuestLauncher(private val host: Activity) {
                 ArmbatLog.i(TAG, "startService refused: ${service.`package` ?: service.action} is not part of this device")
                 return null
             }
-            return super.startService(service)
+            return try {
+                super.startService(service)
+            } catch (error: IllegalArgumentException) {
+                refusedService(service)
+                null
+            }
+        }
+
+        /**
+         * A service the platform refuses before it starts.
+         *
+         * Android 5 refuses an intent that names no component: a service must be
+         * explicit from that release on, and an archive written earlier asks by
+         * action -- its push registration above all (NFS Most Wanted asks the
+         * C2DM service by name in its first onCreate). The container has no
+         * service behind the action, and the platform's own refusal kills the
+         * launch, so the answer is the one a device without the service gives:
+         * the call does nothing, the callback the caller waits for never comes,
+         * and the caller's own fallback takes over.
+         */
+        private fun refusedService(service: Intent) {
+            ArmbatLog.i(TAG, "startService refused: ${service.`package` ?: service.action} has no service on this device")
+        }
+
+        override fun startForegroundService(service: Intent): ComponentName? {
+            if (isUnavailableService(service)) {
+                ArmbatLog.i(TAG, "startService refused: ${service.`package` ?: service.action} is not part of this device")
+                return null
+            }
+            return try {
+                super.startForegroundService(service)
+            } catch (error: IllegalArgumentException) {
+                refusedService(service)
+                null
+            }
         }
 
         /**
