@@ -38,6 +38,7 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.net.URL
+import java.lang.reflect.Method
 import java.util.zip.ZipFile
 import kotlin.math.min
 
@@ -1822,6 +1823,13 @@ class GuestLauncher(private val host: Activity) {
         resultCode: Int,
         data: Intent,
     ) {
+        val names = data.getStringArrayExtra(EXTRA_REQUEST_PERMISSIONS_NAMES)
+            ?: arrayOf<String>()
+        val grants = data.getIntArrayExtra(EXTRA_REQUEST_PERMISSIONS_RESULTS)
+            ?: IntArray(names.size)
+
+        // First: the platform's own dispatcher, which knows the whole who
+        // prefix protocol and clears the request bookkeeping.
         val method = Activity::class.java.declaredMethods.firstOrNull { candidate ->
             candidate.name == "dispatchActivityResult" &&
                 candidate.parameterTypes.size >= 4 &&
@@ -1830,25 +1838,75 @@ class GuestLauncher(private val host: Activity) {
                 candidate.parameterTypes[2] == Integer.TYPE &&
                 candidate.parameterTypes[3] == Intent::class.java
         }
-        if (method == null) {
-            ArmbatLog.w(TAG, "guest permission result: no dispatchActivityResult")
-            return
-        }
-        method.isAccessible = true
-        val arguments = arrayOfNulls<Any?>(method.parameterTypes.size)
-        arguments[0] = who
-        arguments[1] = requestCode
-        arguments[2] = resultCode
-        arguments[3] = data
-        for (index in 4 until arguments.size) {
-            arguments[index] = when (method.parameterTypes[index]) {
-                String::class.java -> "armbat"
-                Integer.TYPE -> 0
-                else -> null
+        if (method != null) {
+            method.isAccessible = true
+            val arguments = arrayOfNulls<Any?>(method.parameterTypes.size)
+            arguments[0] = who
+            arguments[1] = requestCode
+            arguments[2] = resultCode
+            arguments[3] = data
+            for (index in 4 until arguments.size) {
+                arguments[index] = when (method.parameterTypes[index]) {
+                    String::class.java -> "armbat"
+                    Integer.TYPE -> 0
+                    else -> null
+                }
             }
+            if (runCatching { method.invoke(activity, *arguments) }.isSuccess) {
+                return
+            }
+            ArmbatLog.w(TAG, "guest permission result dispatch: refused")
+        } else {
+            ArmbatLog.w(TAG, "guest permission result: no dispatchActivityResult")
         }
-        runCatching { method.invoke(activity, *arguments) }
-            .onFailure { ArmbatLog.w(TAG, "guest permission result dispatch: $it") }
+
+        // Fallback: a release whose dispatcher changed shape. Resolve the
+        // fragment the request came from through the activity's own fragment
+        // manager and hand it the answer the framework would have.
+        val fragmentWho = who
+            ?.takeIf { it.startsWith(PERMISSION_WHO_PREFIX) }
+            ?.removePrefix(PERMISSION_WHO_PREFIX)
+        if (!fragmentWho.isNullOrEmpty()) {
+            val fragment = runCatching {
+                val find = findMethod(activity.fragmentManager, "findFragmentByWho", String::class.java)
+                find?.invoke(activity.fragmentManager, fragmentWho) as? android.app.Fragment
+            }.getOrNull()
+            if (fragment != null) {
+                runCatching {
+                    fragment.onRequestPermissionsResult(requestCode, names, grants)
+                }.onFailure { ArmbatLog.w(TAG, "guest permission result to fragment: $it") }
+                return
+            }
+            ArmbatLog.w(TAG, "guest permission result: no fragment $fragmentWho")
+        }
+
+        // Last resort: the activity takes the answer itself, the way a
+        // request made from the activity body would.
+        runCatching {
+            activity.onRequestPermissionsResult(requestCode, names, grants)
+        }.onFailure { ArmbatLog.w(TAG, "guest permission result to activity: $it") }
+    }
+
+    /**
+     * Finds a method by name and parameter types on the object's runtime type
+     * or any of its superclasses, whatever its visibility: the fragment
+     * manager's resolver is package-private on several releases.
+     */
+    private fun findMethod(instance: Any, name: String, vararg parameters: Class<*>): Method? {
+        var type: Class<*>? = instance.javaClass
+        while (type != null && type != Any::class.java) {
+            val method = type.declaredMethods.firstOrNull { candidate ->
+                candidate.name == name &&
+                    candidate.parameterTypes.size == parameters.size &&
+                    parameters.indices.all { index -> candidate.parameterTypes[index] == parameters[index] }
+            }
+            if (method != null) {
+                method.isAccessible = true
+                return method
+            }
+            type = type.superclass
+        }
+        return null
     }
 
     /**
@@ -2710,6 +2768,12 @@ class GuestLauncher(private val host: Activity) {
         // land on the copies the container already loaded, not on the 64-bit
         // stand-ins the host class loader needs.
         const val GUEST_LIBRARY_DIR = "/armbat/app-libs"
+        /**
+         * The prefix the platform puts on a permission request's result
+         * address; the suffix is the fragment's own identity (empty when the
+         * activity itself asked).
+         */
+        const val PERMISSION_WHO_PREFIX = "@android:requestPermissions:"
         // The frame rate the guest's era assumes. Every archive the container
         // can run is 32-bit, so none of them was written for a faster panel: the
         // engine advances its simulation once per presented frame and counts on
