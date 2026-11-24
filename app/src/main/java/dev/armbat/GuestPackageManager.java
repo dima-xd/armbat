@@ -422,9 +422,26 @@ final class GuestPackageManager extends PackageManager {
      * on the spot. The container's own package manager knows the controller;
      * the request itself is answered inside the container before the intent
      * is ever started (see GuestLauncher).
+     *
+     * The method is as hidden as the intent builder, so the answer is asked
+     * through reflection -- the same rule the rationale query below follows.
+     * A platform that has neither the method nor the request path it feeds
+     * (the builder named no controller before Android 13) is answered with
+     * the container's own package: the intent stays well formed, and the
+     * request itself never reaches the platform anyway.
      */
     public String getPermissionControllerPackageName() {
-        return base.getPermissionControllerPackageName();
+        try {
+            java.lang.reflect.Method method = PackageManager.class.getMethod(
+                    "getPermissionControllerPackageName");
+            Object answer = method.invoke(base);
+            if (answer instanceof String) {
+                return (String) answer;
+            }
+        } catch (ReflectiveOperationException | RuntimeException unreachable) {
+            // Fall through to the container's own package.
+        }
+        return hostPackage;
     }
 
     /**
