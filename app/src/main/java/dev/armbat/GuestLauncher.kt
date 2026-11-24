@@ -883,6 +883,37 @@ class GuestLauncher(private val host: Activity) {
             host.startActivity(intent, options)
             return null
         }
+
+        /**
+         * The result-carrying form of the same door. Activity.startActivityForResult
+         * called with a who prefix -- which is what a runtime permission request
+         * goes through, whatever asked it: a fragment, or the activity itself --
+         * hands the intent here with a String instead of an Activity as the
+         * target. A request the container answers itself (see
+         * [answerPermissionRequest]) never leaves the process; everything else
+         * goes where the other form takes it.
+         */
+        @Suppress("UNUSED_PARAMETER")
+        fun execStartActivity(
+            who: Context,
+            contextThread: IBinder?,
+            token: IBinder?,
+            target: String?,
+            intent: Intent,
+            requestCode: Int,
+            options: android.os.Bundle?,
+        ): Instrumentation.ActivityResult? {
+            if (intent.action == ACTION_REQUEST_PERMISSIONS) {
+                answerPermissionRequest(who, target, intent, requestCode)
+                return null
+            }
+            if (startGuestActivity(intent, requestCode)) {
+                return null
+            }
+            ArmbatLog.i(TAG, "guest startActivity leaves the container: $intent")
+            host.startActivity(intent, options)
+            return null
+        }
     }
 
     private val instrumentation by lazy { GuestInstrumentation() }
@@ -1683,6 +1714,102 @@ class GuestLauncher(private val host: Activity) {
         forwarded.component = ComponentName(session.prepared.packageName, className)
         request(Action.Start(className, forwarded, requestCode))
         return true
+    }
+
+    /**
+     * Answers a runtime permission request an archive made, without leaving
+     * the container.
+     *
+     * The request would otherwise go to the platform's permission controller
+     * as the container: a dialog about the container's own permissions, most
+     * of which it does not declare, and a result the platform hands to the
+     * activity its token belongs to -- the host's, not the guest's -- so the
+     * fragment that asked never hears back and stops where it started. The
+     * guest is answered the same way its own checks are answered (see
+     * GuestContext): storage comes from all files access, everything else from
+     * the grant the container itself holds.
+     */
+    private fun answerPermissionRequest(
+        caller: Context,
+        resultWho: String?,
+        intent: Intent,
+        requestCode: Int,
+    ) {
+        val activity = caller as? Activity
+        if (activity == null) {
+            ArmbatLog.w(TAG, "guest permission request without an activity: $caller")
+            return
+        }
+        val names = intent.getStringArrayExtra(EXTRA_REQUEST_PERMISSIONS_NAMES)
+            ?: arrayOf<String>()
+        val context = session?.context
+        val grants = IntArray(names.size) { index ->
+            if (context != null &&
+                context.checkSelfPermission(names[index]) == PackageManager.PERMISSION_GRANTED
+            ) {
+                PackageManager.PERMISSION_GRANTED
+            } else {
+                PackageManager.PERMISSION_DENIED
+            }
+        }
+        ArmbatLog.i(
+            TAG,
+            "guest permission request answered: ${names.joinToString()} -> " +
+                grants.joinToString(),
+        )
+        val result = Intent()
+        result.putExtra(EXTRA_REQUEST_PERMISSIONS_NAMES, names)
+        result.putExtra(EXTRA_REQUEST_PERMISSIONS_RESULTS, grants)
+        // The request arrives from a fragment's onCreate, mid transaction, so
+        // the callback is dispatched once that transaction has unwound -- the
+        // way the platform's own round trip would have delivered it.
+        activity.runOnUiThread {
+            dispatchActivityResult(activity, resultWho, requestCode, Activity.RESULT_OK, result)
+        }
+    }
+
+    /**
+     * Runs the activity's own result dispatch: the private method the platform
+     * routes every startForActivity result through, which resolves the who
+     * prefix to the fragment that asked and calls its
+     * onRequestPermissionsResult. Reflection because the method is hidden and
+     * its parameter list grew a reason string (and a caller record) between
+     * releases; the first four parameters have been stable since API 1.
+     */
+    private fun dispatchActivityResult(
+        activity: Activity,
+        who: String?,
+        requestCode: Int,
+        resultCode: Int,
+        data: Intent,
+    ) {
+        val method = Activity::class.java.declaredMethods.firstOrNull { candidate ->
+            candidate.name == "dispatchActivityResult" &&
+                candidate.parameterTypes.size >= 4 &&
+                candidate.parameterTypes[0] == String::class.java &&
+                candidate.parameterTypes[1] == Integer.TYPE &&
+                candidate.parameterTypes[2] == Integer.TYPE &&
+                candidate.parameterTypes[3] == Intent::class.java
+        }
+        if (method == null) {
+            ArmbatLog.w(TAG, "guest permission result: no dispatchActivityResult")
+            return
+        }
+        method.isAccessible = true
+        val arguments = arrayOfNulls<Any?>(method.parameterTypes.size)
+        arguments[0] = who
+        arguments[1] = requestCode
+        arguments[2] = resultCode
+        arguments[3] = data
+        for (index in 4 until arguments.size) {
+            arguments[index] = when (method.parameterTypes[index]) {
+                String::class.java -> "armbat"
+                Integer.TYPE -> 0
+                else -> null
+            }
+        }
+        runCatching { method.invoke(activity, *arguments) }
+            .onFailure { ArmbatLog.w(TAG, "guest permission result dispatch: $it") }
     }
 
     /**
@@ -2527,6 +2654,15 @@ class GuestLauncher(private val host: Activity) {
 
     private companion object {
         const val TAG = "Armbat"
+        // The intent the platform builds for a runtime permission request (see
+        // PackageManager.buildRequestPermissionsIntent) and the extras it
+        // carries. All three are @SystemApi constants the public SDK does not
+        // ship, like the method that reads the controller's package from them.
+        const val ACTION_REQUEST_PERMISSIONS = "android.content.pm.action.REQUEST_PERMISSIONS"
+        const val EXTRA_REQUEST_PERMISSIONS_NAMES =
+            "android.content.pm.extra.REQUEST_PERMISSIONS_NAMES"
+        const val EXTRA_REQUEST_PERMISSIONS_RESULTS =
+            "android.content.pm.extra.REQUEST_PERMISSIONS_RESULTS"
         const val NATIVE_ACTIVITY = "android.app.NativeActivity"
         const val TELEPHONY_MANAGER = "android.telephony.TelephonyManager"
         const val STUB_LIBRARY = "libguestsdk.so"
