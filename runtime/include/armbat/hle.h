@@ -106,6 +106,12 @@ public:
     // Guest address of the stub for `name`, or 0 if this name is not implemented.
     std::uint32_t Resolve(std::string_view name) const;
 
+    // Runs the named import against [machine], as if guest code had trapped
+    // into its stub. The container's own shim for the pthread key API arrives
+    // through a private syscall instead of the stub page, and the machine's
+    // registers already hold the forwarded arguments.
+    bool DispatchByName(const std::string& name, A32Machine& machine);
+
     // Name of the most recent HLE call. A hang report is far more useful with the
     // import that was executing than with a bare PC. Returns a copy: the caller
     // is usually another thread, and Dispatch must not hand out a reference to a

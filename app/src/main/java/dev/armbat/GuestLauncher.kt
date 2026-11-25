@@ -920,8 +920,9 @@ class GuestLauncher(private val host: Activity) {
                 return null
             }
             ArmbatLog.i(TAG, "guest startActivity leaves the container: $intent")
-            host.startActivity(intent, options)
-            return null
+            return delegateToFramework(
+                Activity::class.java, who, contextThread, token, target, intent, requestCode, options,
+            )
         }
 
         /**
@@ -951,12 +952,85 @@ class GuestLauncher(private val host: Activity) {
                 return null
             }
             ArmbatLog.i(TAG, "guest startActivity leaves the container: $intent")
-            host.startActivity(intent, options)
-            return null
+            return delegateToFramework(
+                String::class.java, who, contextThread, token, target, intent, requestCode, options,
+            )
+        }
+
+        /**
+         * A start the container does not host keeps the framework's own result
+         * routing: the original Instrumentation carries the caller's token, the
+         * resultWho prefix and the requestCode to ActivityManager, so a result
+         * comes back to the exact activity (or fragment) that asked. Sending
+         * such a start through the container's activity loses that routing, and
+         * the caller waits for a result nobody delivers.
+         */
+        private fun delegateToFramework(
+            targetClass: Class<*>,
+            who: Context,
+            contextThread: IBinder?,
+            token: IBinder?,
+            target: Any?,
+            intent: Intent,
+            requestCode: Int,
+            options: android.os.Bundle?,
+        ): Instrumentation.ActivityResult? {
+            val framework = frameworkInstrumentation
+            if (framework == null || framework === this@GuestInstrumentation) {
+                host.startActivity(intent, options)
+                return null
+            }
+            val method = runCatching {
+                Instrumentation::class.java.getDeclaredMethod(
+                    "execStartActivity",
+                    Context::class.java,
+                    IBinder::class.java,
+                    IBinder::class.java,
+                    targetClass,
+                    Intent::class.java,
+                    Integer.TYPE,
+                    android.os.Bundle::class.java,
+                )
+            }.getOrNull()
+            if (method == null) {
+                ArmbatLog.w(TAG, "guest startActivity: no framework dispatcher")
+                host.startActivity(intent, options)
+                return null
+            }
+            method.isAccessible = true
+            val result = runCatching {
+                method.invoke(
+                    framework,
+                    who,
+                    contextThread,
+                    token,
+                    target,
+                    intent,
+                    requestCode,
+                    options,
+                ) as? Instrumentation.ActivityResult
+            }.onFailure {
+                ArmbatLog.w(TAG, "guest startActivity delegation failed: $it")
+            }.getOrNull()
+            if (result == null) {
+                host.startActivity(intent, options)
+            }
+            return result
         }
     }
 
     private val instrumentation by lazy { GuestInstrumentation() }
+    /**
+     * The framework instrumentation the container's activity was born with. A
+     * start the archive does not own is handed back here, so an external
+     * activity keeps the platform's own result routing: the framework path
+     * carries the who prefix, the result target and the request code to the
+     * system, and the answer returns through the same path (see
+     * [dispatchActivityResult]).
+     */
+    private val frameworkInstrumentation by lazy {
+        runCatching { readField(host, "mInstrumentation") as? Instrumentation }.getOrNull()
+    }
 
     /**
      * Everything a launch needs that does not touch the view hierarchy, done on
@@ -2790,6 +2864,20 @@ class GuestLauncher(private val host: Activity) {
         val method = policy.getDeclaredMethod("makeNewWindow", Context::class.java)
         method.isAccessible = true
         return method.invoke(null, context) as Window
+    }
+
+    private fun readField(target: Any, name: String): Any? {
+        var type: Class<*>? = target.javaClass
+        while (type != null) {
+            try {
+                val field = type.getDeclaredField(name)
+                field.isAccessible = true
+                return field.get(target)
+            } catch (missing: NoSuchFieldException) {
+                type = type.superclass
+            }
+        }
+        return null
     }
 
     private fun field(target: Any, name: String, value: Any?) {

@@ -276,6 +276,25 @@ armbat_embed_binary("${_guest_props_so}" "${_guest_props_header}" guest_props kP
 
 add_custom_target(guest_props DEPENDS "${_guest_props_header}")
 add_dependencies(armbat_core guest_props)
+# --- Guest pthread key shim ---------------------------------------------------
+# The pthread key API the container implements on the host side. The guest's
+# bionic keeps a key table of its own, whose key values carry an "in use" flag
+# the container's implementation never produces; a game that creates a key
+# through one table and reads it back through the other reads the wrong slot.
+# The shim is loaded ahead of the application and marked global, so the four
+# names the application imports bind to it during relocation, before any
+# constructor runs, and every caller sees the container's table.
+set(_guest_keys_so "${_guest_lib_dir}/libarmbat_keys.so")
+set(_guest_keys_flags ${ARMBAT_GUEST_LINKED_FLAGS} "-Wl,-z,global")
+armbat_guest_module("${_guest_keys_so}" "libarmbat_keys.so"
+    "${PROJECT_SOURCE_DIR}/runtime/guest/keys.c"
+    "${CMAKE_C_COMPILER}" "${_guest_keys_flags}")
+
+set(_guest_keys_header "${CMAKE_BINARY_DIR}/generated/guest_keys.h")
+armbat_embed_binary("${_guest_keys_so}" "${_guest_keys_header}" guest_keys kKeys)
+
+add_custom_target(guest_keys DEPENDS "${_guest_keys_header}")
+add_dependencies(armbat_core guest_keys)
 
 # --- Guest bionic sysroot ----------------------------------------------------
 # The guest runs the real Android userland: the linker from the ARMv7 system

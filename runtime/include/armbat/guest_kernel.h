@@ -85,6 +85,12 @@ public:
     void SetBootReadyHandler(std::function<void(std::uint32_t)> handler) {
         boot_ready_ = std::move(handler);
     }
+    // Called for the pthread key trap (r7 = 0x0f0103, r0 = subop, r1..r2 = the
+    // call's own arguments). The container answers through its HLE registry, so
+    // the wire only carries the numbers; the key table stays on the host side.
+    // Returns the guest's r0: the key id, the specific value, or an error.
+    using KeysTrap = std::function<std::int32_t(std::uint32_t, A32Machine&, const std::uint32_t*)>;
+    void SetKeysTrap(KeysTrap trap) { keys_trap_ = std::move(trap); }
 
     // Last syscall number that returned -ENOSYS: naming the missing call is the
     // difference between "libc is stuck" and "implement this one next".
@@ -237,6 +243,7 @@ private:
     PathMapper path_mapper_;
     std::string executable_path_;
     std::function<void(std::uint32_t)> boot_ready_;
+    KeysTrap keys_trap_;
     std::unordered_set<int> log_sockets_;
     // Bumped by every write to a regular file; a window carries the generation it
     // was filled at and is not used across one.
