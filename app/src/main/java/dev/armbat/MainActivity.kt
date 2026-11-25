@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.res.Configuration
 import android.net.Uri
 import android.os.Bundle
+import android.os.StatFs
 import android.view.KeyEvent
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
@@ -37,8 +38,11 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 
 /**
  * The launcher: imported archives on a page grid, a dock, and the three soft
@@ -360,6 +364,15 @@ class MainActivity : ComponentActivity() {
         var widescreen by remember { mutableStateOf(GuestScreen.widescreen(context)) }
         var resolution by remember { mutableStateOf(GuestScreen.resolution(context, null)) }
         var screenRate by remember { mutableStateOf(GuestScreen.refreshRate(context, null)) }
+        // Data import: the two files a game needs besides its own archive, which
+        // a current platform no longer lets a file manager place by hand.
+        var zipQueue by remember { mutableStateOf<List<Pair<Uri, String>>>(emptyList()) }
+        var zipApp by remember { mutableStateOf<ApkInfo?>(null) }
+        var zipTarget by remember { mutableStateOf(GuestData.Target.ROOT) }
+        var dataName by remember { mutableStateOf("") }
+        // -1 when nothing is being written; the panel reads it as a percentage.
+        var dataPercent by remember { mutableStateOf(-1) }
+        var dataJob by remember { mutableStateOf<Job?>(null) }
         var channel by remember { mutableStateOf(Updates.channel(context)) }
         var updateStatus by remember { mutableStateOf<Updates.Status>(Updates.Status.Idle) }
         var updateOffer by remember { mutableStateOf<Updates.Update?>(null) }
@@ -619,6 +632,197 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        /**
+         * Places an expansion file next to the game it names.
+         *
+         * The name carries a package and a version, but the version in it is
+         * whatever the site the file came from shipped. A game looks its
+         * expansion file up by the version code it reads from its own
+         * application info, and the container reports the archive's code there;
+         * the copy is therefore named after that code. Without the rename the
+         * file sits on disk and the game never opens it.
+         */
+        suspend fun placeExpansion(
+            expansion: GuestData.Expansion,
+            name: String,
+            uri: Uri,
+        ) {
+            val app = apps.firstOrNull { it.packageName == expansion.packageName }
+            if (app == null) {
+                notice = Notice(
+                    context.getString(R.string.data_no_package, name, expansion.packageName),
+                )
+                return
+            }
+            @Suppress("DEPRECATION")
+            val code = runCatching {
+                this@MainActivity.packageManager.getPackageArchiveInfo(app.path, 0)?.versionCode
+            }.getOrNull() ?: expansion.version.toIntOrNull()
+            if (code == null) {
+                notice = Notice(context.getString(R.string.data_failed, name))
+                return
+            }
+            val directory = GuestStorage.obbDir(expansion.packageName)
+            val target = File(directory, "${expansion.kind}.$code.${expansion.packageName}.obb")
+            val expected = GuestData.size(this@MainActivity, uri)
+            val free = runCatching { StatFs(directory.absolutePath).availableBytes }
+                .getOrDefault(Long.MAX_VALUE)
+            if (expected > 0 && free < expected + FREE_MARGIN) {
+                notice = Notice(context.getString(R.string.data_no_space, name))
+                return
+            }
+            directory.mkdirs()
+            dataName = name
+            dataPercent = 0
+            val done = withContext(Dispatchers.IO) {
+                val input = runCatching { context.contentResolver.openInputStream(uri) }.getOrNull()
+                if (input == null) {
+                    return@withContext false
+                }
+                GuestData.copy(input, target, expected, cancelled = { !isActive }) { percent ->
+                    dataPercent = percent
+                }
+            }
+            // Stopped from the panel: there is no result to report, and the
+            // .part file is already gone.
+            if (dataJob?.isActive != true) {
+                return
+            }
+            dataPercent = -1
+            if (done) {
+                // The game looks the file up by its own version code and reads
+                // no other one, so a copy named after the previous version is
+                // dead weight rather than a spare. It is removed only once the
+                // new file is in place: a failed copy must not take the working
+                // file with it.
+                directory.listFiles { file ->
+                    file.name.startsWith("${expansion.kind}.") && file.name.endsWith(".obb")
+                }?.forEach { if (it != target) it.delete() }
+            }
+            notice = if (done) {
+                Notice(context.getString(R.string.data_done_obb, name))
+            } else {
+                Notice(context.getString(R.string.data_failed, name))
+            }
+        }
+
+        /**
+         * Unpacks a cache archive into the folder it was packed from.
+         *
+         * A game reads its cache through paths the container maps, so the four
+         * destinations are the four layouts that occur in the wild. The first
+         * one keeps the archive's own `Android/obb` and `Android/data` prefixes
+         * intact, which is how a cache is usually shipped.
+         */
+        suspend fun unpack(uri: Uri, name: String) {
+            val app = zipApp
+            if (zipTarget != GuestData.Target.ROOT && app == null) {
+                return
+            }
+            val directory = when (zipTarget) {
+                GuestData.Target.ROOT -> GuestStorage.root()
+                GuestData.Target.INTERNAL ->
+                    File(GuestStorage.dataDir(app!!.packageName), "files")
+
+                GuestData.Target.EXTERNAL -> GuestStorage.externalFilesDir(app!!.packageName)
+                GuestData.Target.DATA -> GuestStorage.dataDir(app!!.packageName)
+            }
+            val expected = GuestData.size(this@MainActivity, uri)
+            val free = runCatching { StatFs(directory.absolutePath).availableBytes }
+                .getOrDefault(Long.MAX_VALUE)
+            // The packed size of a zip says little about what it holds; three
+            // times is where a full volume stops being a surprise, and an
+            // archive that is actually bigger still fails cleanly.
+            if (expected > 0 && free < expected * 3 + FREE_MARGIN) {
+                notice = Notice(context.getString(R.string.data_no_space, name))
+                return
+            }
+            directory.mkdirs()
+            dataName = name
+            dataPercent = 0
+            val result = withContext(Dispatchers.IO) {
+                runCatching {
+                    val input = context.contentResolver.openInputStream(uri)
+                        ?: return@runCatching null
+                    input.use {
+                        GuestData.extract(
+                            it,
+                            directory,
+                            expected,
+                            cancelled = { !isActive },
+                        ) { percent -> dataPercent = percent }
+                    }
+                }.getOrNull()
+            }
+            if (dataJob?.isActive != true) {
+                return
+            }
+            dataPercent = -1
+            notice = when {
+                result == null -> Notice(context.getString(R.string.data_failed, name))
+                result.files == 0 -> Notice(context.getString(R.string.data_empty_zip, name))
+                else -> Notice(context.getString(R.string.data_done_zip, result.files))
+            }
+        }
+
+        /**
+         * Takes the files the picker returned: expansion files go in at once, a
+         * zip waits for the placement panel because only the user knows which
+         * game a random archive belongs to.
+         */
+        fun importData(uris: List<Uri>) {
+            if (uris.isEmpty() || !requireStorage()) {
+                return
+            }
+            dataJob = scope.launch {
+                try {
+                    val zips = mutableListOf<Pair<Uri, String>>()
+                    for (uri in uris) {
+                        val name = GuestData.displayName(this@MainActivity, uri) ?: continue
+                        val expansion = GuestData.expansion(name)
+                        when {
+                            expansion != null -> placeExpansion(expansion, name, uri)
+                            name.endsWith(".zip", ignoreCase = true) -> zips += uri to name
+                            else -> notice = Notice(
+                                context.getString(R.string.data_unknown, name),
+                            )
+                        }
+                    }
+                    if (zips.isNotEmpty()) {
+                        // A cache archive is usually renamed after its package,
+                        // and a library of one entry makes the answer obvious;
+                        // anything else is the user's choice in the panel.
+                        val first = zips.first()
+                        zipApp = apps.firstOrNull {
+                            first.second.contains(it.packageName, ignoreCase = true)
+                        } ?: apps.singleOrNull()
+                        zipTarget = GuestData.Target.ROOT
+                        zipQueue = zips
+                    }
+                } finally {
+                    dataPercent = -1
+                    dataJob = null
+                }
+            }
+        }
+
+        /** Places one archive of the queue; the panel then moves to the next. */
+        fun startUnpack(uri: Uri, name: String) {
+            dataJob = scope.launch {
+                try {
+                    unpack(uri, name)
+                } finally {
+                    dataPercent = -1
+                    dataJob = null
+                    zipQueue = zipQueue.filterNot { it.first == uri }
+                }
+            }
+        }
+
+        val dataPicker = rememberLauncherForActivityResult(
+            ActivityResultContracts.OpenMultipleDocuments(),
+        ) { uris -> importData(uris) }
+
         val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
             if (uri == null) return@rememberLauncherForActivityResult
             scope.launch { importArchive(uri) }
@@ -655,6 +859,9 @@ class MainActivity : ComponentActivity() {
             }
         }
         BackHandler(enabled = notice != null) { notice = null }
+        // A running copy is the newest thing on screen, so the back key stops it
+        // before it dismisses anything underneath.
+        BackHandler(enabled = dataPercent >= 0) { dataJob?.cancel() }
 
         Box(Modifier.fillMaxSize().background(HoloBlack)) {
             Column(
@@ -675,6 +882,7 @@ class MainActivity : ComponentActivity() {
                             onLaunch = { run(it) },
                             onDetails = { screen = Screen.Details(it) },
                             onAddApk = { picker.launch(arrayOf("*/*")) },
+                            onAddData = { dataPicker.launch(arrayOf("*/*")) },
                             onSettings = { screen = Screen.Settings },
                             onApps = { screen = Screen.Apps },
                         )
@@ -774,6 +982,27 @@ class MainActivity : ComponentActivity() {
                         )
                     }
 
+                    zipQueue.firstOrNull()?.let { (uri, name) ->
+                        DataDialog(
+                            fileName = name,
+                            apps = apps,
+                            app = zipApp,
+                            target = zipTarget,
+                            onApp = { zipApp = it },
+                            onTarget = { zipTarget = it },
+                            onUnpack = { startUnpack(uri, name) },
+                            onDismiss = { zipQueue = emptyList() },
+                        )
+                    }
+
+                    if (dataPercent >= 0) {
+                        DataProgressDialog(
+                            name = dataName,
+                            percent = dataPercent,
+                            onCancel = { dataJob?.cancel() },
+                        )
+                    }
+
                     // An alert of the updater (a failed download, a missing
                     // install permission) has to be readable over the offer that
                     // caused it, so it is drawn last.
@@ -810,5 +1039,12 @@ class MainActivity : ComponentActivity() {
     companion object {
         /** What the notification's close button asks this activity to do. */
         const val ACTION_CLOSE = "dev.armbat.CLOSE"
+
+        /**
+         * How much room an expansion file or an archive needs on top of its own
+         * size. A volume filled to the last byte makes the write fail halfway
+         * through, which is the one outcome the .part file cannot hide.
+         */
+        private const val FREE_MARGIN = 16L * 1024 * 1024
     }
 }

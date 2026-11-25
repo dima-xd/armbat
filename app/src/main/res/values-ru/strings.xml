@@ -102,4 +102,22 @@
     <string name="silence_hint">По одной записи на строку. Пусто — выключено.</string>
     <string name="silence_save">СОХРАНИТЬ</string>
     <string name="silence_reset">СБРОСИТЬ</string>
+    <string name="data_unpack_title">Добавить данные игры</string>
+    <string name="data_unpack_where">Куда распаковать</string>
+    <string name="data_unpack_app">Игра</string>
+    <string name="data_unpack">ДОБАВИТЬ</string>
+    <string name="data_unpack_need_app">Сначала импортируй APK игры</string>
+    <string name="data_target_root">Как в архиве (Android/obb, Android/data)</string>
+    <string name="data_target_internal">Внутренние файлы игры</string>
+    <string name="data_target_external">Внешние файлы игры</string>
+    <string name="data_target_data">Каталог данных игры</string>
+    <string name="data_progress_title">Копирование</string>
+    <string name="data_progress_percent">%1$d%%</string>
+    <string name="data_unknown">%1$s — не .obb и не .zip</string>
+    <string name="data_no_package">%1$s принадлежит %2$s, которого нет в библиотеке</string>
+    <string name="data_done_obb">%1$s добавлен</string>
+    <string name="data_done_zip">Добавлено файлов: %1$d</string>
+    <string name="data_empty_zip">В %1$s нечего распаковывать</string>
+    <string name="data_failed">Не удалось скопировать %1$s</string>
+    <string name="data_no_space">Недостаточно места для %1$s</string>
 </resources>

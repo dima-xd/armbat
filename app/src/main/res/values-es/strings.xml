@@ -100,4 +100,22 @@
     <string name="silence_hint">Una entrada por línea. Vacío significa desactivado.</string>
     <string name="silence_save">GUARDAR</string>
     <string name="silence_reset">RESTABLECER</string>
+    <string name="data_unpack_title">Añadir datos del juego</string>
+    <string name="data_unpack_where">Descomprimir en</string>
+    <string name="data_unpack_app">Juego</string>
+    <string name="data_unpack">AÑADIR</string>
+    <string name="data_unpack_need_app">Importa primero el APK del juego</string>
+    <string name="data_target_root">Como en el archivo (Android/obb, Android/data)</string>
+    <string name="data_target_internal">Archivos internos del juego</string>
+    <string name="data_target_external">Archivos externos del juego</string>
+    <string name="data_target_data">Carpeta de datos del juego</string>
+    <string name="data_progress_title">Copiando</string>
+    <string name="data_progress_percent">%1$d%%</string>
+    <string name="data_unknown">%1$s no es un .obb ni un .zip</string>
+    <string name="data_no_package">%1$s pertenece a %2$s, que no está en la biblioteca</string>
+    <string name="data_done_obb">%1$s añadido</string>
+    <string name="data_done_zip">%1$d archivos añadidos</string>
+    <string name="data_empty_zip">No hay nada que descomprimir en %1$s</string>
+    <string name="data_failed">No se pudo copiar %1$s</string>
+    <string name="data_no_space">No hay espacio para %1$s</string>
 </resources>

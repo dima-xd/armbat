@@ -101,4 +101,22 @@
     <string name="silence_hint">每行一条记录。留空即关闭。</string>
     <string name="silence_save">保存</string>
     <string name="silence_reset">重置</string>
+    <string name="data_unpack_title">添加游戏数据</string>
+    <string name="data_unpack_where">解压到</string>
+    <string name="data_unpack_app">游戏</string>
+    <string name="data_unpack">添加</string>
+    <string name="data_unpack_need_app">请先导入游戏的 APK</string>
+    <string name="data_target_root">按压缩包中的结构（Android/obb、Android/data）</string>
+    <string name="data_target_internal">游戏的内部文件</string>
+    <string name="data_target_external">游戏的外部文件</string>
+    <string name="data_target_data">游戏的数据目录</string>
+    <string name="data_progress_title">正在复制</string>
+    <string name="data_progress_percent">%1$d%%</string>
+    <string name="data_unknown">%1$s 不是 .obb 或 .zip</string>
+    <string name="data_no_package">%1$s 属于 %2$s，但应用库中没有它</string>
+    <string name="data_done_obb">已添加 %1$s</string>
+    <string name="data_done_zip">已添加 %1$d 个文件</string>
+    <string name="data_empty_zip">%1$s 中没有可解压的内容</string>
+    <string name="data_failed">无法复制 %1$s</string>
+    <string name="data_no_space">%1$s 空间不足</string>
 </resources>

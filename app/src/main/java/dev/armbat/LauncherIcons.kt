@@ -121,6 +121,73 @@ fun AddApkIcon(modifier: Modifier = Modifier) {
     }
 }
 
+/**
+ * An SD card: the expansion files and caches that do not fit inside an apk.
+ *
+ * It is a second gesture after the archive itself, which is why it is a second
+ * icon rather than a badge on the first: one tap brings the game in, another
+ * brings the gigabyte next to it.
+ */
+@Composable
+fun DataIcon(modifier: Modifier = Modifier) {
+    Canvas(modifier) {
+        val s = size.minDimension
+        val center = Offset(s / 2f, s / 2f)
+
+        drawCircle(
+            brush = Brush.radialGradient(
+                colors = listOf(Color(0xFF4B545A), Color(0xFF14181A)),
+                center = Offset(s * 0.34f, s * 0.28f),
+                radius = s * 0.85f,
+            ),
+            radius = s * 0.44f,
+            center = center,
+        )
+        drawCircle(
+            color = Color(0xFF77808A).copy(alpha = 0.75f),
+            radius = s * 0.44f,
+            center = center,
+            style = Stroke(width = s * 0.02f),
+        )
+
+        // The card, with the top-left corner cut the way the physical one is.
+        val cut = s * 0.10f
+        val left = center.x - s * 0.19f
+        val right = center.x + s * 0.19f
+        val top = center.y - s * 0.25f
+        val bottom = center.y + s * 0.25f
+        val card = Path().apply {
+            moveTo(left, top + cut)
+            lineTo(left + cut, top)
+            lineTo(right, top)
+            lineTo(right, bottom)
+            lineTo(left, bottom)
+            close()
+        }
+        drawPath(
+            path = card,
+            brush = Brush.linearGradient(
+                colors = listOf(Color(0xFFB9E3FF), Color(0xFF2C6E9E)),
+                start = Offset(left, top),
+                end = Offset(right, bottom),
+            ),
+        )
+        // The contacts, the only gold the era's icons used.
+        val pad = s * 0.048f
+        for (index in 0 until 4) {
+            drawRoundRect(
+                color = Color(0xFFE8C05A),
+                topLeft = Offset(
+                    left + s * 0.10f + index * (pad + s * 0.028f),
+                    top + s * 0.07f,
+                ),
+                size = Size(pad, s * 0.09f),
+                cornerRadius = CornerRadius(s * 0.012f),
+            )
+        }
+    }
+}
+
 @Composable
 fun SettingsIcon(modifier: Modifier = Modifier) {
     Canvas(modifier) {

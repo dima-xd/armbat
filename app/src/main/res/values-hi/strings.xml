@@ -99,4 +99,22 @@
     <string name="silence_hint">प्रति पंक्ति एक प्रविष्टि। खाली रहने पर बंद।</string>
     <string name="silence_save">सहेजें</string>
     <string name="silence_reset">रीसेट</string>
+    <string name="data_unpack_title">गेम डेटा जोड़ें</string>
+    <string name="data_unpack_where">कहाँ खोलें</string>
+    <string name="data_unpack_app">गेम</string>
+    <string name="data_unpack">जोड़ें</string>
+    <string name="data_unpack_need_app">पहले गेम का APK आयात करें</string>
+    <string name="data_target_root">ज़िप के अनुसार (Android/obb, Android/data)</string>
+    <string name="data_target_internal">गेम की आंतरिक फ़ाइलें</string>
+    <string name="data_target_external">गेम की बाहरी फ़ाइलें</string>
+    <string name="data_target_data">गेम का डेटा फ़ोल्डर</string>
+    <string name="data_progress_title">कॉपी हो रहा है</string>
+    <string name="data_progress_percent">%1$d%%</string>
+    <string name="data_unknown">%1$s न .obb है न .zip</string>
+    <string name="data_no_package">%1$s, %2$s का है, जो लाइब्रेरी में नहीं है</string>
+    <string name="data_done_obb">%1$s जोड़ा गया</string>
+    <string name="data_done_zip">%1$d फ़ाइलें जोड़ी गईं</string>
+    <string name="data_empty_zip">%1$s में खोलने के लिए कुछ नहीं है</string>
+    <string name="data_failed">%1$s कॉपी नहीं हो सका</string>
+    <string name="data_no_space">%1$s के लिए जगह नहीं है</string>
 </resources>

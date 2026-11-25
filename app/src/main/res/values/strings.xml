@@ -102,4 +102,22 @@
     <string name="silence_hint">One entry per line. Empty means off.</string>
     <string name="silence_save">SAVE</string>
     <string name="silence_reset">RESET</string>
+    <string name="data_unpack_title">Add game data</string>
+    <string name="data_unpack_where">Unpack to</string>
+    <string name="data_unpack_app">Game</string>
+    <string name="data_unpack">ADD</string>
+    <string name="data_unpack_need_app">Import the game APK first</string>
+    <string name="data_target_root">As packed (Android/obb, Android/data)</string>
+    <string name="data_target_internal">Internal files of the game</string>
+    <string name="data_target_external">External files of the game</string>
+    <string name="data_target_data">Data folder of the game</string>
+    <string name="data_progress_title">Copying</string>
+    <string name="data_progress_percent">%1$d%%</string>
+    <string name="data_unknown">%1$s is not an .obb or .zip</string>
+    <string name="data_no_package">%1$s belongs to %2$s, which is not in the library</string>
+    <string name="data_done_obb">%1$s added</string>
+    <string name="data_done_zip">Files added: %1$d</string>
+    <string name="data_empty_zip">Nothing to unpack in %1$s</string>
+    <string name="data_failed">Could not copy %1$s</string>
+    <string name="data_no_space">Not enough space for %1$s</string>
 </resources>

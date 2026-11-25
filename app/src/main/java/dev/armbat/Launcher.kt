@@ -280,6 +280,7 @@ fun HomeScreen(
     onLaunch: (ApkInfo) -> Unit,
     onDetails: (ApkInfo) -> Unit,
     onAddApk: () -> Unit,
+    onAddData: () -> Unit,
     onSettings: () -> Unit,
     onApps: () -> Unit,
 ) {
@@ -384,6 +385,7 @@ fun HomeScreen(
                 busy = busy,
                 onSearch = { searchFocus.requestFocus() },
                 onAddApk = onAddApk,
+                onAddData = onAddData,
                 onSettings = onSettings,
                 onApps = onApps,
             )
@@ -415,6 +417,7 @@ private fun Dock(
     busy: Boolean,
     onSearch: () -> Unit,
     onAddApk: () -> Unit,
+    onAddData: () -> Unit,
     onSettings: () -> Unit,
     onApps: () -> Unit,
 ) {
@@ -426,6 +429,7 @@ private fun Dock(
     ) {
         DockSlot(Modifier.weight(1f), onClick = onSearch) { SearchIcon(it) }
         DockSlot(Modifier.weight(1f), onClick = onAddApk) { AddApkIcon(it.alpha(if (busy) 0.5f else 1f)) }
+        DockSlot(Modifier.weight(1f), onClick = onAddData) { DataIcon(it.alpha(if (busy) 0.5f else 1f)) }
         DockSlot(Modifier.weight(1f), onClick = onSettings) { SettingsIcon(it) }
         DockSlot(Modifier.weight(1f), onClick = onApps) { AppsIcon(it) }
     }
@@ -1231,6 +1235,227 @@ private fun PackageRefreshRateDialog(
 private fun Modifier.scrim(): Modifier {
     val input = remember { MutableInteractionSource() }
     return clickable(interactionSource = input, indication = null, onClick = {})
+}
+
+/**
+ * Where a picked archive goes.
+ *
+ * A cache archive keeps the folder layout it was packed from, and the list names
+ * the four layouts that actually occur instead of showing a file tree. Three of
+ * them are addresses inside a game, so they carry the game as the second half of
+ * the address; the fourth needs no game, because the archive's own
+ * `Android/obb` and `Android/data` prefixes already name it.
+ */
+@Composable
+fun DataDialog(
+    fileName: String,
+    apps: List<ApkInfo>,
+    app: ApkInfo?,
+    target: GuestData.Target,
+    onApp: (ApkInfo) -> Unit,
+    onTarget: (GuestData.Target) -> Unit,
+    onUnpack: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var chooseApp by remember { mutableStateOf(false) }
+    var chooseTarget by remember { mutableStateOf(false) }
+    // A destination inside the game's own folders is only half an address: the
+    // other half is which game. The list asks for that half after the user picks
+    // such a destination, and never before -- "as packed" needs no game at all,
+    // because the archive's own Android/obb and Android/data prefixes already
+    // name it.
+    var pendingTarget by remember { mutableStateOf(GuestData.Target.ROOT) }
+    val needsApp = target != GuestData.Target.ROOT
+    val ready = !needsApp || app != null
+    val targetOptions = listOf(
+        GuestData.Target.ROOT to stringResource(R.string.data_target_root),
+        GuestData.Target.INTERNAL to stringResource(R.string.data_target_internal),
+        GuestData.Target.EXTERNAL to stringResource(R.string.data_target_external),
+        GuestData.Target.DATA to stringResource(R.string.data_target_data),
+    )
+    val targetLabel = targetOptions.first { it.first == target }.second
+    val targetSummary = if (needsApp) {
+        "$targetLabel · ${app?.label ?: stringResource(R.string.none)}"
+    } else {
+        targetLabel
+    }
+
+    Box(
+        Modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.65f))
+            .scrim(),
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(
+            Modifier
+                .width(300.dp)
+                .background(Color(0xFF232323))
+                .border(1.dp, Color(0xFF4A4A4A)),
+        ) {
+            Text(
+                stringResource(R.string.data_unpack_title),
+                color = HoloBlue,
+                fontSize = 17.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 18.dp, bottom = 4.dp),
+            )
+            Text(
+                fileName,
+                color = HoloDim,
+                fontSize = 12.sp,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(start = 20.dp, end = 20.dp, bottom = 8.dp),
+            )
+            HoloDivider()
+            SettingsRow(
+                title = stringResource(R.string.data_unpack_where),
+                summary = targetSummary,
+                onClick = { chooseTarget = true },
+            )
+            if (!ready) {
+                Text(
+                    stringResource(R.string.data_unpack_need_app),
+                    color = HoloRust,
+                    fontSize = 12.sp,
+                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 6.dp),
+                )
+            }
+            HoloDivider()
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 12.dp),
+                horizontalArrangement = Arrangement.End,
+            ) {
+                Text(
+                    stringResource(R.string.cancel),
+                    color = HoloBlue,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = 1.sp,
+                    modifier = Modifier
+                        .clickable(onClick = onDismiss)
+                        .padding(8.dp),
+                )
+                Spacer(Modifier.width(20.dp))
+                Text(
+                    stringResource(R.string.data_unpack),
+                    color = if (ready) HoloBlue else HoloDim,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = 1.sp,
+                    modifier = Modifier
+                        .clickable(enabled = ready, onClick = onUnpack)
+                        .padding(8.dp),
+                )
+            }
+        }
+
+        if (chooseTarget) {
+            ChoiceDialog(
+                title = stringResource(R.string.data_unpack_where),
+                options = targetOptions,
+                selected = target,
+                onPick = { picked ->
+                    chooseTarget = false
+                    when {
+                        // The archive's own layout needs no owner.
+                        picked == GuestData.Target.ROOT -> onTarget(picked)
+                        // A destination inside a game is applied together with
+                        // the game, so the archive never lands in the wrong
+                        // package's folder.
+                        apps.isNotEmpty() -> {
+                            pendingTarget = picked
+                            chooseApp = true
+                        }
+                        // An empty library has no game to attach to; the hint
+                        // under the row says what is missing.
+                        else -> onTarget(picked)
+                    }
+                },
+                onDismiss = { chooseTarget = false },
+            )
+        }
+
+        if (chooseApp) {
+            ChoiceDialog(
+                title = stringResource(R.string.data_unpack_app),
+                options = apps.map { it.packageName to it.label },
+                selected = app?.packageName.orEmpty(),
+                onPick = { packageName ->
+                    chooseApp = false
+                    apps.firstOrNull { it.packageName == packageName }?.let { picked ->
+                        onApp(picked)
+                        onTarget(pendingTarget)
+                    }
+                },
+                onDismiss = { chooseApp = false },
+            )
+        }
+    }
+}
+
+/**
+ * A copy in flight.
+ *
+ * An expansion file is the largest thing this application ever writes -- a
+ * gigabyte is normal -- so the shell cannot just freeze until it lands: the
+ * panel says how far it got and is the only way to stop it.
+ */
+@Composable
+fun DataProgressDialog(name: String, percent: Int, onCancel: () -> Unit) {
+    Box(
+        Modifier
+            .fillMaxSize()
+            .background(Color.Black.copy(alpha = 0.65f))
+            .scrim(),
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(
+            Modifier
+                .width(300.dp)
+                .background(Color(0xFF232323))
+                .border(1.dp, Color(0xFF4A4A4A)),
+        ) {
+            Text(
+                stringResource(R.string.data_progress_title),
+                color = HoloBlue,
+                fontSize = 17.sp,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 18.dp, bottom = 4.dp),
+            )
+            Text(
+                name,
+                color = HoloDim,
+                fontSize = 12.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.padding(horizontal = 20.dp),
+            )
+            Text(
+                stringResource(R.string.data_progress_percent, percent.coerceIn(0, 100)),
+                color = HoloText,
+                fontSize = 15.sp,
+                modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp),
+            )
+            HoloDivider()
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 12.dp),
+                horizontalArrangement = Arrangement.End,
+            ) {
+                Text(
+                    stringResource(R.string.cancel),
+                    color = HoloBlue,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = 1.sp,
+                    modifier = Modifier
+                        .clickable(onClick = onCancel)
+                        .padding(8.dp),
+                )
+            }
+        }
+    }
 }
 
 /** A list of exclusive choices in a panel, the way the platform of the era did it. */
