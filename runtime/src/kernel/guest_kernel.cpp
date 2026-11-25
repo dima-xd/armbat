@@ -12,12 +12,14 @@
 #include <cstring>
 #include <ctime>
 #include <mutex>
+#include <string_view>
 #include <vector>
 
 #include <android/fdsan.h>
 #include <android/log.h>
 
 #include "armbat/log.h"
+#include <dirent.h>
 #include <fcntl.h>
 #include <linux/futex.h>
 #include <net/if.h>
@@ -92,6 +94,9 @@ constexpr std::uint32_t kArmbatProperty = kArmNrBase + 0x102;
 // ARM uses the asm-generic syscall table, so these numbers are stable.
 enum SyscallNumber : std::uint32_t {
     kSysExit = 1,
+    // A game that downloads maps or mods into its own folder sets the working
+    // directory there and then names files relative to it.
+    kSysChdir = 12,
     kSysRead = 3,
     kSysWrite = 4,
     kSysOpen = 5,
@@ -366,6 +371,65 @@ ssize_t PreadFully(int fd, void* out, std::size_t count, off_t offset) {
         done += static_cast<std::size_t>(got);
     }
     return static_cast<ssize_t>(done);
+}
+
+// Shared storage decides a rename of a whole directory itself, and refuses trees
+// it considers unsupported with EPERM: the media provider lets a single entry
+// change its name, but not a directory carrying files without a media type. The
+// guest's own filesystem is a plain Linux one, where the same call is one atomic
+// step, and every application that stages a download in a scratch directory and
+// then moves it into place -- Unity's cache does exactly that -- breaks on the
+// refusal. Complete the move here: rename each entry, recurse where the host
+// refuses a subdirectory for the same reason, then drop the empty source. An
+// existing destination keeps the host's answer, because replacing an entry has
+// semantics (overwrite, ENOTEMPTY, waiting writers) a tree walk cannot reproduce.
+int MoveDirectoryTree(const std::string& from, const std::string& to) {
+    struct stat source {};
+    if (::lstat(from.c_str(), &source) != 0) {
+        return errno;
+    }
+    if (!S_ISDIR(source.st_mode)) {
+        return EPERM;
+    }
+    struct stat destination {};
+    if (::lstat(to.c_str(), &destination) == 0) {
+        return EPERM;
+    }
+    if (::mkdir(to.c_str(), source.st_mode & 07777) != 0) {
+        return errno;
+    }
+    DIR* directory = ::opendir(from.c_str());
+    if (directory == nullptr) {
+        return errno;
+    }
+    int failure = 0;
+    while (const dirent* entry = ::readdir(directory)) {
+        const std::string_view name(entry->d_name);
+        if (name == "." || name == "..") {
+            continue;
+        }
+        const std::string child_from = from + "/" + std::string(name);
+        const std::string child_to = to + "/" + std::string(name);
+        if (::rename(child_from.c_str(), child_to.c_str()) == 0) {
+            continue;
+        }
+        int code = errno;
+        if (code == EPERM) {
+            code = MoveDirectoryTree(child_from, child_to);
+        }
+        if (code != 0) {
+            failure = code;
+            break;
+        }
+    }
+    ::closedir(directory);
+    if (failure != 0) {
+        return failure;
+    }
+    if (::rmdir(from.c_str()) != 0) {
+        return errno;
+    }
+    return 0;
 }
 
 // How much of `count` at `address` the guest actually mapped. A kernel copies a
@@ -927,16 +991,73 @@ void GuestKernel::RegisterGuestFd(int fd) {
 }
 
 std::string GuestKernel::ResolveGuestPath(std::string guest_path) {
-    // The guest has no working directory of its own: `chdir` is not part of the
-    // emulated kernel and `getcwd` answers "/", so a relative name always means
-    // a name under the guest's root. Answer that explicitly instead of handing
-    // the name to the host, whose working directory is not part of the contract
-    // and a library such as Mortar strips the leading slash of a Java-provided
-    // path before it opens a save.
-    if (!guest_path.empty() && guest_path[0] != '/') {
-        guest_path.insert(guest_path.begin(), '/');
+    // The guest's working directory is a guest path: the mapper turns whatever
+    // the guest names into a host file, and a relative name has to be joined to
+    // that directory *before* the mapping, or the host would resolve it against
+    // the container's own position, which is not part of the contract. A name a
+    // library strips the leading slash of (Mortar does that with a Java-provided
+    // save path) therefore still lands under the guest root, as it did when the
+    // working directory was always "/".
+    if (guest_path.empty()) {
+        return guest_path;
     }
-    return guest_path;
+    if (guest_path[0] == '/') {
+        // Already absolute: the host resolves its "." and ".." after the mapper
+        // named the real tree, with the same meaning they have for the guest.
+        return guest_path;
+    }
+    std::string cwd;
+    {
+        const std::lock_guard lock(cwd_mutex_);
+        cwd = cwd_;
+    }
+    // Fold "." and ".." here: the host cannot, because it would fold them
+    // against its own idea of where the guest is.
+    std::string joined = cwd == "/" ? "/" + guest_path : cwd + "/" + guest_path;
+    std::string normalized;
+    normalized.reserve(joined.size());
+    normalized.push_back('/');
+    std::size_t index = 0;
+    while (index < joined.size()) {
+        while (index < joined.size() && joined[index] == '/') {
+            ++index;
+        }
+        const std::size_t start = index;
+        while (index < joined.size() && joined[index] != '/') {
+            ++index;
+        }
+        if (start == index) {
+            break;
+        }
+        const std::string_view part(joined.data() + start, index - start);
+        if (part == ".") {
+            continue;
+        }
+        if (part == "..") {
+            // A ".." above the root stays at the root, as Linux does.
+            if (normalized.size() > 1) {
+                normalized.pop_back();
+                const std::size_t slash = normalized.find_last_of('/');
+                normalized.resize(slash == std::string::npos ? 1 : slash + 1);
+            }
+            continue;
+        }
+        normalized.append(part);
+        normalized.push_back('/');
+    }
+    if (normalized.size() > 1 && joined.back() != '/') {
+        normalized.pop_back();
+    }
+    return normalized;
+}
+
+std::string GuestKernel::ResolveAtPath(std::string path, int directory) {
+    if (directory != AT_FDCWD) {
+        // The guest's descriptors are the host's: the host resolves the name
+        // against the directory the descriptor names, exactly as the guest asked.
+        return path;
+    }
+    return ResolveGuestPath(std::move(path));
 }
 
 void GuestKernel::TrackGuestFd(int fd, DescriptionLock description, bool read_only) {
@@ -1447,12 +1568,10 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
         flags &= ~static_cast<int>(kOLargeFile);
         const int mode = static_cast<int>(args[with_directory ? 3 : 2]);
         const int directory = with_directory ? static_cast<int>(args[0]) : AT_FDCWD;
-        // A relative name is relative to the guest's working directory, which is
-        // always the guest root; an explicit descriptor is resolved by the host
-        // against that descriptor, as on a real kernel.
-        if (directory == AT_FDCWD) {
-            path = ResolveGuestPath(std::move(path));
-        }
+        // A relative name is relative to the guest's working directory; an
+        // explicit descriptor is resolved by the host against that descriptor,
+        // as on a real kernel.
+        path = ResolveAtPath(std::move(path), directory);
         if (IsGuestMapsPath(path)) {
             const int maps = ServeMaps();
             if (maps < 0) {
@@ -1594,13 +1713,14 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
         if (!arena_.IsMapped(buffer, sizeof(GuestStat64))) {
             return -EFAULT;
         }
-        const std::string host_path = MapPath(path);
+        const std::string guest_path = ResolveGuestPath(std::move(path));
+        const std::string host_path = MapPath(guest_path);
         struct stat host {};
         const bool follow = number == kSysStat || number == kSysStat64;
         const int result = follow ? ::stat(host_path.c_str(), &host)
                                   : ::lstat(host_path.c_str(), &host);
         if (result != 0) {
-            TracePath(path, host_path, -errno);
+            TracePath(guest_path, host_path, -errno);
             return -errno;
         }
         const GuestStat64 guest = ToGuestStat64(host);
@@ -1619,8 +1739,9 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
         if (!arena_.IsMapped(buffer, sizeof(GuestStat64))) {
             return -EFAULT;
         }
-        const std::string host_path =
-            (path.empty() && (flags & kAtEmptyPath) != 0) ? std::string() : MapPath(path);
+        const std::string host_path = (path.empty() && (flags & kAtEmptyPath) != 0)
+                                          ? std::string()
+                                          : MapPath(ResolveAtPath(std::move(path), directory));
         struct stat host {};
         if (::fstatat(directory, host_path.c_str(), &host, flags) != 0) {
             return -errno;
@@ -1640,7 +1761,7 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
         }
         const int mode = static_cast<int>(args[at ? 2 : 1]);
         const int flags = at ? static_cast<int>(args[3]) : 0;
-        const std::string host_path = MapPath(path);
+        const std::string host_path = MapPath(ResolveAtPath(std::move(path), directory));
         return ::faccessat(directory, host_path.c_str(), mode, flags) == 0 ? 0 : -errno;
     }
 
@@ -1658,10 +1779,11 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
             return -EFAULT;
         }
         const int mode = static_cast<int>(args[at ? 2 : 1]) & 07777;
-        const std::string host_path = MapPath(path);
+        const std::string guest_path = ResolveAtPath(std::move(path), directory);
+        const std::string host_path = MapPath(guest_path);
         const int result = at ? ::mkdirat(directory, host_path.c_str(), mode)
                               : ::mkdir(host_path.c_str(), mode);
-        TracePath(path, host_path, result == 0 ? 0 : -errno);
+        TracePath(guest_path, host_path, result == 0 ? 0 : -errno);
         return result == 0 ? 0 : -errno;
     }
 
@@ -1670,7 +1792,7 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
         if (!ReadString(args[0], path)) {
             return -EFAULT;
         }
-        const std::string host_path = MapPath(path);
+        const std::string host_path = MapPath(ResolveGuestPath(std::move(path)));
         return ::rmdir(host_path.c_str()) == 0 ? 0 : -errno;
     }
 
@@ -1683,10 +1805,11 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
             return -EFAULT;
         }
         const int flags = at ? static_cast<int>(args[2]) : 0;
-        const std::string host_path = MapPath(path);
+        const std::string guest_path = ResolveAtPath(std::move(path), directory);
+        const std::string host_path = MapPath(guest_path);
         const int result = at ? ::unlinkat(directory, host_path.c_str(), flags)
                               : ::unlink(host_path.c_str());
-        TracePath(path, host_path, result == 0 ? 0 : -errno);
+        TracePath(guest_path, host_path, result == 0 ? 0 : -errno);
         return result == 0 ? 0 : -errno;
     }
 
@@ -1700,13 +1823,26 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
         if (!ReadString(args[at ? 1 : 0], from) || !ReadString(args[at ? 3 : 1], to)) {
             return -EFAULT;
         }
-        const std::string host_from = MapPath(from);
-        const std::string host_to = MapPath(to);
-        const int result =
-            at ? ::renameat(from_directory, host_from.c_str(), to_directory, host_to.c_str())
-               : ::rename(host_from.c_str(), host_to.c_str());
-        TracePath(from, host_from, result == 0 ? 0 : -errno);
-        return result == 0 ? 0 : -errno;
+        const std::string host_from = MapPath(ResolveAtPath(from, from_directory));
+        const std::string host_to = MapPath(ResolveAtPath(to, to_directory));
+        int code = 0;
+        if (at ? ::renameat(from_directory, host_from.c_str(), to_directory, host_to.c_str()) != 0
+               : ::rename(host_from.c_str(), host_to.c_str()) != 0) {
+            code = errno;
+            if (code == EPERM) {
+                // The platform refuses to move a directory on shared storage; the
+                // guest was promised a filesystem where that is a single step.
+                code = MoveDirectoryTree(host_from, host_to);
+            }
+        }
+        if (code != 0) {
+            // A refused move leaves the caller with half its work done and no
+            // way to tell which of the two names the host did not accept.
+            ARMBAT_LOG_WARN("Armbat", "rename: %s -> %s: %s", host_from.c_str(),
+                            host_to.c_str(), std::strerror(code));
+        }
+        TracePath(from, host_from, code == 0 ? 0 : -code);
+        return code == 0 ? 0 : -code;
     }
 
     case kSysChmod:
@@ -1718,7 +1854,7 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
             return -EFAULT;
         }
         const int mode = static_cast<int>(args[at ? 2 : 1]) & 07777;
-        const std::string host_path = MapPath(path);
+        const std::string host_path = MapPath(ResolveAtPath(std::move(path), directory));
         const int result = at ? ::fchmodat(directory, host_path.c_str(), mode, 0)
                               : ::chmod(host_path.c_str(), mode);
         return result == 0 ? 0 : -errno;
@@ -1735,7 +1871,8 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
         if (!ReadString(args[1], path)) {
             return -EFAULT;
         }
-        const std::string host_path = MapPath(path);
+        const std::string host_path =
+            MapPath(ResolveAtPath(std::move(path), static_cast<int>(args[0])));
         return ::fchownat(static_cast<int>(args[0]), host_path.c_str(),
                           static_cast<uid_t>(args[2]), static_cast<gid_t>(args[3]),
                           static_cast<int>(args[4])) == 0
@@ -1751,7 +1888,7 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
         if (!ReadString(args[0], path)) {
             return -EFAULT;
         }
-        const std::string host_path = MapPath(path);
+        const std::string host_path = MapPath(ResolveGuestPath(std::move(path)));
         if (::truncate(host_path.c_str(), static_cast<off_t>(args[1])) != 0) {
             return -errno;
         }
@@ -1767,7 +1904,7 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
         if (!ReadString(args[0], path)) {
             return -EFAULT;
         }
-        const std::string host_path = MapPath(path);
+        const std::string host_path = MapPath(ResolveGuestPath(std::move(path)));
         // ARM EABI keeps a 64-bit argument in an even register pair, so after
         // the path the length occupies r2:r3 and r1 is padding. bionic's
         // truncate64 stub hands its registers to the kernel untouched.
@@ -1806,8 +1943,10 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
         if (!ReadString(args[1], target) || !ReadString(args[3], link)) {
             return -EFAULT;
         }
-        const std::string host_target = MapPath(target);
-        const std::string host_link = MapPath(link);
+        const std::string host_target =
+            MapPath(ResolveAtPath(std::move(target), static_cast<int>(args[0])));
+        const std::string host_link =
+            MapPath(ResolveAtPath(std::move(link), static_cast<int>(args[2])));
         return ::linkat(static_cast<int>(args[0]), host_target.c_str(),
                         static_cast<int>(args[2]), host_link.c_str(),
                         static_cast<int>(args[4])) == 0
@@ -1823,7 +1962,8 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
         }
         // The target stays a guest path -- whatever follows the link maps it
         // again -- while the link itself has to exist on the host.
-        const std::string host_link = MapPath(link);
+        const std::string host_link =
+            MapPath(ResolveAtPath(std::move(link), static_cast<int>(args[1])));
         return ::symlinkat(target.c_str(), static_cast<int>(args[1]), host_link.c_str()) == 0
                    ? 0
                    : -errno;
@@ -1857,26 +1997,65 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
             std::memcpy(arena_.Ptr(buffer), executable_path_.data(), length);
             return static_cast<std::int32_t>(length);
         }
-        const std::string host_path = MapPath(path);
+        const std::string guest_path = ResolveAtPath(std::move(path), directory);
+        const std::string host_path = MapPath(guest_path);
         const ssize_t result = at ? ::readlinkat(directory, host_path.c_str(),
                                                  reinterpret_cast<char*>(arena_.Ptr(buffer)), size)
                                   : ::readlink(host_path.c_str(),
                                                reinterpret_cast<char*>(arena_.Ptr(buffer)), size);
-        TracePath(path, host_path, result < 0 ? -errno : static_cast<int>(result));
+        TracePath(guest_path, host_path, result < 0 ? -errno : static_cast<int>(result));
         return result < 0 ? -errno : ClampSize(result);
+    }
+
+    case kSysChdir: {
+        std::string path;
+        if (!ReadString(args[0], path)) {
+            return -EFAULT;
+        }
+        std::string guest_path = ResolveGuestPath(std::move(path));
+        if (guest_path.empty()) {
+            return -ENOENT;
+        }
+        // getcwd never answers a trailing slash, and a later relative name
+        // joined to this one must not produce "//".
+        while (guest_path.size() > 1 && guest_path.back() == '/') {
+            guest_path.pop_back();
+        }
+        const std::string host_path = MapPath(guest_path);
+        struct stat host {};
+        if (::stat(host_path.c_str(), &host) != 0) {
+            TracePath(guest_path, host_path, -errno);
+            return -errno;
+        }
+        if (!S_ISDIR(host.st_mode)) {
+            return -ENOTDIR;
+        }
+        {
+            const std::lock_guard lock(cwd_mutex_);
+            cwd_ = guest_path;
+        }
+        return 0;
     }
 
     case kSysGetcwd: {
         const std::uint32_t buffer = args[0];
         const std::uint32_t size = args[1];
-        if (size < 2) {
+        std::string cwd;
+        {
+            const std::lock_guard lock(cwd_mutex_);
+            cwd = cwd_;
+        }
+        // Linux answers the length of the name without its terminator, and
+        // ERANGE when the caller's buffer cannot hold the name: a caller that
+        // took a short answer for success would walk off its own string.
+        if (size < cwd.size() + 1) {
             return -ERANGE;
         }
-        if (!arena_.IsMapped(buffer, 2)) {
+        if (!arena_.IsMapped(buffer, size)) {
             return -EFAULT;
         }
-        std::memcpy(arena_.Ptr(buffer), "/", 2);
-        return 1;
+        std::memcpy(arena_.Ptr(buffer), cwd.c_str(), cwd.size() + 1);
+        return static_cast<std::int32_t>(cwd.size());
     }
 
     case kSysGetpid:

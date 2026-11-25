@@ -141,7 +141,10 @@ private:
     int ServeMaps();
     // Turns a name relative to the guest's working directory into the absolute
     // guest name of the same file.
-    static std::string ResolveGuestPath(std::string guest_path);
+    std::string ResolveGuestPath(std::string guest_path);
+    // The same for the `*at` family: only AT_FDCWD names the working directory,
+    // an explicit descriptor is the guest's own and the host resolves against it.
+    std::string ResolveAtPath(std::string path, int directory);
     bool WriteGuest(std::uint32_t address, const void* data, std::size_t size);
 
     // Descriptors that stand in for /dev/socket/logdw. bionic's async-safe
@@ -252,6 +255,13 @@ private:
     // that cannot be trusted.
     mutable std::mutex paths_mutex_;
     std::vector<std::string> path_traces_;
+    // The guest's working directory, in guest paths. A real kernel keeps one per
+    // process, and a guest that chdir()s into its own data folder then reads
+    // names relative to it expects the same. The host's own working directory is
+    // not the guest's, so the path is translated through the mapper on every use
+    // instead of being handed to the host.
+    mutable std::mutex cwd_mutex_;
+    std::string cwd_ = "/";
     std::mutex modules_mutex_;
     std::vector<PendingModule> pending_modules_;
     ThreadSpawner thread_spawner_;
