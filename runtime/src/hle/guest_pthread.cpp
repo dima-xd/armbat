@@ -956,6 +956,10 @@ void GuestPthread::State::Register() {
         }
         const std::uint32_t value = static_cast<std::uint32_t>(index);
         call.CopyOut(call.Arg(0), &value, sizeof(value));
+        if (LogAllowed("key-create", 32)) {
+            ARMBAT_LOG_INFO("Armbat", "pthread_key_create -> key %u at %08x",
+                                value, call.Arg(0));
+        }
         call.Return(kSuccess);
     });
 
@@ -975,16 +979,42 @@ void GuestPthread::State::Register() {
         const std::uint32_t key = call.Arg(0);
         auto thread = self.FindByMachine(call.Machine());
         if (!thread) {
+            // A suspended thread can come back on a fresh machine object; its
+            // identity is the guest TLS pointer it was created with, which
+            // survives the swap.
+            thread = self.FindByHandle(call.Machine().TlsBase());
+            if (thread && LogAllowed("key-reattach", 8)) {
+                ARMBAT_LOG_WARN("Armbat",
+                                    "pthread_setspecific: machine unknown, matched thread %u by tls %08x",
+                                    thread->thread_id, call.Machine().TlsBase());
+            }
+        }
+        if (!thread) {
+            if (LogAllowed("key-set-miss", 8)) {
+                ARMBAT_LOG_WARN("Armbat",
+                                    "pthread_setspecific: no thread for key %u (tls %08x)",
+                                    key, call.Machine().TlsBase());
+            }
             call.Return(kEsrch);
             return;
         }
         {
             const std::lock_guard lock(self.mutex);
             if (key >= self.key_used.size() || !self.key_used[key]) {
+                if (LogAllowed("key-set-inval", 8)) {
+                    ARMBAT_LOG_WARN("Armbat",
+                                        "pthread_setspecific: key %u not allocated (thread %u)",
+                                        key, thread->thread_id);
+                }
                 call.Return(kEinval);
                 return;
             }
             thread->key_values[static_cast<int>(key)] = call.Arg(1);
+            if (LogAllowed("key-set", 32)) {
+                ARMBAT_LOG_INFO("Armbat",
+                                    "pthread_setspecific key %u = %08x (thread %u)",
+                                    key, call.Arg(1), thread->thread_id);
+            }
         }
         call.Return(kSuccess);
     });
@@ -992,12 +1022,31 @@ void GuestPthread::State::Register() {
     registry.Add("pthread_getspecific", [&self](HleCall& call) {
         auto thread = self.FindByMachine(call.Machine());
         if (!thread) {
+            thread = self.FindByHandle(call.Machine().TlsBase());
+            if (thread && LogAllowed("key-reattach", 8)) {
+                ARMBAT_LOG_WARN("Armbat",
+                                    "pthread_getspecific: machine unknown, matched thread %u by tls %08x",
+                                    thread->thread_id, call.Machine().TlsBase());
+            }
+        }
+        if (!thread) {
+            if (LogAllowed("key-get-miss", 8)) {
+                ARMBAT_LOG_WARN("Armbat",
+                                    "pthread_getspecific: no thread for key %u (tls %08x)",
+                                    call.Arg(0), call.Machine().TlsBase());
+            }
             call.Return(0);
             return;
         }
         const std::lock_guard lock(self.mutex);
         const auto it = thread->key_values.find(static_cast<int>(call.Arg(0)));
-        call.Return(it == thread->key_values.end() ? 0 : it->second);
+        const std::uint32_t value = it == thread->key_values.end() ? 0 : it->second;
+        if (value == 0 && LogAllowed("key-get-null", 16)) {
+            ARMBAT_LOG_WARN("Armbat",
+                                "pthread_getspecific key %u -> null (thread %u, tls %08x)",
+                                call.Arg(0), thread->thread_id, call.Machine().TlsBase());
+        }
+        call.Return(value);
     });
 
     // pthread_once is a three-state futex word: 0 new, 1 running, 2 done.
