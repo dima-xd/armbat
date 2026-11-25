@@ -1197,7 +1197,7 @@ struct GuestContainer::Impl {
                 }
                 caller.SetReg(0, args[0]);
                 caller.SetReg(1, args[1]);
-                if (!impl_->hle->DispatchByName(kKeyTrapNames[subop], caller)) {
+                if (!hle->DispatchByName(kKeyTrapNames[subop], caller)) {
                     return -ENOSYS;
                 }
                 return static_cast<std::int32_t>(caller.Reg(0));
