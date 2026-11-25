@@ -283,6 +283,14 @@ std::uint32_t HleRegistry::Resolve(std::string_view name) const {
     return stub_base_ + it->second * kStubSize;
 }
 
+bool HleRegistry::DispatchByName(const std::string& name, A32Machine& machine) {
+    const auto it = by_name_.find(name);
+    if (it == by_name_.end()) {
+        return false;
+    }
+    return DispatchIndex(it->second, machine);
+}
+
 std::uint32_t HleRegistry::AllocateData(std::uint32_t size) {
     if (size == 0) {
         size = 4;

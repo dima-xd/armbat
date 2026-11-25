@@ -38,6 +38,7 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.net.URL
+import java.lang.reflect.Method
 import java.util.zip.ZipFile
 import kotlin.math.min
 
@@ -537,7 +538,12 @@ class GuestLauncher(private val host: Activity) {
                 ArmbatLog.i(TAG, "bindService refused: ${service.`package` ?: service.action} is not part of this device")
                 return false
             }
-            return super.bindService(service, conn, flags)
+            return try {
+                super.bindService(service, conn, flags)
+            } catch (error: IllegalArgumentException) {
+                refusedService(service)
+                false
+            }
         }
 
         override fun startService(service: Intent): ComponentName? {
@@ -545,7 +551,41 @@ class GuestLauncher(private val host: Activity) {
                 ArmbatLog.i(TAG, "startService refused: ${service.`package` ?: service.action} is not part of this device")
                 return null
             }
-            return super.startService(service)
+            return try {
+                super.startService(service)
+            } catch (error: IllegalArgumentException) {
+                refusedService(service)
+                null
+            }
+        }
+
+        /**
+         * A service the platform refuses before it starts.
+         *
+         * Android 5 refuses an intent that names no component: a service must be
+         * explicit from that release on, and an archive written earlier asks by
+         * action -- its push registration above all (NFS Most Wanted asks the
+         * C2DM service by name in its first onCreate). The container has no
+         * service behind the action, and the platform's own refusal kills the
+         * launch, so the answer is the one a device without the service gives:
+         * the call does nothing, the callback the caller waits for never comes,
+         * and the caller's own fallback takes over.
+         */
+        private fun refusedService(service: Intent) {
+            ArmbatLog.i(TAG, "startService refused: ${service.`package` ?: service.action} has no service on this device")
+        }
+
+        override fun startForegroundService(service: Intent): ComponentName? {
+            if (isUnavailableService(service)) {
+                ArmbatLog.i(TAG, "startService refused: ${service.`package` ?: service.action} is not part of this device")
+                return null
+            }
+            return try {
+                super.startForegroundService(service)
+            } catch (error: IllegalArgumentException) {
+                refusedService(service)
+                null
+            }
         }
 
         /**
@@ -880,12 +920,117 @@ class GuestLauncher(private val host: Activity) {
                 return null
             }
             ArmbatLog.i(TAG, "guest startActivity leaves the container: $intent")
-            host.startActivity(intent, options)
-            return null
+            return delegateToFramework(
+                Activity::class.java, who, contextThread, token, target, intent, requestCode, options,
+            )
+        }
+
+        /**
+         * The result-carrying form of the same door. Activity.startActivityForResult
+         * called with a who prefix -- which is what a runtime permission request
+         * goes through, whatever asked it: a fragment, or the activity itself --
+         * hands the intent here with a String instead of an Activity as the
+         * target. A request the container answers itself (see
+         * [answerPermissionRequest]) never leaves the process; everything else
+         * goes where the other form takes it.
+         */
+        @Suppress("UNUSED_PARAMETER")
+        fun execStartActivity(
+            who: Context,
+            contextThread: IBinder?,
+            token: IBinder?,
+            target: String?,
+            intent: Intent,
+            requestCode: Int,
+            options: android.os.Bundle?,
+        ): Instrumentation.ActivityResult? {
+            if (intent.action == ACTION_REQUEST_PERMISSIONS) {
+                answerPermissionRequest(who, target, intent, requestCode)
+                return null
+            }
+            if (startGuestActivity(intent, requestCode)) {
+                return null
+            }
+            ArmbatLog.i(TAG, "guest startActivity leaves the container: $intent")
+            return delegateToFramework(
+                String::class.java, who, contextThread, token, target, intent, requestCode, options,
+            )
+        }
+
+        /**
+         * A start the container does not host keeps the framework's own result
+         * routing: the original Instrumentation carries the caller's token, the
+         * resultWho prefix and the requestCode to ActivityManager, so a result
+         * comes back to the exact activity (or fragment) that asked. Sending
+         * such a start through the container's activity loses that routing, and
+         * the caller waits for a result nobody delivers.
+         */
+        private fun delegateToFramework(
+            targetClass: Class<*>,
+            who: Context,
+            contextThread: IBinder?,
+            token: IBinder?,
+            target: Any?,
+            intent: Intent,
+            requestCode: Int,
+            options: android.os.Bundle?,
+        ): Instrumentation.ActivityResult? {
+            val framework = frameworkInstrumentation
+            if (framework == null || framework === this@GuestInstrumentation) {
+                host.startActivity(intent, options)
+                return null
+            }
+            val method = runCatching {
+                Instrumentation::class.java.getDeclaredMethod(
+                    "execStartActivity",
+                    Context::class.java,
+                    IBinder::class.java,
+                    IBinder::class.java,
+                    targetClass,
+                    Intent::class.java,
+                    Integer.TYPE,
+                    android.os.Bundle::class.java,
+                )
+            }.getOrNull()
+            if (method == null) {
+                ArmbatLog.w(TAG, "guest startActivity: no framework dispatcher")
+                host.startActivity(intent, options)
+                return null
+            }
+            method.isAccessible = true
+            val result = runCatching {
+                method.invoke(
+                    framework,
+                    who,
+                    contextThread,
+                    token,
+                    target,
+                    intent,
+                    requestCode,
+                    options,
+                ) as? Instrumentation.ActivityResult
+            }.onFailure {
+                ArmbatLog.w(TAG, "guest startActivity delegation failed: $it")
+            }.getOrNull()
+            if (result == null) {
+                host.startActivity(intent, options)
+            }
+            return result
         }
     }
 
     private val instrumentation by lazy { GuestInstrumentation() }
+    /**
+     * The framework instrumentation the container's activity was born with. A
+     * start the archive does not own is handed back here, so an external
+     * activity keeps the platform's own result routing: the framework path
+     * carries the who prefix, the result target and the request code to the
+     * system, and the answer returns through the same path (see
+     * [dispatchActivityResult]).
+     */
+    private val frameworkInstrumentation by lazy {
+        runCatching { readField(host, "mInstrumentation") as? Instrumentation }.getOrNull()
+    }
 
     /**
      * Everything a launch needs that does not touch the view hierarchy, done on
@@ -1683,6 +1828,221 @@ class GuestLauncher(private val host: Activity) {
         forwarded.component = ComponentName(session.prepared.packageName, className)
         request(Action.Start(className, forwarded, requestCode))
         return true
+    }
+
+    /**
+     * Answers a runtime permission request an archive made, without leaving
+     * the container.
+     *
+     * The request would otherwise go to the platform's permission controller
+     * as the container: a dialog about the container's own permissions, most
+     * of which it does not declare, and a result the platform hands to the
+     * activity its token belongs to -- the host's, not the guest's -- so the
+     * fragment that asked never hears back and stops where it started. The
+     * guest is answered the same way its own checks are answered (see
+     * GuestContext): storage comes from all files access, everything else from
+     * the grant the container itself holds.
+     */
+    private fun answerPermissionRequest(
+        caller: Context,
+        resultWho: String?,
+        intent: Intent,
+        requestCode: Int,
+    ) {
+        val activity = caller as? Activity
+        if (activity == null) {
+            ArmbatLog.w(TAG, "guest permission request without an activity: $caller")
+            return
+        }
+        val names = intent.getStringArrayExtra(EXTRA_REQUEST_PERMISSIONS_NAMES)
+            ?: arrayOf<String>()
+        val context = session?.context
+        val grants = IntArray(names.size) { index ->
+            if (context != null &&
+                context.checkSelfPermission(names[index]) == PackageManager.PERMISSION_GRANTED
+            ) {
+                PackageManager.PERMISSION_GRANTED
+            } else {
+                PackageManager.PERMISSION_DENIED
+            }
+        }
+        ArmbatLog.i(
+            TAG,
+            "guest permission request answered: ${names.joinToString()} -> " +
+                grants.joinToString(),
+        )
+        val result = Intent()
+        result.putExtra(EXTRA_REQUEST_PERMISSIONS_NAMES, names)
+        result.putExtra(EXTRA_REQUEST_PERMISSIONS_RESULTS, grants)
+        // The request arrives from a fragment's onCreate, mid transaction, so
+        // the callback is dispatched once that transaction has unwound -- the
+        // way the platform's own round trip would have delivered it.
+        activity.runOnUiThread {
+            dispatchActivityResult(activity, resultWho, requestCode, Activity.RESULT_OK, result)
+        }
+    }
+
+    /**
+     * Runs the activity's own result dispatch: the private method the platform
+     * routes every startForActivity result through, which resolves the who
+     * prefix to the fragment that asked and calls its
+     * onRequestPermissionsResult. Reflection because the method is hidden and
+     * its parameter list grew a reason string (and a caller record) between
+     * releases; the first four parameters have been stable since API 1.
+     */
+    private fun dispatchActivityResult(
+        activity: Activity,
+        who: String?,
+        requestCode: Int,
+        resultCode: Int,
+        data: Intent,
+    ) {
+        val names = data.getStringArrayExtra(EXTRA_REQUEST_PERMISSIONS_NAMES)
+            ?: arrayOf<String>()
+        val grants = data.getIntArrayExtra(EXTRA_REQUEST_PERMISSIONS_RESULTS)
+            ?: IntArray(names.size)
+
+        // First: the platform's own dispatcher, which knows the whole who
+        // prefix protocol and clears the request bookkeeping.
+        val method = Activity::class.java.declaredMethods.firstOrNull { candidate ->
+            candidate.name == "dispatchActivityResult" &&
+                candidate.parameterTypes.size >= 4 &&
+                candidate.parameterTypes[0] == String::class.java &&
+                candidate.parameterTypes[1] == Integer.TYPE &&
+                candidate.parameterTypes[2] == Integer.TYPE &&
+                candidate.parameterTypes[3] == Intent::class.java
+        }
+        if (method != null) {
+            method.isAccessible = true
+            val arguments = arrayOfNulls<Any?>(method.parameterTypes.size)
+            arguments[0] = who
+            arguments[1] = requestCode
+            arguments[2] = resultCode
+            arguments[3] = data
+            for (index in 4 until arguments.size) {
+                arguments[index] = when (method.parameterTypes[index]) {
+                    String::class.java -> "armbat"
+                    Integer.TYPE -> 0
+                    else -> null
+                }
+            }
+            if (runCatching { method.invoke(activity, *arguments) }.isSuccess) {
+                return
+            }
+            ArmbatLog.w(TAG, "guest permission result dispatch: refused")
+        } else {
+            ArmbatLog.w(TAG, "guest permission result: no dispatchActivityResult")
+        }
+
+        // Fallback: a release whose dispatcher changed shape. Resolve the
+        // fragment the request came from through the activity's own fragment
+        // manager and hand it the answer the framework would have.
+        val fragmentWho = who
+            ?.takeIf { it.startsWith(PERMISSION_WHO_PREFIX) }
+            ?.removePrefix(PERMISSION_WHO_PREFIX)
+        if (!fragmentWho.isNullOrEmpty()) {
+            val fragment = resolveGuestFragment(activity, fragmentWho)
+            if (fragment != null) {
+                runCatching {
+                    fragment.onRequestPermissionsResult(requestCode, names, grants)
+                }.onFailure { ArmbatLog.w(TAG, "guest permission result to fragment: $it") }
+                return
+            }
+            ArmbatLog.w(TAG, "guest permission result: no fragment $fragmentWho")
+        }
+
+        // Last resort: the activity takes the answer itself, the way a
+        // request made from the activity body would.
+        runCatching {
+            activity.onRequestPermissionsResult(requestCode, names, grants)
+        }.onFailure { ArmbatLog.w(TAG, "guest permission result to activity: $it") }
+    }
+
+    /**
+     * The fragment the request came from, through the fragment machinery the
+     * platform keeps on the activity. The activity's own getFragmentManager()
+     * dereferences the host callback the container does not install, so the
+     * controller is reached through reflection and its manager is found by
+     * shape: an object whose type answers findFragmentByWho, whatever field
+     * holds it on this release.
+     */
+    private fun resolveGuestFragment(activity: Activity, who: String): android.app.Fragment? {
+        runCatching {
+            activity.fragmentManager?.let { manager ->
+                findMethod(manager, "findFragmentByWho", String::class.java)
+                    ?.invoke(manager, who) as? android.app.Fragment
+            }
+        }.getOrNull()?.let { return it }
+
+        val controller = runCatching {
+            Activity::class.java.getDeclaredField("mFragments").apply { isAccessible = true }
+                .get(activity)
+        }.getOrNull() ?: return null
+        val manager = findFragmentManager(controller) ?: return null
+        val find = findMethod(manager, "findFragmentByWho", String::class.java) ?: return null
+        return runCatching { find.invoke(manager, who) as? android.app.Fragment }.getOrNull()
+    }
+
+    /**
+     * The fragment manager below [holder], located by shape rather than name:
+     * the controller and its host callback rename their fields between
+     * releases, but the manager always answers findFragmentByWho.
+     */
+    private fun findFragmentManager(holder: Any): Any? {
+        if (hasMethod(holder, "findFragmentByWho")) {
+            return holder
+        }
+        var type: Class<*>? = holder.javaClass
+        while (type != null && type != Any::class.java) {
+            for (field in type.declaredFields) {
+                if (java.lang.reflect.Modifier.isStatic(field.modifiers)) {
+                    continue
+                }
+                val value = runCatching {
+                    field.isAccessible = true
+                    field.get(holder)
+                }.getOrNull() ?: continue
+                if (hasMethod(value, "findFragmentByWho")) {
+                    return value
+                }
+            }
+            type = type.superclass
+        }
+        return null
+    }
+
+    /** Whether the object's type or any superclass declares [name]. */
+    private fun hasMethod(instance: Any, name: String): Boolean {
+        var type: Class<*>? = instance.javaClass
+        while (type != null && type != Any::class.java) {
+            if (type.declaredMethods.any { it.name == name }) {
+                return true
+            }
+            type = type.superclass
+        }
+        return false
+    }
+
+    /**
+     * Finds a method by name and parameter types on the object's runtime type
+     * or any of its superclasses, whatever its visibility: the fragment
+     * manager's resolver is package-private on several releases.
+     */
+    private fun findMethod(instance: Any, name: String, vararg parameters: Class<*>): Method? {
+        var type: Class<*>? = instance.javaClass
+        while (type != null && type != Any::class.java) {
+            val method = type.declaredMethods.firstOrNull { candidate ->
+                candidate.name == name &&
+                    candidate.parameterTypes.size == parameters.size &&
+                    parameters.indices.all { index -> candidate.parameterTypes[index] == parameters[index] }
+            }
+            if (method != null) {
+                method.isAccessible = true
+                return method
+            }
+            type = type.superclass
+        }
+        return null
     }
 
     /**
@@ -2506,6 +2866,20 @@ class GuestLauncher(private val host: Activity) {
         return method.invoke(null, context) as Window
     }
 
+    private fun readField(target: Any, name: String): Any? {
+        var type: Class<*>? = target.javaClass
+        while (type != null) {
+            try {
+                val field = type.getDeclaredField(name)
+                field.isAccessible = true
+                return field.get(target)
+            } catch (missing: NoSuchFieldException) {
+                type = type.superclass
+            }
+        }
+        return null
+    }
+
     private fun field(target: Any, name: String, value: Any?) {
         var type: Class<*>? = target.javaClass
         while (type != null) {
@@ -2527,6 +2901,15 @@ class GuestLauncher(private val host: Activity) {
 
     private companion object {
         const val TAG = "Armbat"
+        // The intent the platform builds for a runtime permission request (see
+        // PackageManager.buildRequestPermissionsIntent) and the extras it
+        // carries. All three are @SystemApi constants the public SDK does not
+        // ship, like the method that reads the controller's package from them.
+        const val ACTION_REQUEST_PERMISSIONS = "android.content.pm.action.REQUEST_PERMISSIONS"
+        const val EXTRA_REQUEST_PERMISSIONS_NAMES =
+            "android.content.pm.extra.REQUEST_PERMISSIONS_NAMES"
+        const val EXTRA_REQUEST_PERMISSIONS_RESULTS =
+            "android.content.pm.extra.REQUEST_PERMISSIONS_RESULTS"
         const val NATIVE_ACTIVITY = "android.app.NativeActivity"
         const val TELEPHONY_MANAGER = "android.telephony.TelephonyManager"
         const val STUB_LIBRARY = "libguestsdk.so"
@@ -2535,6 +2918,12 @@ class GuestLauncher(private val host: Activity) {
         // land on the copies the container already loaded, not on the 64-bit
         // stand-ins the host class loader needs.
         const val GUEST_LIBRARY_DIR = "/armbat/app-libs"
+        /**
+         * The prefix the platform puts on a permission request's result
+         * address; the suffix is the fragment's own identity (empty when the
+         * activity itself asked).
+         */
+        const val PERMISSION_WHO_PREFIX = "@android:requestPermissions:"
         // The frame rate the guest's era assumes. Every archive the container
         // can run is 32-bit, so none of them was written for a faster panel: the
         // engine advances its simulation once per presented frame and counts on

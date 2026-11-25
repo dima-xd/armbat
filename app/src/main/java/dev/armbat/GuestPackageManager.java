@@ -412,6 +412,39 @@ final class GuestPackageManager extends PackageManager {
     }
 
     /**
+     * The package a permission request intent is addressed to.
+     *
+     * The platform's own buildRequestPermissionsIntent -- a hidden method, and
+     * so absent from the SDK this wrapper compiles against like the rationale
+     * query below -- names the permission controller through this method, and
+     * the base PackageManager class refuses to answer it: an archive whose
+     * fragment asks for runtime permissions reached it and the process ended
+     * on the spot. The container's own package manager knows the controller;
+     * the request itself is answered inside the container before the intent
+     * is ever started (see GuestLauncher).
+     *
+     * The method is as hidden as the intent builder, so the answer is asked
+     * through reflection -- the same rule the rationale query below follows.
+     * A platform that has neither the method nor the request path it feeds
+     * (the builder named no controller before Android 13) is answered with
+     * the container's own package: the intent stays well formed, and the
+     * request itself never reaches the platform anyway.
+     */
+    public String getPermissionControllerPackageName() {
+        try {
+            java.lang.reflect.Method method = PackageManager.class.getMethod(
+                    "getPermissionControllerPackageName");
+            Object answer = method.invoke(base);
+            if (answer instanceof String) {
+                return (String) answer;
+            }
+        } catch (ReflectiveOperationException | RuntimeException unreachable) {
+            // Fall through to the container's own package.
+        }
+        return hostPackage;
+    }
+
+    /**
      * The rationale query is abstract on the platform's PackageManager but
      * hidden from the public SDK, so this wrapper compiled against the SDK has
      * no slot for it: every Activity.shouldShowRequestPermissionRationale call

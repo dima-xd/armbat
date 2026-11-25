@@ -14,6 +14,7 @@
 #include "armbat/log.h"
 
 #include "guest_boot.h"
+#include "guest_keys.h"
 #include "guest_net.h"
 #include "guest_props.h"
 #include "shim_libandroid.h"
@@ -77,6 +78,10 @@ const Image kImages[] = {
     // container, so __system_property_get() answers from the guest profile.
     {"libarmbat_props.so", "/system/lib/libarmbat_props.so", guest_props::kPropsImage,
      guest_props::kPropsSize},
+    // The same for the pthread key API: the container keeps the one key table
+    // the archive reads back through, and the shim carries the calls out.
+    {"libarmbat_keys.so", "/system/lib/libarmbat_keys.so", guest_keys::kKeysImage,
+     guest_keys::kKeysSize},
 };
 
 bool FileSize(const std::string& path, std::uint32_t* size) {

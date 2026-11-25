@@ -88,6 +88,16 @@ constexpr std::uint32_t kArmbatResolve = kArmNrBase + 0x101;
 // container does not map, so the guest's libarmbat_props.so carries the name out
 // and receives the answer for the device the container presents.
 constexpr std::uint32_t kArmbatProperty = kArmNrBase + 0x102;
+// The pthread key API the guest's libarmbat_keys.so forwards: the key table
+// lives in the container (see guest_pthread.cpp), and the shim carries the
+// question out so the call is answered by the same implementation every image
+// binds to.
+// A pthread key call the container owns: the guest's libarmbat_keys.so carries
+// (subop, args) out through this trap, and the container's own pthread key
+// implementation answers. Loaded ahead of the application, it is what an
+// archive's imports bind to, so every key the archive creates has the plain
+// small-integer format its code was built against.
+constexpr std::uint32_t kArmbatKeys = kArmNrBase + 0x103;
 
 // ARM uses the asm-generic syscall table, so these numbers are stable.
 enum SyscallNumber : std::uint32_t {
@@ -1269,6 +1279,19 @@ std::int32_t GuestKernel::DispatchPrivate(std::uint32_t number, const std::uint3
             return -ENOENT;
         }
         return static_cast<std::int32_t>(value.size());
+    }
+    case kArmbatKeys: {
+        // The guest's preloaded key shim asks the container to run one of the
+        // four pthread key functions (see guest/guest_keys.c). The sub-operation
+        // names the function; its arguments arrive in the words the shim passed
+        // through, and the answer is whatever the implementation returns.
+        if (args[0] >= 4) {
+            return -EINVAL;
+        }
+        if (!keys_trap_) {
+            return -ENOSYS;
+        }
+        return keys_trap_(args[0], CallingMachine(machine_), args + 1);
     }
     default:
         last_unimplemented_ = number;

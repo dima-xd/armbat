@@ -171,6 +171,11 @@ std::vector<unsigned char> ReadWholeFile(const std::string& path) {
     bytes.resize(filled);
     return bytes;
 }
+// Names the key trap dispatches by its sub-operation (see guest/guest_keys.c).
+constexpr std::array<const char*, 4> kKeyTrapNames = {
+    "pthread_key_create", "pthread_key_delete", "pthread_setspecific",
+    "pthread_getspecific",
+};
 
 // Replaces a small text file in the container's own directory. The files that
 // describe the emulated device to the guest are written this way: they are
@@ -1180,6 +1185,23 @@ struct GuestContainer::Impl {
         bionic = std::make_unique<BionicBoot>(*machine, arena);
         kernel->SetExecutablePath("/system/bin/armbat_boot");
         kernel->SetBootReadyHandler([this](std::uint32_t api) { bionic->OnReady(api); });
+        // The key shim's trap: the sub-operation names the function and the
+        // argument words the caller passed sit in the registers after it.
+        // Shifting them into the first slots makes the call look exactly like
+        // the import trap the same names use, so one implementation serves
+        // both doors.
+        kernel->SetKeysTrap(
+            [this](std::uint32_t subop, A32Machine& caller, const std::uint32_t* args) -> std::int32_t {
+                if (subop >= kKeyTrapNames.size()) {
+                    return -EINVAL;
+                }
+                caller.SetReg(0, args[0]);
+                caller.SetReg(1, args[1]);
+                if (!hle->DispatchByName(kKeyTrapNames[subop], caller)) {
+                    return -ENOSYS;
+                }
+                return static_cast<std::int32_t>(caller.Reg(0));
+            });
         const auto started = std::chrono::steady_clock::now();
         auto stamp = [&started](const char* what) {
             const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1786,35 +1808,68 @@ GuestContainer::LoadResult GuestContainer::LoadGuestLibrary(const std::string& p
     // and built the name from the context's own directory. Only an ELF32 ARM
     // image belongs to the guest; a 64-bit image, or a file the unpacker wrote
     // half-way, is the platform's to refuse, and it names that reason better.
-    const std::vector<unsigned char> image = ReadWholeFile(path);
-    const bool elf = image.size() >= 52 && image[0] == 0x7f && image[1] == 'E' &&
-                     image[2] == 'L' && image[3] == 'F';
+    // Loading the same file twice is a no-op on the platform; running the entry
+    // again would bind its natives twice. The name decides, not the directory:
+    // a Java half that built its path from a directory that is not the
+    // archive's own still asks for a library the launch already mapped, and
+    // the platform would answer that request with a missing file.
+    const std::size_t asked_slash = path.find_last_of('/');
+    const std::string asked_file =
+        asked_slash == std::string::npos ? path : path.substr(asked_slash + 1);
+    for (const Impl::LoadedLibrary& library : impl_->loaded_libraries) {
+        if (library.path == path || library.file == asked_file) {
+            return LoadResult::Loaded;
+        }
+    }
+    // A name the archive's own folder answers: every library the launch mapped
+    // lives in one directory of the container's cache, and the guest's /armbat
+    // tree names it. A path that is not there is repaired by reading the file's
+    // own name out of that directory; a name the archive does not carry stays
+    // the platform's to refuse, and it names that reason better.
+    const auto resolve = [this](const std::string& asked) -> std::string {
+        std::string asked_path = asked;
+        if (asked_path.rfind("/armbat/app-libs/", 0) == 0) {
+            asked_path = impl_->armbat_root + "/" + asked_path.substr(sizeof("/armbat/app-libs/") - 1);
+        }
+        const std::size_t slash = asked_path.find_last_of('/');
+        if (slash == std::string::npos || slash + 1 >= asked_path.size()) {
+            return std::string();
+        }
+        return impl_->app_lib_dir + "/" + asked_path.substr(slash + 1);
+    };
+    std::string file = path;
+    std::vector<unsigned char> image = ReadWholeFile(path);
+    bool elf = image.size() >= 52 && image[0] == 0x7f && image[1] == 'E' &&
+               image[2] == 'L' && image[3] == 'F';
     if (!elf || image[4] != 1 /*ELFCLASS32*/ || image[5] != 1 /*ELFDATA2LSB*/) {
-        return LoadResult::NotGuestImage;
+        const std::string resolved = resolve(path);
+        if (resolved.empty() || resolved == path) {
+            return LoadResult::NotGuestImage;
+        }
+        image = ReadWholeFile(resolved);
+        elf = image.size() >= 52 && image[0] == 0x7f && image[1] == 'E' &&
+              image[2] == 'L' && image[3] == 'F';
+        if (!elf || image[4] != 1 /*ELFCLASS32*/ || image[5] != 1 /*ELFDATA2LSB*/) {
+            return LoadResult::NotGuestImage;
+        }
+        file = resolved;
     }
     const std::uint16_t machine =
         static_cast<std::uint16_t>(image[18] | (static_cast<std::uint16_t>(image[19]) << 8));
     if (machine != 40 /*EM_ARM*/) {
         return LoadResult::NotGuestImage;
     }
-    // Loading the same file twice is a no-op on the platform; running the entry
-    // again would bind its natives twice.
-    for (const Impl::LoadedLibrary& library : impl_->loaded_libraries) {
-        if (library.path == path) {
-            return LoadResult::Loaded;
-        }
-    }
-    const std::uint32_t handle = impl_->bionic->Dlopen(path, 2 /*RTLD_NOW*/);
+    const std::uint32_t handle = impl_->bionic->Dlopen(file, 2 /*RTLD_NOW*/);
     if (handle == 0) {
         *error = impl_->bionic->LastError();
         return LoadResult::Failed;
     }
-    const std::size_t slash = path.find_last_of('/');
-    const std::string file = slash == std::string::npos ? path : path.substr(slash + 1);
+    const std::size_t slash = file.find_last_of('/');
+    const std::string base = slash == std::string::npos ? file : file.substr(slash + 1);
     const std::uint32_t on_load = impl_->bionic->Dlsym(handle, "JNI_OnLoad");
-    impl_->loaded_libraries.push_back(Impl::LoadedLibrary{handle, path, file, file, on_load});
+    impl_->loaded_libraries.push_back(Impl::LoadedLibrary{handle, file, base, base, on_load});
     if (on_load != 0) {
-        impl_->on_load.push_back(PendingOnLoad{file, file, on_load});
+        impl_->on_load.push_back(PendingOnLoad{base, base, on_load});
     }
     // Exported entry points, collected the same way an archive library's are at
     // startup: the JNI bridge binds them to the classes of the loader in use.
@@ -1929,6 +1984,21 @@ std::string GuestContainer::LoadApk(const std::string& apk_path, const std::stri
                         "property shim loaded but __system_property_get is not exported");
     } else {
         ARMBAT_LOG_INFO("Armbat", "platform properties: guest profile loaded and exported");
+    }
+    // The pthread key API the container owns (see guest/guest_keys.c). Like the
+    // two shims above it goes into the global symbol group before the
+    // application, so the four names an archive imports bind to it during
+    // relocation -- before any constructor runs -- and one key table serves
+    // every image in the process.
+    const std::uint32_t keys_handle =
+        impl_->bionic->Dlopen("/system/lib/libarmbat_keys.so", 2 /*RTLD_NOW*/);
+    if (keys_handle == 0) {
+        ARMBAT_LOG_WARN("Armbat", "pthread key shim not loaded: %s",
+                        impl_->bionic->LastError().c_str());
+    } else if (impl_->bionic->Dlsym(keys_handle, "pthread_key_create") == 0) {
+        ARMBAT_LOG_WARN("Armbat", "pthread key shim loaded but pthread_key_create is not exported");
+    } else {
+        ARMBAT_LOG_INFO("Armbat", "pthread keys: container table loaded and exported");
     }
 
     std::vector<GuestApk::ExtractedNative> extracted;
