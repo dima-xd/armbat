@@ -23,7 +23,7 @@ nothing is patched and nothing is installed.
 |---|---|
 | Stable | [releases/latest](https://github.com/dima-xd/armbat/releases/latest) |
 | Nightly | [releases/tag/nightly](https://github.com/dima-xd/armbat/releases/tag/nightly) |
-| Every build and changelog | [armbat-web.vercel.app](https://armbat-web.vercel.app/builds) |
+| Every build and changelog | [armbat.netlify.app](https://armbat.netlify.app/builds) |
 
 The app can also switch between the two channels in its settings.
 
