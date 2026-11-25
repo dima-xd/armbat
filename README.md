@@ -1,4 +1,4 @@
-English · [中文](README.zh.md) · [Website](https://armbat-web.vercel.app/) · [Discord](https://discord.gg/dSpQ7XamWT)
+English · [中文](README.zh.md) · [Website](https://armbat.netlify.app/) · [Discord](https://discord.gg/dSpQ7XamWT)
 
 [![Latest release](https://img.shields.io/github/v/release/dima-xd/armbat?sort=semver&label=release)](https://github.com/dima-xd/armbat/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/dima-xd/armbat/total?label=downloads)](https://github.com/dima-xd/armbat/releases)
@@ -23,7 +23,7 @@ nothing is patched and nothing is installed.
 |---|---|
 | Stable | [releases/latest](https://github.com/dima-xd/armbat/releases/latest) |
 | Nightly | [releases/tag/nightly](https://github.com/dima-xd/armbat/releases/tag/nightly) |
-| Every build and changelog | [armbat-web.vercel.app](https://armbat-web.vercel.app/builds) |
+| Every build and changelog | [armbat.netlify.app](https://armbat.netlify.app/builds) |
 
 The app can also switch between the two channels in its settings.
 
@@ -272,7 +272,7 @@ and no binary in this repository comes from anywhere else.
 
 ## Community
 
-- Website: [armbat-web.vercel.app](https://armbat-web.vercel.app/)
+- Website: [armbat-web.vercel.app](https://armbat.netlify.app/)
 - Discord: [discord.gg/dSpQ7XamWT](https://discord.gg/dSpQ7XamWT)
 - Bugs and game reports: [issues](https://github.com/dima-xd/armbat/issues)
 
