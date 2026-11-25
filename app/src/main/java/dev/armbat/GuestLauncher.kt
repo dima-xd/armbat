@@ -1554,7 +1554,7 @@ class GuestLauncher(private val host: Activity) {
         // after the resume, and an archive may drive its whole engine from
         // there: Unity's player only wakes up in onWindowFocusChanged. The
         // guest's decor never sees the host's focus, so the call is made here.
-        windowFocus(hosted.activity, true)
+        windowFocus(hosted, true)
     }
 
     /** Puts the activity's decor into the host and makes it the visible one. */
@@ -1591,7 +1591,7 @@ class GuestLauncher(private val host: Activity) {
      */
     private fun suspendHosted(hosted: Hosted) {
         if (hosted.resumed) {
-            windowFocus(hosted.activity, false)
+            windowFocus(hosted, false)
             lifecycle(hosted.activity, "onPause")
             hosted.resumed = false
         }
@@ -1621,7 +1621,7 @@ class GuestLauncher(private val host: Activity) {
         }
         runCatching {
             if (hosted.resumed) {
-                windowFocus(hosted.activity, false)
+                windowFocus(hosted, false)
                 ArmbatLog.i(TAG, "destroy: pause ${hosted.info.name}")
                 lifecycle(hosted.activity, "onPause")
                 hosted.resumed = false
@@ -1836,7 +1836,7 @@ class GuestLauncher(private val host: Activity) {
         hosted.resumed = false
         val start = android.os.SystemClock.uptimeMillis()
         try {
-            windowFocus(hosted.activity, false)
+            windowFocus(hosted, false)
             lifecycle(hosted.activity, "onPause")
             ArmbatLog.i(TAG, "paused: ${hosted.info.name} in ${since(start)} ms")
         } catch (error: Throwable) {
@@ -1926,7 +1926,7 @@ class GuestLauncher(private val host: Activity) {
         } catch (error: Throwable) {
             failure = error
         }
-        windowFocus(hosted.activity, true)
+        windowFocus(hosted, true)
         hosted.resumed = true
         if (failure == null) {
             ArmbatLog.i(TAG, "resumed: ${hosted.info.name} in ${since(start)} ms")
@@ -2083,18 +2083,39 @@ class GuestLauncher(private val host: Activity) {
      * view inside it, so nothing would ever call this on the archive. An archive
      * may depend on it completely: Unity's activity forwards it to its player,
      * which is where the engine is told to resume rendering.
+     *
+     * The archive's views need the same event. On a device the window's root
+     * calls dispatchWindowFocusChanged on the decor: the decor's own handler
+     * forwards it to the activity first, and then every view in the tree gets
+     * its onWindowFocusChanged. Here the host's window already has the focus
+     * when the guest decor is transplanted into it, so the views never heard of
+     * it. Gameloft's copy of GLSurfaceView only lets its renderer call the
+     * engine's step() after its own onWindowFocusChanged(true): N.O.V.A. 3
+     * (GAND 1.0.8e) ran a frame loop that never drew, and the screen stayed
+     * black until the host lost the focus and got it back. The decor's
+     * children are dispatched to, in the platform's order after the activity,
+     * and not the decor itself, which would call the activity a second time.
      */
-    private fun windowFocus(activity: Activity, hasFocus: Boolean) {
+    private fun windowFocus(hosted: Hosted, hasFocus: Boolean) {
         try {
             val method = Activity::class.java.getDeclaredMethod(
                 "onWindowFocusChanged",
                 java.lang.Boolean.TYPE,
             )
             method.isAccessible = true
-            method.invoke(activity, hasFocus)
+            method.invoke(hosted.activity, hasFocus)
             ArmbatLog.i(TAG, "window focus: $hasFocus delivered")
         } catch (error: Throwable) {
             ArmbatLog.i(TAG, "window focus: $hasFocus failed: ${error.cause ?: error}")
+        }
+        val decor = hosted.window.peekDecorView() as? ViewGroup ?: return
+        for (index in 0 until decor.childCount) {
+            val view = decor.getChildAt(index)
+            try {
+                view.dispatchWindowFocusChanged(hasFocus)
+            } catch (error: Throwable) {
+                ArmbatLog.i(TAG, "window focus: $hasFocus to ${view.javaClass.name} failed: $error")
+            }
         }
     }
 
