@@ -1563,7 +1563,26 @@ struct JniBridge::Impl {
 
         add(JNI_IDX(NewStringUTF), [this](HleCall& call) {
             JNIEnv* env = HostEnv();
-            call.Return(Handle(env, env->NewStringUTF(ArgString(call, call.Arg(1)).c_str())));
+            std::string text = ArgString(call, call.Arg(1));
+            // A path crosses here from the guest's native half to its Java half,
+            // and Java opens it with the framework's own file classes, where no
+            // syscall of this kernel can translate it: `new URL(<path>)` and the
+            // FileInputStream below it see the raw string. Mapping at the
+            // boundary keeps both halves on the same file -- a File built through
+            // this bridge already carries the container's path, and a path read
+            // back from the framework is already real, so nothing is mapped
+            // twice (the mapper leaves a path inside the tree alone).
+            if (!text.empty() && (text[0] == '/' || text[0] == 'f' || text[0] == 'F')) {
+                const std::string mapped = TranslatedText(text);
+                if (mapped != text) {
+                    if (LogAllowed("jni-file", 64)) {
+                        ARMBAT_LOG_INFO("Armbat", "jni: string path %s -> %s", text.c_str(),
+                                        mapped.c_str());
+                    }
+                    text = mapped;
+                }
+            }
+            call.Return(Handle(env, env->NewStringUTF(text.c_str())));
         });
 
         add(JNI_IDX(GetStringUTFLength), [this](HleCall& call) {
@@ -3248,6 +3267,62 @@ struct JniBridge::Impl {
             }
         }
         return env->IsSameObject(type, file_class) == JNI_TRUE;
+    }
+
+    // A string the guest's native half hands its Java half that names a guest
+    // file: the plain path, or a `file:` URL around one. Java opens both with
+    // the framework's own file classes, where this kernel's mapper never runs,
+    // so the name has to arrive already translated. Everything else is returned
+    // untouched.
+    std::string TranslatedText(const std::string& text) {
+        std::string path;
+        std::string prefix;
+        if (!text.empty() && text[0] == '/') {
+            path = text;
+        } else if (IsFileUrl(text)) {
+            // The scheme, then the authority. An empty authority is the local
+            // file system the guest means; a named one is a remote share, which
+            // this container does not own and leaves alone.
+            std::size_t start = 5;
+            if (text.compare(start, 2, "//") == 0) {
+                const std::size_t slash = text.find('/', start + 2);
+                if (slash == std::string::npos || slash != start + 2) {
+                    return text;
+                }
+                start = slash;
+            }
+            path = text.substr(start);
+            // Java's file handler folds the slashes of the empty authority away,
+            // so `file:////sdcard/x` names the same file as `file:///sdcard/x`.
+            while (path.size() > 1 && path[0] == '/' && path[1] == '/') {
+                path.erase(0, 1);
+            }
+            prefix = "file://";
+        } else {
+            return text;
+        }
+        const std::string mapped = container.MapPath(path);
+        if (mapped == path) {
+            return text;
+        }
+        return prefix + mapped;
+    }
+
+    static bool IsFileUrl(const std::string& text) {
+        if (text.size() < 5) {
+            return false;
+        }
+        constexpr char kScheme[] = "file:";
+        for (std::size_t index = 0; index < 5; ++index) {
+            char ch = text[index];
+            if (ch >= 'A' && ch <= 'Z') {
+                ch = static_cast<char>(ch - 'A' + 'a');
+            }
+            if (ch != kScheme[index]) {
+                return false;
+            }
+        }
+        return true;
     }
 
     // A guest's own code spells a path the way a device does --
