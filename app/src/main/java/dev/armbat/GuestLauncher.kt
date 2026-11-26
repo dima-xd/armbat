@@ -828,6 +828,12 @@ class GuestLauncher(private val host: Activity) {
         var started = false
         var resumed = false
 
+        /** The window focus the activity and its views were last told about. */
+        var windowFocused = false
+
+        /** A focus was due while the window was not on screen yet (see settle). */
+        var focusPending = false
+
         /** The archive called finish(); the result still has to be handed back. */
         var finished = false
         var destroyed = false
@@ -1643,6 +1649,17 @@ class GuestLauncher(private val host: Activity) {
             androidx.core.view.WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         this.hosted = hosted
         ArmbatLog.i(TAG, "guest activity shown: ${hosted.info.name}")
+        if (hosted.focusPending) {
+            // The window is on screen now, so the focus that was withheld can
+            // be reported (see windowFocus). It is posted rather than delivered
+            // here because the platform reports the focus of a window after its
+            // first traversal, not in the middle of adding it.
+            frame.post {
+                if (hosted.focusPending && hosted.resumed && this.hosted === hosted) {
+                    windowFocus(hosted, true)
+                }
+            }
+        }
     }
 
     /**
@@ -2146,7 +2163,39 @@ class GuestLauncher(private val host: Activity) {
      * The guest's window is the host's window, and the guest's decor is only a
      * view inside it, so nothing would ever call this on the archive. An archive
      * may depend on it completely: Unity's activity forwards it to its player,
-     * which is where the engine is told to resume rendering.
+     * which is where the engine is told to resume rendering. Only the changes
+     * are reported, as the platform reports them: the guest is never told it
+     * lost a focus it never had.
+     */
+    private fun windowFocus(hosted: Hosted, hasFocus: Boolean) {
+        if (!hasFocus) {
+            hosted.focusPending = false
+            if (!hosted.windowFocused) {
+                return
+            }
+            dispatchWindowFocus(hosted, false)
+            return
+        }
+        if (hosted.windowFocused) {
+            return
+        }
+        // The platform reports the focus of a window that is on screen, and the
+        // guest's decor may not be there yet: an archive that starts another
+        // activity from its own onCreate is resumed and then covered by the
+        // container before settle() ever puts its frame into the host, and the
+        // platform never shows that window at all. Handing its views a focus
+        // gain and a focus loss in that state arms engines that resume from the
+        // second event: N.O.V.A. 3's renderer then calls GameResume() on its
+        // first frame, before the engine has built its subsystems, and faults
+        // on the null VoiceChat singleton. The focus waits for settle().
+        if (!dispatchWindowFocus(hosted, true)) {
+            hosted.focusPending = true
+            ArmbatLog.i(TAG, "window focus: ${hosted.info.name} waits for its window")
+        }
+    }
+
+    /**
+     * Tells the guest's activity and the decor's children about the focus.
      *
      * The archive's views need the same event. On a device the window's root
      * calls dispatchWindowFocusChanged on the decor: the decor's own handler
@@ -2159,8 +2208,16 @@ class GuestLauncher(private val host: Activity) {
      * black until the host lost the focus and got it back. The decor's
      * children are dispatched to, in the platform's order after the activity,
      * and not the decor itself, which would call the activity a second time.
+     *
+     * A gain is refused while the decor is not attached to a window, because
+     * the platform never delivers one in that state; a loss always goes out.
+     * Returns false when the gain was refused.
      */
-    private fun windowFocus(hosted: Hosted, hasFocus: Boolean) {
+    private fun dispatchWindowFocus(hosted: Hosted, hasFocus: Boolean): Boolean {
+        val decor = hosted.window.peekDecorView() as? ViewGroup
+        if (hasFocus && (decor == null || !decor.isAttachedToWindow)) {
+            return false
+        }
         try {
             val method = Activity::class.java.getDeclaredMethod(
                 "onWindowFocusChanged",
@@ -2172,7 +2229,10 @@ class GuestLauncher(private val host: Activity) {
         } catch (error: Throwable) {
             ArmbatLog.i(TAG, "window focus: $hasFocus failed: ${error.cause ?: error}")
         }
-        val decor = hosted.window.peekDecorView() as? ViewGroup ?: return
+        hosted.windowFocused = hasFocus
+        if (decor == null) {
+            return true
+        }
         for (index in 0 until decor.childCount) {
             val view = decor.getChildAt(index)
             try {
@@ -2181,6 +2241,7 @@ class GuestLauncher(private val host: Activity) {
                 ArmbatLog.i(TAG, "window focus: $hasFocus to ${view.javaClass.name} failed: $error")
             }
         }
+        return true
     }
 
     /**
