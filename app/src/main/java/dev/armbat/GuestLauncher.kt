@@ -147,6 +147,16 @@ class GuestLauncher(private val host: Activity) {
     ) : ContextWrapper(base) {
         private var guestTheme: Resources.Theme? = null
 
+        /**
+         * The Application of this guest process, once it exists.
+         *
+         * On a device getApplicationContext() answers with the Application
+         * itself, whatever context of the process it is asked on. The base
+         * context has to exist before the Application is created, so this
+         * stays unset until guestApplication below publishes it.
+         */
+        var guestApplication: Application? = null
+
         /** One line per call and target: a retry loop must not flood the log. */
         private val refusedServiceCalls: MutableSet<String> = ConcurrentHashMap.newKeySet<String>()
 
@@ -325,8 +335,15 @@ class GuestLauncher(private val host: Activity) {
          * The application context of a guest has to resolve the archive's
          * resources: SDKs inflate their own layouts and read their own strings
          * through it, and the container's resources do not contain those ids.
+         *
+         * It is the archive's Application, as on a device: code that keeps
+         * process-wide state behind an `instanceof Application` check (the
+         * playmods launcher of Slendytubbies does this in its own onCreate)
+         * otherwise never initializes and dereferences a null singleton on
+         * the first lifecycle callback. The Application is attached to this
+         * context, so resources and package answers are still the archive's.
          */
-        override fun getApplicationContext(): Context = this
+        override fun getApplicationContext(): Context = guestApplication ?: this
 
         /**
          * A cloned inflater, so layouts referenced by the archive's ids are
@@ -2592,7 +2609,7 @@ class GuestLauncher(private val host: Activity) {
      * TelephonyManager, and the archive's cast to the guest class of that name
      * fails before its activity has started.
      */
-    private fun guestApplication(prepared: Prepared, context: Context): Application {
+    private fun guestApplication(prepared: Prepared, context: GuestContext): Application {
         val className = prepared.archiveInfo?.className
         val application = if (className.isNullOrEmpty()) {
             Application()
@@ -2613,6 +2630,9 @@ class GuestLauncher(private val host: Activity) {
         // What Application.attach does before onCreate: the base context is
         // where getPackageName, getResources and getContentResolver answer from.
         attachBaseContext(application, context)
+        // The platform answers getApplicationContext() with the Application
+        // from inside its own onCreate as well, so publish it before that call.
+        context.guestApplication = application
         application.onCreate()
         return application
     }
