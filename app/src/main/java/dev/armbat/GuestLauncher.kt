@@ -38,6 +38,7 @@ import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.net.URL
+import java.util.concurrent.ConcurrentHashMap
 import java.util.zip.ZipFile
 import kotlin.math.min
 
@@ -145,6 +146,9 @@ class GuestLauncher(private val host: Activity) {
         private val startGuest: (Intent) -> Boolean,
     ) : ContextWrapper(base) {
         private var guestTheme: Resources.Theme? = null
+
+        /** One line per call and target: a retry loop must not flood the log. */
+        private val refusedServiceCalls: MutableSet<String> = ConcurrentHashMap.newKeySet<String>()
 
         /**
          * Package queries from a guest describe the archive, not the container:
@@ -503,49 +507,55 @@ class GuestLauncher(private val host: Activity) {
             super.getSharedPreferences(name, legacyMode(mode))
 
         /**
-         * The container presents a device without Google services: nothing in it
-         * ships the Play Store, Play services or the licensing service, and the
-         * guest has to take the same "store unavailable" path it takes on such a
-         * device. On a phone that happens to have them installed the guest would
-         * otherwise connect to the real billing service and run a code path no
-         * offline container can support.
+         * The services a guest addresses do not exist on the device it is
+         * presented with.
+         *
+         * That device has one package -- the archive -- and the archive is not
+         * installed, so the platform never instantiates a Service its manifest
+         * declares, and the container does not run one. The call must not be
+         * handed to the phone either: a component of the phone's own would
+         * start an application the guest is not allowed to see, while an intent
+         * that names no package at all is rejected by the platform since API 21
+         * with IllegalArgumentException ("Service Intent must be explicit").
+         * EA's push helper starts com.google.android.c2dm.intent.REGISTER with
+         * an action alone, and that exception on the guest's main thread ends
+         * the process before the game appears.
+         *
+         * The answer is the one such a device gave when nothing installed
+         * matched the intent: nothing starts, and the caller receives the
+         * null/false of a missing service and carries on.
          */
-        private fun isUnavailableService(service: Intent): Boolean {
-            // The billing helper binds with an implicit intent (no package), so
-            // the action has to be checked as well as an explicit package name.
-            val packageName = service.`package`
-            if (packageName != null) {
-                if (packageName == "com.android.vending" ||
-                    packageName == "com.google.android.gms" ||
-                    packageName == "com.google.android.gsf" ||
-                    packageName == "com.google.android.gms.phenotype" ||
-                    packageName == "com.bda.controller"
-                ) {
-                    return true
-                }
+        private fun refuseService(call: String, service: Intent) {
+            val component = service.component
+            val target = component?.let { "${it.packageName}/${it.className}" }
+                ?: service.`package`
+                ?: service.action
+                ?: "service"
+            if (!refusedServiceCalls.add("$call $target")) {
+                return
             }
-            val action = service.action ?: return false
-            return action.startsWith("com.android.vending.") ||
-                action.startsWith("com.google.android.gms.") ||
-                action.startsWith("com.google.android.finsky.") ||
-                action == "com.bda.controller.IControllerService" ||
-                action.startsWith("com.bda.controller.")
+            ArmbatLog.i(TAG, "$call refused: $target is not part of this device")
         }
 
         override fun bindService(service: Intent, conn: ServiceConnection, flags: Int): Boolean {
-            if (isUnavailableService(service)) {
-                ArmbatLog.i(TAG, "bindService refused: ${service.`package` ?: service.action} is not part of this device")
-                return false
-            }
-            return super.bindService(service, conn, flags)
+            refuseService("bindService", service)
+            return false
         }
 
         override fun startService(service: Intent): ComponentName? {
-            if (isUnavailableService(service)) {
-                ArmbatLog.i(TAG, "startService refused: ${service.`package` ?: service.action} is not part of this device")
-                return null
-            }
-            return super.startService(service)
+            refuseService("startService", service)
+            return null
+        }
+
+        /** A newer archive asks for a foreground service by a call of its own. */
+        override fun startForegroundService(service: Intent): ComponentName? {
+            refuseService("startForegroundService", service)
+            return null
+        }
+
+        override fun stopService(service: Intent): Boolean {
+            refuseService("stopService", service)
+            return false
         }
 
         /**
