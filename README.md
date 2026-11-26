@@ -1,4 +1,4 @@
-English · [中文](README.zh.md) · [Website](armbat.arcueid.space) · [Discord](https://armbat.arcueid.space)
+English · [中文](README.zh.md) · [Website](https://armbat.arcueid.space) · [Discord](https://discord.gg/dSpQ7XamWT)
 
 [![Latest release](https://img.shields.io/github/v/release/dima-xd/armbat?sort=semver&label=release)](https://github.com/dima-xd/armbat/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/dima-xd/armbat/total?label=downloads)](https://github.com/dima-xd/armbat/releases)
