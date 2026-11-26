@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cerrno>
 #include <cstdint>
@@ -27,6 +28,7 @@
 #include "armbat/guest_input.h"
 #include "armbat/guest_kernel.h"
 #include "armbat/guest_memory.h"
+#include "armbat/guest_modules.h"
 #include "armbat/handles.h"
 #include "armbat/hle.h"
 #include "armbat/jni_bridge.h"
@@ -40,6 +42,7 @@
 // address-space boundary.
 
 namespace armbat {
+
 namespace {
 
 GuestKernel* g_kernel = nullptr;

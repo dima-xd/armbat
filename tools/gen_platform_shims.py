@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -77,6 +78,41 @@ FIXED_API = {
     "libart": JNI_INVOCATION_API,
     "libdvm": JNI_INVOCATION_API,
 }
+
+# The NDK ships one libGLESv2 stub per API level and it carries the GLES 2.0
+# surface only. A device's libGLESv2.so exports the GLES 3.x core entry points
+# from the same library, and engines rely on that: Unity reads GL_VERSION, takes
+# the ES 3.0 path and resolves glTexStorage2D through dlsym. Without the name in
+# the shim the lookup answers null, Unity stores null in its texture upload
+# table and the guest jumps to address zero. The names come from the NDK's own
+# GLES3 headers, so the shim still matches the toolchain it is built with.
+ES3_HEADERS = (
+    "GLES3/gl3.h",
+    "GLES3/gl31.h",
+    "GLES3/gl32.h",
+)
+API_DECLARATION = re.compile(r"GL_APICALL\s+[^;]*?GL_APIENTRY\s+(gl\w+)\s*\(", re.S)
+
+
+def read_api_declarations(include_root: str, headers: tuple[str, ...]) -> list[str]:
+    """Returns every function the given GLES headers declare, without repeats."""
+    names: list[str] = []
+    seen: set[str] = set()
+    for relative in headers:
+        path = os.path.join(include_root, relative)
+        if not os.path.isfile(path):
+            # Silent here would mean the shim quietly loses its ES 3 surface and
+            # the guest crashes on a null entry point again.
+            raise SystemExit(f"{path}: missing GLES header")
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            for match in API_DECLARATION.finditer(handle.read()):
+                name = match.group(1)
+                if name not in seen:
+                    seen.add(name)
+                    names.append(name)
+    if not names:
+        raise SystemExit(f"{include_root}: no GLES declarations found")
+    return names
 
 
 def read_dynsym(path: str) -> list[tuple[str, int]]:
@@ -202,6 +238,7 @@ def build(ndk: str, out_dir: str, api: int, libraries: list[str]) -> int:
     )
     if not os.path.isdir(stub_root):
         raise SystemExit(f"{stub_root}: no API {api} stub libraries")
+    include_root = os.path.join(toolchain, host, "sysroot", "usr", "include")
 
     text_dir = os.path.join(out_dir, "asm")
     lib_dir = os.path.join(out_dir, "lib")
@@ -217,6 +254,16 @@ def build(ndk: str, out_dir: str, api: int, libraries: list[str]) -> int:
         else:
             print(f"skip {library}: no API {api} stub", file=sys.stderr)
             continue
+        es3 = 0
+        if library == "libGLESv2":
+            # Appended after the stub's own names so a symbol declared by both
+            # keeps the kind the stub gave it.
+            known = {name for name, _kind in symbols}
+            for name in read_api_declarations(include_root, ES3_HEADERS):
+                if name not in known:
+                    known.add(name)
+                    symbols.append((name, STT_FUNC))
+                    es3 += 1
         funcs = sum(1 for _, kind in symbols if kind == STT_FUNC)
         source = os.path.join(text_dir, library + ".S")
         with open(source, "w", encoding="ascii", newline="\n") as handle:
@@ -250,7 +297,8 @@ def build(ndk: str, out_dir: str, api: int, libraries: list[str]) -> int:
             sys.stderr.write(result.stdout)
             sys.stderr.write(result.stderr)
             return result.returncode
-        print(f"{library}: {funcs} functions, {len(symbols) - funcs} objects -> {target}")
+        print(f"{library}: {funcs} functions, {len(symbols) - funcs} objects"
+              f"{f', +{es3} GLES3' if es3 else ''} -> {target}")
     return 0
 
 

@@ -4,6 +4,7 @@
 #include <dlfcn.h>
 
 #include <atomic>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -16,7 +17,9 @@
 
 #include "armbat/a32_machine.h"
 #include "armbat/guest_arena.h"
+#include "armbat/guest_modules.h"
 #include "armbat/hle.h"
+#include "armbat/handles.h"
 
 // GLES is forwarded to the host driver. The guest address space is the
 // arena and the arena is ordinary host memory, so a guest pointer is already a
@@ -42,11 +45,39 @@
 namespace armbat {
 namespace {
 
-constexpr bool kTraceGles = false;
-
+// The ES 3.0 entry points are exported by libGLESv3.so; libGLESv2.so carries the
+// ES 2.0 set and, depending on the platform build, an incomplete copy of the 3.0
+// one. Resolving through the ES 2.0 library alone left every 3.0 call null --
+// glTexStorage2D, glBindSampler, glDrawBuffers, glMapBufferRange and the rest --
+// and a null entry point is silently dropped by the handlers below. An engine on
+// the 3.0 path then draws from textures that never received storage and presents
+// a black frame with no error anywhere in the log. Both libraries are asked, the
+// 3.0 one first.
 void* GlSymbol(const char* name) {
-    static void* library = dlopen("libGLESv2.so", RTLD_NOW | RTLD_LOCAL);
-    return library != nullptr ? ::dlsym(library, name) : nullptr;
+    static void* es3 = dlopen("libGLESv3.so", RTLD_NOW | RTLD_LOCAL);
+    static void* es2 = dlopen("libGLESv2.so", RTLD_NOW | RTLD_LOCAL);
+    if (es3 != nullptr) {
+        if (void* symbol = ::dlsym(es3, name)) {
+            return symbol;
+        }
+    }
+    if (es2 != nullptr) {
+        if (void* symbol = ::dlsym(es2, name)) {
+            return symbol;
+        }
+    }
+    // A missing entry point used to be indistinguishable from a call that did
+    // nothing, which is how the entire ES 3.0 surface stayed dead without a line
+    // in the log. Say it once per name.
+    static std::mutex reported_mutex;
+    static std::set<std::string> reported;
+    {
+        const std::lock_guard lock(reported_mutex);
+        if (reported.insert(name).second) {
+            ARMBAT_LOG_WARN("Armbat", "gles: entry point %s is not on this driver", name);
+        }
+    }
+    return nullptr;
 }
 
 template <typename Function>
@@ -211,28 +242,52 @@ const Element* ArrayArg(HleCall& call, std::uint32_t address, const char* name) 
     return static_cast<const Element*>(range.bytes);
 }
 
-// Size of one pixel of a client texture / readback buffer, or 0 for a format
-// the helper does not know (then the range check falls back to one byte).
+// Bytes per pixel of a client texture / readback buffer, or 0 for a format the
+// helper does not know. A zero makes the caller skip the range check, so the
+// table has to cover the ES 3.0 formats as well as the ES 2.0 ones.
 std::size_t PixelSize(unsigned format, unsigned type) {
-    const bool packed = type == 0x8363 ||  // GL_UNSIGNED_SHORT_5_6_5
-                        type == 0x8033 ||  // GL_UNSIGNED_SHORT_4_4_4_4
-                        type == 0x8034;    // GL_UNSIGNED_SHORT_5_5_5_1
-    if (packed) {
-        return 2;
+    // Types that pack a whole pixel into one element; the format does not add
+    // components on top of them.
+    switch (type) {
+        case 0x8363:  // GL_UNSIGNED_SHORT_5_6_5
+        case 0x8033:  // GL_UNSIGNED_SHORT_4_4_4_4
+        case 0x8034:  // GL_UNSIGNED_SHORT_5_5_5_1
+            return 2;
+        case 0x8368:  // GL_UNSIGNED_INT_2_10_10_10_REV
+        case 0x84fa:  // GL_UNSIGNED_INT_24_8
+        case 0x8c3b:  // GL_UNSIGNED_INT_10F_11F_11F_REV
+        case 0x8c3e:  // GL_UNSIGNED_INT_5_9_9_9_REV
+            return 4;
+        case 0x8dad:  // GL_FLOAT_32_UNSIGNED_INT_24_8_REV
+            return 8;
+        default:
+            break;
     }
     std::size_t components = 0;
     switch (format) {
-        case 0x1908:  // GL_RGBA
-            components = 4;
+        case 0x1903:  // GL_RED
+        case 0x8d94:  // GL_RED_INTEGER
+            components = 1;
+            break;
+        case 0x8227:  // GL_RG
+        case 0x8228:  // GL_RG_INTEGER
+            components = 2;
             break;
         case 0x1907:  // GL_RGB
+        case 0x8d98:  // GL_RGB_INTEGER
             components = 3;
+            break;
+        case 0x1908:  // GL_RGBA
+        case 0x8d99:  // GL_RGBA_INTEGER
+            components = 4;
             break;
         case 0x190a:  // GL_LUMINANCE_ALPHA
             components = 2;
             break;
         case 0x1909:  // GL_LUMINANCE
         case 0x1906:  // GL_ALPHA
+        case 0x1902:  // GL_DEPTH_COMPONENT
+        case 0x84f9:  // GL_DEPTH_STENCIL
             components = 1;
             break;
         default:
@@ -240,14 +295,20 @@ std::size_t PixelSize(unsigned format, unsigned type) {
     }
     std::size_t element = 0;
     switch (type) {
+        case 0x1400:  // GL_BYTE
         case 0x1401:  // GL_UNSIGNED_BYTE
             element = 1;
             break;
-        case 0x1406:  // GL_FLOAT
-            element = 4;
-            break;
+        case 0x1402:  // GL_SHORT
+        case 0x1403:  // GL_UNSIGNED_SHORT
+        case 0x140b:  // GL_HALF_FLOAT
         case 0x8d61:  // GL_HALF_FLOAT_OES
             element = 2;
+            break;
+        case 0x1404:  // GL_INT
+        case 0x1405:  // GL_UNSIGNED_INT
+        case 0x1406:  // GL_FLOAT
+            element = 4;
             break;
         default:
             return 0;
@@ -255,24 +316,65 @@ std::size_t PixelSize(unsigned format, unsigned type) {
     return components * element;
 }
 
+// Where the image sits inside the guest buffer the driver is about to read or
+// write. GL_UNPACK_ROW_LENGTH and the skip values move it: a row can be longer
+// than the image is wide and the first pixel can start several rows into the
+// pointer. Ignoring them makes the check either too short -- the driver reads
+// past the checked range -- or too long, and a valid call is refused.
 std::size_t ImageSize(unsigned width, unsigned height, unsigned format, unsigned type,
-                      int alignment) {
+                      int alignment, int row_length = 0, int skip_rows = 0,
+                      int skip_pixels = 0) {
     const std::size_t pixel = PixelSize(format, type);
     if (pixel == 0 || width == 0 || height == 0) {
         return 0;
     }
-    const int align = alignment > 0 ? alignment : 1;
-    const std::size_t row = (static_cast<std::size_t>(width) * pixel + align - 1) /
-                            static_cast<std::size_t>(align) * static_cast<std::size_t>(align);
-    return row * height;
+    const std::size_t align = static_cast<std::size_t>(alignment > 0 ? alignment : 1);
+    const std::size_t stride =
+        static_cast<std::size_t>(row_length > 0 ? row_length : static_cast<int>(width));
+    std::size_t row = stride * pixel;
+    row = (row + align - 1) / align * align;
+    const std::size_t first_row = static_cast<std::size_t>(skip_rows > 0 ? skip_rows : 0);
+    const std::size_t first_column =
+        static_cast<std::size_t>(skip_pixels > 0 ? skip_pixels : 0);
+    const std::size_t first = first_row * row + first_column * pixel;
+    return first + static_cast<std::size_t>(height - 1) * row +
+           static_cast<std::size_t>(width) * pixel;
 }
 
-// How many ints glGetIntegerv writes for this pname. Multi-value state is the
-// exception; most queries write one value.
+// The same for a 3D upload: images are padded to GL_UNPACK_IMAGE_HEIGHT rows and
+// GL_UNPACK_SKIP_IMAGES of them can precede the first image.
+std::size_t ImageSize3D(unsigned width, unsigned height, unsigned depth, unsigned format,
+                        unsigned type, int alignment, int row_length, int skip_rows,
+                        int skip_pixels, int image_height, int skip_images) {
+    const std::size_t slice =
+        ImageSize(width, height, format, type, alignment, row_length, skip_rows, skip_pixels);
+    if (slice == 0 || depth == 0) {
+        return 0;
+    }
+    const std::size_t pixel = PixelSize(format, type);
+    const std::size_t align = static_cast<std::size_t>(alignment > 0 ? alignment : 1);
+    const std::size_t stride =
+        static_cast<std::size_t>(row_length > 0 ? row_length : static_cast<int>(width));
+    std::size_t row = stride * pixel;
+    row = (row + align - 1) / align * align;
+    const std::size_t rows =
+        static_cast<std::size_t>(image_height > 0 ? image_height : static_cast<int>(height));
+    const std::size_t image = rows * row;
+    const std::size_t first =
+        static_cast<std::size_t>(skip_images > 0 ? skip_images : 0) * image;
+    return first + slice + static_cast<std::size_t>(depth - 1) * image;
+}
+
+// How many elements glGet* writes for this pname. Multi-value state is the
+// exception; most queries write one value. A multi-value pname missing from this
+// table makes the range check too short and the driver then writes past the
+// guest buffer that was checked, so the table has to cover every ES 2.0/3.0
+// query that answers with more than one element.
 std::size_t ValueCount(unsigned pname) {
     switch (pname) {
         case 0x0ba2:  // GL_VIEWPORT
         case 0x0c10:  // GL_SCISSOR_BOX
+        case 0x0c22:  // GL_COLOR_CLEAR_VALUE
         case 0x0c23:  // GL_COLOR_WRITEMASK
         case 0x8005:  // GL_BLEND_COLOR
             return 4;
@@ -281,11 +383,42 @@ std::size_t ValueCount(unsigned pname) {
         case 0x846d:  // GL_ALIASED_POINT_SIZE_RANGE
         case 0x846e:  // GL_ALIASED_LINE_WIDTH_RANGE
             return 2;
-        case 0x86a3:  // GL_COMPRESSED_TEXTURE_FORMATS
-            return 16;
+        case 0x91be:  // GL_MAX_COMPUTE_WORK_GROUP_COUNT
+        case 0x91bf:  // GL_MAX_COMPUTE_WORK_GROUP_SIZE
+            return 3;
         default:
             return 1;
     }
+}
+
+// The format lists have no fixed length: the driver answers how many entries it
+// has, and the guest's buffer is sized from that same number. The number is
+// capped so a broken answer cannot ask for an unbounded check.
+std::size_t ValueCountQuery(unsigned pname) {
+    unsigned int count_name = 0;
+    switch (pname) {
+        case 0x86a3:  // GL_COMPRESSED_TEXTURE_FORMATS
+            count_name = 0x86a2;  // GL_NUM_COMPRESSED_TEXTURE_FORMATS
+            break;
+        case 0x8df7:  // GL_PROGRAM_BINARY_FORMATS
+            count_name = 0x87fe;  // GL_NUM_PROGRAM_BINARY_FORMATS
+            break;
+        case 0x8df6:  // GL_SHADER_BINARY_FORMATS
+            count_name = 0x8df9;  // GL_NUM_SHADER_BINARY_FORMATS
+            break;
+        default:
+            return ValueCount(pname);
+    }
+    const auto get_integer = Gl<void (*)(unsigned int, int*)>("glGetIntegerv");
+    if (get_integer == nullptr) {
+        return 0;
+    }
+    int count = 0;
+    get_integer(count_name, &count);
+    if (count <= 0) {
+        return 0;
+    }
+    return count > 64 ? 64u : static_cast<std::size_t>(count);
 }
 
 std::size_t IndexSize(unsigned type) {
@@ -317,8 +450,507 @@ struct GlesState {
     std::unordered_map<unsigned long long, StringCell> indexed_strings;
     std::uint32_t array_buffer = 0;
     std::uint32_t element_buffer = 0;
+    // A bound pixel buffer turns the pixels argument into an offset, so the two
+    // have to be told apart before anything is range-checked.
+    std::uint32_t unpack_buffer = 0;  // GL_PIXEL_UNPACK_BUFFER
+    std::uint32_t pack_buffer = 0;    // GL_PIXEL_PACK_BUFFER
     int unpack_alignment = 4;
     int pack_alignment = 4;
+    // Pixel store state that moves the first pixel of an image away from the
+    // pointer: a row length longer than the image, skipped rows, pixels and
+    // images. ES 3.0 engines set them for atlas sub-uploads.
+    int unpack_row_length = 0;
+    int unpack_skip_rows = 0;
+    int unpack_skip_pixels = 0;
+    int unpack_image_height = 0;
+    int unpack_skip_images = 0;
+    int pack_row_length = 0;
+    int pack_skip_rows = 0;
+    int pack_skip_pixels = 0;
+    // A glMapBufferRange range held in a staging cell in the HLE data area,
+    // because the driver's own mapping is host memory the guest cannot address.
+    // Ranges are identified by the buffer object: an engine maps several buffers
+    // through one target (GL_COPY_WRITE_BUFFER is its staging path) and every one
+    // of them stays mapped until its own unmap, so a table keyed by target throws
+    // away the range that was mapped first.
+    struct Mapping {
+        std::uint32_t cell = 0;
+        std::intptr_t offset = 0;
+        std::intptr_t length = 0;
+        std::uint32_t buffer = 0;
+        unsigned int target = 0;
+        bool writable = false;
+    };
+    // Keyed by buffer object.
+    std::unordered_map<unsigned int, Mapping> mappings;
+    // Every binding the guest establishes, by target. The four named fields above
+    // are the hot paths; a target the container has no field for still has to be
+    // known, because a mapped range is looked up by the buffer bound to its
+    // target when the guest unmaps it.
+    std::unordered_map<unsigned int, unsigned int> bindings;
+    // Client-side vertex arrays: the driver dereferences these only at the draw
+    // that reads them, so the range has to be checked there, not at the call
+    // that sets the pointer.
+    struct ClientArray {
+        bool enabled = false;
+        std::uint32_t pointer = 0;
+        unsigned int buffer = 0;  // non-zero: the pointer is an offset and the data is safe
+        int size = 4;
+        unsigned int type = 0x1406;  // GL_FLOAT
+        int stride = 0;
+    };
+    std::array<ClientArray, 16> attribs{};
+    ClientArray legacy_vertex;
+    ClientArray legacy_color;
+    ClientArray legacy_normal;
+    ClientArray legacy_texcoord;
+    // Largest index value an element buffer holds, per index width: a draw with
+    // client arrays has no other way to know how far the arrays are read.
+    struct IndexMax {
+        std::uint32_t bytes = 0;
+        std::uint32_t shorts = 0;
+        std::uint32_t words = 0;
+    };
+    std::unordered_map<unsigned int, IndexMax> index_max;
+};
+
+// Pixel store state, copied out under the state lock so a call site can compute
+// a buffer layout without holding it.
+struct PixelStore {
+    int alignment = 4;
+    int row_length = 0;
+    int skip_rows = 0;
+    int skip_pixels = 0;
+    int image_height = 0;
+    int skip_images = 0;
+};
+
+PixelStore UnpackStoreLocked(const GlesState& state) {
+    PixelStore store;
+    store.alignment = state.unpack_alignment;
+    store.row_length = state.unpack_row_length;
+    store.skip_rows = state.unpack_skip_rows;
+    store.skip_pixels = state.unpack_skip_pixels;
+    store.image_height = state.unpack_image_height;
+    store.skip_images = state.unpack_skip_images;
+    return store;
+}
+
+PixelStore PackStoreLocked(const GlesState& state) {
+    PixelStore store;
+    store.alignment = state.pack_alignment;
+    store.row_length = state.pack_row_length;
+    store.skip_rows = state.pack_skip_rows;
+    store.skip_pixels = state.pack_skip_pixels;
+    return store;
+}
+
+// Largest upload the container copies through the data area. Staging is the
+// fallback for a range that is not entirely mapped, not the normal path.
+constexpr std::size_t kMaxStagedBytes = 32u << 20;
+
+// The driver reads guest pixels through the fastmem view, so a range that is not
+// entirely mapped must not reach it: the read would run past the mapping and
+// take the host process down. The image itself can still be valid -- an engine
+// uploads a sub-rectangle of an atlas, or the tail of a buffer it allocated
+// flat -- so the mapped bytes are copied into a staging block and the rest is
+// zeroed instead of dropping the upload.
+class StagedRead {
+public:
+    StagedRead(HleRegistry& registry, HleCall& call, std::uint32_t address, std::size_t length)
+        : registry_(registry) {
+        if (length == 0) {
+            ok_ = true;
+            return;
+        }
+        // A null pixels argument is legal on the upload paths: allocate the
+        // storage without data. Staging a zero-filled block for it would copy
+        // megabytes for every mip level of a texture that has none.
+        if (address == 0) {
+            ok_ = true;
+            return;
+        }
+        if (static_cast<std::uint64_t>(address) + length > 0xffffffffull) {
+            return;
+        }
+        if (std::byte* mapped = call.Mapped(address, length)) {
+            bytes_ = mapped;
+            ok_ = true;
+            return;
+        }
+        if (length > kMaxStagedBytes) {
+            return;
+        }
+        cell_ = registry_.AllocateData(static_cast<std::uint32_t>(length));
+        if (cell_ == 0) {
+            return;
+        }
+        auto* staging = static_cast<std::byte*>(registry_.Arena().Ptr(cell_));
+        if (staging == nullptr) {
+            registry_.ReleaseData(cell_);
+            cell_ = 0;
+            return;
+        }
+        std::memset(staging, 0, length);
+        // Copy what is mapped one page at a time: the range also straddles the
+        // end of a mapping, and the pages before it still hold the pixels.
+        for (std::size_t offset = 0; offset < length;) {
+            const std::size_t to_page = 4096 - ((address + offset) & 4095u);
+            const std::size_t chunk = to_page < length - offset ? to_page : length - offset;
+            if (std::byte* source =
+                    call.Mapped(static_cast<std::uint32_t>(address + offset), chunk)) {
+                std::memcpy(staging + offset, source, chunk);
+            }
+            offset += chunk;
+        }
+        bytes_ = staging;
+        ok_ = true;
+    }
+
+    ~StagedRead() {
+        if (cell_ != 0) {
+            registry_.ReleaseData(cell_);
+        }
+    }
+
+    StagedRead(const StagedRead&) = delete;
+    StagedRead& operator=(const StagedRead&) = delete;
+
+    std::byte* bytes() const { return bytes_; }
+    bool ok() const { return ok_; }
+
+private:
+    HleRegistry& registry_;
+    std::uint32_t cell_ = 0;
+    std::byte* bytes_ = nullptr;
+    bool ok_ = false;
+};
+
+// Largest index value in an element buffer, for every index width. A draw that
+// reads a client-side vertex array with an element buffer bound has no other way
+// to know how far that array is read: the driver resolves the indices itself.
+GlesState::IndexMax ScanIndexMax(const std::byte* data, std::size_t length) {
+    GlesState::IndexMax out;
+    if (data == nullptr) {
+        return out;
+    }
+    for (std::size_t i = 0; i < length; ++i) {
+        const auto value = static_cast<std::uint32_t>(data[i]);
+        if (value > out.bytes) {
+            out.bytes = value;
+        }
+    }
+    for (std::size_t i = 0; i + 1 < length; i += 2) {
+        std::uint16_t value = 0;
+        std::memcpy(&value, data + i, sizeof(value));
+        if (value > out.shorts) {
+            out.shorts = value;
+        }
+    }
+    for (std::size_t i = 0; i + 3 < length; i += 4) {
+        std::uint32_t value = 0;
+        std::memcpy(&value, data + i, sizeof(value));
+        if (value > out.words) {
+            out.words = value;
+        }
+    }
+    return out;
+}
+
+// Keeps the element-buffer index bounds current. A draw that reads client-side
+// vertex arrays needs the largest index the buffer can hold; reading it back from
+// the driver at draw time would stall the pipeline, so the bound is taken when
+// the buffer is uploaded.
+void UpdateIndexMax(const std::shared_ptr<GlesState>& state, unsigned int target,
+                    std::size_t length, bool replace, const std::byte* data) {
+    if (target != 0x8893) {  // GL_ELEMENT_ARRAY_BUFFER
+        return;
+    }
+    std::uint32_t name = 0;
+    {
+        const std::lock_guard lock(state->mutex);
+        name = state->element_buffer;
+    }
+    if (name == 0) {
+        return;
+    }
+    const GlesState::IndexMax scan = ScanIndexMax(data, length);
+    const std::lock_guard lock(state->mutex);
+    GlesState::IndexMax& cell = state->index_max[name];
+    if (replace) {
+        cell = scan;
+        return;
+    }
+    // A partial update can only raise the bound: an over-estimate keeps the check
+    // valid, an under-estimate would let a bad index through unread.
+    if (scan.bytes > cell.bytes) cell.bytes = scan.bytes;
+    if (scan.shorts > cell.shorts) cell.shorts = scan.shorts;
+    if (scan.words > cell.words) cell.words = scan.words;
+}
+
+// Bytes one vertex array element occupies in guest memory.
+std::size_t AttributeElementSize(unsigned int type) {
+    switch (type) {
+        case 0x1400:  // GL_BYTE
+        case 0x1401:  // GL_UNSIGNED_BYTE
+            return 1;
+        case 0x1402:  // GL_SHORT
+        case 0x1403:  // GL_UNSIGNED_SHORT
+        case 0x140b:  // GL_HALF_FLOAT
+            return 2;
+        case 0x1404:  // GL_INT
+        case 0x1405:  // GL_UNSIGNED_INT
+        case 0x1406:  // GL_FLOAT
+        case 0x8368:  // GL_UNSIGNED_INT_2_10_10_10_REV
+        case 0x8d9f:  // GL_INT_2_10_10_10_REV
+            return 4;
+        default:
+            return 0;
+    }
+}
+
+bool HasClientArrays(const std::shared_ptr<GlesState>& state) {
+    const std::lock_guard lock(state->mutex);
+    for (const GlesState::ClientArray& array : state->attribs) {
+        if (array.enabled && array.buffer == 0) {
+            return true;
+        }
+    }
+    return state->legacy_vertex.enabled || state->legacy_color.enabled ||
+           state->legacy_normal.enabled || state->legacy_texcoord.enabled;
+}
+
+// The driver dereferences a client-side array only when the draw runs, so the
+// check belongs here, with the largest vertex index the draw can reach. Only
+// arrays without a buffer object need it: with a buffer bound the driver reads
+// its own memory.
+bool ValidateDrawArrays(HleCall& call, const std::shared_ptr<GlesState>& state,
+                        const char* name, std::uint64_t max_index, bool bounded) {
+    if (!bounded) {
+        return true;
+    }
+    const auto check = [&](const GlesState::ClientArray& array) {
+        if (!array.enabled || array.buffer != 0 || array.size <= 0) {
+            return true;
+        }
+        const std::size_t element = AttributeElementSize(array.type);
+        if (element == 0) {
+            return true;
+        }
+        const std::uint64_t stride =
+            array.stride > 0 ? static_cast<std::uint64_t>(array.stride)
+                             : static_cast<std::uint64_t>(array.size) * element;
+        const std::uint64_t end = static_cast<std::uint64_t>(array.pointer) +
+                                  max_index * stride +
+                                  static_cast<std::uint64_t>(array.size) * element;
+        if (end > 0xffffffffull) {
+            RejectBuffer(name, array.pointer, 1);
+            return false;
+        }
+        const std::size_t length = static_cast<std::size_t>(end - array.pointer);
+        if (call.Mapped(array.pointer, length) == nullptr) {
+            RejectBuffer(name, array.pointer, length);
+            return false;
+        }
+        return true;
+    };
+    const std::lock_guard lock(state->mutex);
+    for (const GlesState::ClientArray& array : state->attribs) {
+        if (!check(array)) {
+            return false;
+        }
+    }
+    return check(state->legacy_vertex) && check(state->legacy_color) &&
+           check(state->legacy_normal) && check(state->legacy_texcoord);
+}
+
+// Largest index in a guest-side index array, or false when the array cannot be
+// read. Only the legacy path (no element buffer) reaches this.
+bool ScanClientIndices(HleCall& call, std::uint32_t address, int count, unsigned int type,
+                       std::uint64_t* max_index) {
+    const std::size_t element = IndexSize(type);
+    if (element == 0 || count <= 0) {
+        return false;
+    }
+    const std::size_t length = static_cast<std::size_t>(count) * element;
+    const std::byte* indices = call.Mapped(address, length);
+    if (indices == nullptr) {
+        return false;
+    }
+    std::uint64_t largest = 0;
+    for (int i = 0; i < count; ++i) {
+        std::uint32_t value = 0;
+        if (element == 1) {
+            value = static_cast<unsigned char>(indices[i]);
+        } else if (element == 2) {
+            std::uint16_t half = 0;
+            std::memcpy(&half, indices + static_cast<std::size_t>(i) * 2, sizeof(half));
+            value = half;
+        } else {
+            std::memcpy(&value, indices + static_cast<std::size_t>(i) * 4, sizeof(value));
+        }
+        if (value > largest) {
+            largest = value;
+        }
+    }
+    *max_index = largest;
+    return true;
+}
+
+// The buffer the container believes is bound to target, in the terms the guest
+// uses. Never called while the state mutex is already held elsewhere in a way
+// that matters: every caller takes the lock around it.
+std::uint32_t TrackedBinding(const GlesState& state, unsigned int target) {
+    const auto found = state.bindings.find(target);
+    if (found != state.bindings.end()) {
+        return found->second;
+    }
+    switch (target) {
+        case 0x8892:  // GL_ARRAY_BUFFER
+            return state.array_buffer;
+        case 0x8893:  // GL_ELEMENT_ARRAY_BUFFER
+            return state.element_buffer;
+        case 0x88ef:  // GL_PIXEL_UNPACK_BUFFER
+            return state.unpack_buffer;
+        case 0x88eb:  // GL_PIXEL_PACK_BUFFER
+            return state.pack_buffer;
+        default:
+            return 0;
+    }
+}
+
+// The mapping the guest means by glUnmapBuffer(target) or
+// glFlushMappedBufferRange(target): the range on the buffer bound to that target
+// and, when the engine unmapped without rebinding, the only range still open on
+// the target. The caller holds the state mutex.
+bool FindMapping(GlesState& state, unsigned int target, GlesState::Mapping* mapping,
+                 unsigned int* owner) {
+    const std::uint32_t buffer = TrackedBinding(state, target);
+    const auto found = state.mappings.find(buffer);
+    if (found != state.mappings.end()) {
+        *mapping = found->second;
+        *owner = found->first;
+        return true;
+    }
+    for (const auto& entry : state.mappings) {
+        if (entry.second.target == target) {
+            *mapping = entry.second;
+            *owner = entry.first;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Reads a range of the buffer bound to target. glGetBufferSubData is not on
+// every driver (this one does not export it), and mapping the same range is the
+// portable way to get the bytes out; without it a guest that maps a range for
+// reading gets zeros back and works on data it never wrote.
+bool ReadBackRange(unsigned int target, std::intptr_t offset, std::intptr_t length, void* out) {
+    const auto read_back =
+        Gl<void (*)(unsigned int, std::intptr_t, std::intptr_t, void*)>("glGetBufferSubData");
+    if (read_back != nullptr) {
+        read_back(target, offset, length, out);
+    } else {
+        const auto map = Gl<void* (*)(unsigned int, std::intptr_t, std::intptr_t, unsigned int)>(
+            "glMapBufferRange");
+        const auto unmap = Gl<unsigned char (*)(unsigned int)>("glUnmapBuffer");
+        if (map == nullptr || unmap == nullptr) {
+            return false;
+        }
+        const auto* source =
+            static_cast<const unsigned char*>(map(target, offset, length, 0x0001u /* READ */));
+        if (source == nullptr) {
+            return false;
+        }
+        std::memcpy(out, source, static_cast<std::size_t>(length));
+        unmap(target);
+    }
+    // The read is the container's own call: an error it raises must not be left
+    // for the guest to read as the answer to its next query.
+    const auto take_error = Gl<unsigned int (*)(void)>("glGetError");
+    if (take_error != nullptr) {
+        take_error();
+    }
+    return true;
+}
+
+// The staging cell of a mapped range reaches the driver through glBufferSubData,
+// which writes into the buffer bound to the target at that moment. The engine may
+// have rebound the target since it mapped, so the binding is set to the mapped
+// buffer for the duration of the upload and put back afterwards.
+void UploadMappedRange(HleRegistry& registry, GlesState& state, unsigned int target,
+                       const GlesState::Mapping& mapping, std::intptr_t offset,
+                       std::intptr_t length) {
+    if (!mapping.writable || mapping.cell == 0 || length <= 0 || offset < 0) {
+        return;
+    }
+    if (offset >= mapping.length) {
+        return;
+    }
+    if (offset + length > mapping.length) {
+        length = mapping.length - offset;
+    }
+    const auto upload =
+        Gl<void (*)(unsigned int, std::intptr_t, std::intptr_t, const void*)>("glBufferSubData");
+    if (upload == nullptr) {
+        return;
+    }
+    const auto* bytes = static_cast<const std::byte*>(registry.Arena().Ptr(mapping.cell));
+    if (bytes == nullptr) {
+        return;
+    }
+    std::uint32_t current = 0;
+    {
+        const std::lock_guard lock(state.mutex);
+        current = TrackedBinding(state, target);
+    }
+    const auto bind = Gl<void (*)(unsigned int, unsigned int)>("glBindBuffer");
+    const bool rebind = bind != nullptr && mapping.buffer != 0 && current != mapping.buffer;
+    if (rebind) {
+        bind(target, mapping.buffer);
+    }
+    upload(target, mapping.offset + offset, length, bytes + offset);
+    if (rebind) {
+        bind(target, current);
+    }
+}
+
+// The pixels argument of an upload call in the form the driver takes it. A bound
+// GL_PIXEL_UNPACK_BUFFER makes the argument an offset into that buffer, so no
+// guest memory is involved; otherwise the guest range is checked and, when it is
+// not entirely mapped, served from a staging copy instead of being dropped.
+class UploadPixels {
+public:
+    UploadPixels(HleRegistry& registry, HleCall& call,
+                 const std::shared_ptr<GlesState>& state, std::uint32_t address,
+                 std::size_t length, const char* name) {
+        std::uint32_t unpack_buffer = 0;
+        {
+            const std::lock_guard lock(state->mutex);
+            unpack_buffer = state->unpack_buffer;
+        }
+        if (unpack_buffer != 0) {
+            bytes_ = reinterpret_cast<void*>(static_cast<std::uintptr_t>(address));
+            ok_ = true;
+            return;
+        }
+        staged_ = std::make_unique<StagedRead>(registry, call, address, length);
+        if (!staged_->ok()) {
+            RejectBuffer(name, address, length);
+            return;
+        }
+        bytes_ = staged_->bytes();
+        ok_ = true;
+    }
+
+    void* bytes() const { return bytes_; }
+    bool ok() const { return ok_; }
+
+private:
+    std::unique_ptr<StagedRead> staged_;
+    void* bytes_ = nullptr;
+    bool ok_ = false;
 };
 
 // Copies `text` into a guest cell and returns its address. The cell is reused as
@@ -343,32 +975,41 @@ std::uint32_t StringCellAddress(HleRegistry& registry, StringCell& cell,
 // Extensions are filtered down to the ones whose advertised surface is fully
 // supported. GL_OES_framebuffer_object is safe because its entry points are
 // forwarded through the GLES 1.x host library below. The list must not be
-// empty, though -- engines probe it to pick
-// internal formats for their off-screen targets. Without packed_depth_stencil
-// Unity builds a depth-only renderbuffer, attaches it at the stencil point and
-// keeps drawing into an incomplete framebuffer: every draw then fails with
+// empty, though -- engines probe it to pick internal formats for their
+// off-screen targets. Without packed_depth_stencil Unity builds a depth-only
+// renderbuffer, attaches it at the stencil point and keeps drawing into an
+// incomplete framebuffer: every draw then fails with
 // GL_INVALID_FRAMEBUFFER_OPERATION and the window presents pure black while all
 // the call counters look healthy.
+constexpr const char* kSafeExtensions[] = {
+    "GL_OES_framebuffer_object",
+    "GL_OES_packed_depth_stencil",
+    "GL_OES_depth24",
+    "GL_OES_stencil8",
+    "GL_OES_stencil4",
+    "GL_OES_rgb8_rgba8",
+    "GL_OES_fbo_render_mipmap",
+    "GL_OES_standard_derivatives",
+    "GL_EXT_texture_format_BGRA8888",
+};
+
+bool ListsExtension(const std::string& driver, const char* name) {
+    const std::size_t at = driver.find(name);
+    if (at == std::string::npos) {
+        return false;
+    }
+    // A prefix of a longer name is not the same extension.
+    const std::size_t end = at + std::strlen(name);
+    if (end < driver.size() && driver[end] != ' ') {
+        return false;
+    }
+    return at == 0 || driver[at - 1] == ' ';
+}
+
 std::string FilterExtensions(const std::string& driver) {
-    static const char* const kSafe[] = {
-        "GL_OES_framebuffer_object",
-        "GL_OES_packed_depth_stencil",
-        "GL_OES_depth24",
-        "GL_OES_stencil8",
-        "GL_OES_stencil4",
-        "GL_OES_rgb8_rgba8",
-        "GL_OES_fbo_render_mipmap",
-        "GL_OES_standard_derivatives",
-        "GL_EXT_texture_format_BGRA8888",
-    };
     std::string out;
-    for (const char* name : kSafe) {
-        const std::size_t at = driver.find(name);
-        if (at == std::string::npos) {
-            continue;
-        }
-        const std::size_t end = at + std::strlen(name);
-        if (end < driver.size() && driver[end] != ' ') {
+    for (const char* name : kSafeExtensions) {
+        if (!ListsExtension(driver, name)) {
             continue;
         }
         if (!out.empty()) {
@@ -379,10 +1020,88 @@ std::string FilterExtensions(const std::string& driver) {
     return out;
 }
 
+// The driver's extension list, read the way the current context allows. ES 3.0
+// removed the single GL_EXTENSIONS string: asking for it there raises
+// GL_INVALID_ENUM, and the error the container left behind is then read by the
+// guest as the failure of whatever it checked next.
+std::vector<std::string> DriverExtensions() {
+    std::vector<std::string> out;
+    const int version = CurrentContextVersion();
+    const auto get_string = Gl<const unsigned char* (*)(unsigned int)>("glGetString");
+    const auto get_string_i =
+        Gl<const unsigned char* (*)(unsigned int, unsigned int)>("glGetStringi");
+    const auto get_integer = Gl<void (*)(unsigned int, int*)>("glGetIntegerv");
+    const bool indexed = version >= 3 || get_string == nullptr;
+    if (indexed) {
+        if (get_string_i != nullptr && get_integer != nullptr) {
+            int count = 0;
+            get_integer(0x821d, &count);  // GL_NUM_EXTENSIONS
+            if (count > 0 && count < 4096) {
+                for (int i = 0; i < count; ++i) {
+                    const unsigned char* name = get_string_i(0x1f03, i);
+                    if (name != nullptr) {
+                        out.emplace_back(reinterpret_cast<const char*>(name));
+                    }
+                }
+            }
+        }
+    }
+    if (!indexed || (out.empty() && version == 0)) {
+        const unsigned char* all = get_string != nullptr ? get_string(0x1f03) : nullptr;
+        if (all != nullptr) {
+            const char* text = reinterpret_cast<const char*>(all);
+            const std::size_t length = std::strlen(text);
+            std::size_t at = 0;
+            while (at < length) {
+                std::size_t end = at;
+                while (end < length && text[end] != ' ') {
+                    ++end;
+                }
+                if (end > at) {
+                    out.emplace_back(text + at, end - at);
+                }
+                at = end + 1;
+            }
+        }
+    }
+    return out;
+}
+
+// What the container tells the guest it supports. On an ES 2.0 context the
+// driver lists extensions in one string; on an ES 3.0 context the guest
+// enumerates them through GL_NUM_EXTENSIONS and glGetStringi, and that is the
+// path Unity 5.3 takes. Answering zero there made it believe the GPU had no
+// packed_depth_stencil -- and no other extension at all -- so it fell back to a
+// framebuffer the driver rejects every draw against: black window, healthy
+// counters.
+std::vector<std::string> AdvertisedExtensions() {
+    const std::vector<std::string> driver = DriverExtensions();
+    std::vector<std::string> out;
+    for (const char* name : kSafeExtensions) {
+        for (const std::string& have : driver) {
+            if (have == name) {
+                out.emplace_back(name);
+                break;
+            }
+        }
+    }
+    return out;
+}
+
+// Mechanical handlers, generated by tools/gen_gles.py from the NDK's own GLES
+// headers. Included inside the anonymous namespace so Gl<>/FloatArg stay
+// private to this file, and so the generated function gets internal linkage.
+#include "generated/guest_gles_auto.inc"
+
 }  // namespace
 
 void RegisterGlesFunctions(HleRegistry& registry) {
     auto state = std::make_shared<GlesState>();
+
+    // The mechanical entry points first. HleRegistry::Add replaces an existing
+    // name, so the hand-written handlers below -- the ones whose pointers, 64-bit
+    // values or return buffers need marshalling -- always win.
+    RegisterGlesGeneratedFunctions(registry);
 
     // ---- strings and errors ------------------------------------------------
 
@@ -393,11 +1112,6 @@ void RegisterGlesFunctions(HleRegistry& registry) {
         static const auto es2 = Gl<const unsigned char* (*)(unsigned int)>("glGetString");
         static const auto es1 = Gl1<const unsigned char* (*)(unsigned int)>("glGetString");
         const int context_version = CurrentContextVersion();
-        static std::atomic<bool> reported{false};
-        if (!reported.exchange(true)) {
-            ARMBAT_LOG_INFO("Armbat", "gles: glGetString with context client version %d",
-                            context_version);
-        }
         const auto function = (context_version == 1 && es1 != nullptr) ? es1 : es2;
         if (function == nullptr) {
             call.Return(0);
@@ -414,18 +1128,17 @@ void RegisterGlesFunctions(HleRegistry& registry) {
 		// stays filtered to the subset this container implements, including
         // the OES framebuffer entry points registered below.
         if (name == 0x1f02) {  // GL_VERSION
-            // Loaders such as glad parse this string to decide which entry
-            // points to fetch. The host driver is ES 3.x even for the ES 2.0
-            // context the guest asks for, and engines built against that
-            // driver call the ES 3.0 surface unconditionally (Minecraft's
-            // screenshot path does exactly that with glReadBuffer). Reporting
-            // 2.0 here left those pointers null and the guest jumped to
-            // address zero. 3.0 rather than the driver's 3.2 keeps the loader
-            // to the core ES 3.0 list this container serves.
+            // Loaders parse this string to decide which entry points to fetch,
+            // so it has to describe the surface this container serves and match
+            // GL_MAJOR_VERSION, GL_MINOR_VERSION and the shading language string
+            // exactly. The ES 2.0 context path also answers 3.0: engines built
+            // against an ES 3 driver call the 3.0 surface unconditionally
+            // (Minecraft's screenshot path does exactly that with glReadBuffer),
+            // and telling them 2.0 leaves those pointers null.
             //
-            // A GLES 1.x context is the exception: it has no shader path, and
-            // an engine told it has one takes the ES2 route and dereferences
-            // what the context never provided.
+            // A GLES 1.x context is the exception: it has no shader path, and an
+            // engine told it has one takes the ES2 route and dereferences what
+            // the context never provided.
             value = context_version == 1 ? "OpenGL ES-CM 1.1 (Armbat)"
                                          : "OpenGL ES 3.0 (Armbat)";
         } else if (name == 0x8b8c) {  // GL_SHADING_LANGUAGE_VERSION
@@ -436,16 +1149,15 @@ void RegisterGlesFunctions(HleRegistry& registry) {
                 call.Return(0);
                 return;
             }
-            value = "OpenGL ES GLSL ES 1.00";
+            // Must agree with GL_VERSION above, or an engine that reads both
+            // concludes the shading language cannot express the API it was told
+            // about and falls back to a path the container does not serve.
+            value = "OpenGL ES GLSL ES 3.00";
         } else if (name == 0x1f03) {  // GL_EXTENSIONS
             value = FilterExtensions(value);
         }
         const std::lock_guard lock(state->mutex);
         const std::uint32_t cell = StringCellAddress(registry, state->strings[name], value);
-        if (kTraceGles) {
-            ARMBAT_LOG_INFO("Armbat", "glGetString(0x%x): %s", name,
-                                value.substr(0, 120).c_str());
-        }
         call.Return(cell);
     });
     registry.Add("glGetStringi", [&registry, state](HleCall& call) {
@@ -457,12 +1169,26 @@ void RegisterGlesFunctions(HleRegistry& registry) {
         }
         const unsigned int name = call.Arg(0);
         const unsigned int index = call.Arg(1);
-        const unsigned char* text = function(name, index);
-        if (text == nullptr) {
-            call.Return(0);
-            return;
+        std::string value;
+        if (name == 0x1f03) {  // GL_EXTENSIONS
+            // The enumerated list is the same filtered list the single-string
+            // query answers with and that GL_NUM_EXTENSIONS counts. Handing the
+            // guest the driver's own list would advertise entry points and
+            // formats this container does not serve.
+            const std::vector<std::string> advertised = AdvertisedExtensions();
+            if (index >= advertised.size()) {
+                call.Return(0);
+                return;
+            }
+            value = advertised[index];
+        } else {
+            const unsigned char* text = function(name, index);
+            if (text == nullptr) {
+                call.Return(0);
+                return;
+            }
+            value = reinterpret_cast<const char*>(text);
         }
-        const std::string value(reinterpret_cast<const char*>(text));
         const unsigned long long key = (static_cast<unsigned long long>(name) << 32) | index;
         const std::lock_guard lock(state->mutex);
         const std::uint32_t cell =
@@ -478,21 +1204,34 @@ void RegisterGlesFunctions(HleRegistry& registry) {
         if (function == nullptr) {
             return;
         }
-        int* out = reinterpret_cast<int*>(call.Mapped(call.Arg(1), ValueCount(call.Arg(0)) *
-                                                                sizeof(int)));
-        if (out == nullptr) {
-            RejectBuffer("glGetIntegerv", call.Arg(1), ValueCount(call.Arg(0)) * sizeof(int));
+        const std::size_t length = ValueCountQuery(call.Arg(0)) * sizeof(int);
+        int* out = length != 0
+                       ? reinterpret_cast<int*>(call.Mapped(call.Arg(1), length))
+                       : nullptr;
+        if (length != 0 && out == nullptr) {
+            RejectBuffer("glGetIntegerv", call.Arg(1), length);
             return;
         }
+        // These three answer for the surface the container serves, the way a
+        // driver does, and not for the host context the driver happens to run.
+        // They have to agree with GL_VERSION and GL_SHADING_LANGUAGE_VERSION
+        // above: an engine reads all of them into the caps it validates itself
+        // against, and a mismatch sends Unity 5.3 down a path its context does
+        // not support (it printed "GPU not supported" and exited on the reverse
+        // mismatch).
+        const int context_version = CurrentContextVersion();
         switch (call.Arg(0)) {
             case 0x821b:  // GL_MAJOR_VERSION
-                *out = 2;
+                *out = context_version == 1 ? 1 : 3;
                 return;
             case 0x821c:  // GL_MINOR_VERSION
                 *out = 0;
                 return;
             case 0x821d:  // GL_NUM_EXTENSIONS
-                *out = 0;
+                // The count has to match what glGetStringi enumerates and what
+                // the single-string query returns, or an engine that probes the
+                // enumerated path sees no extensions at all.
+                *out = static_cast<int>(AdvertisedExtensions().size());
                 return;
             default:
                 function(call.Arg(0), out);
@@ -504,9 +1243,11 @@ void RegisterGlesFunctions(HleRegistry& registry) {
         if (function == nullptr) {
             return;
         }
-        const std::size_t length = ValueCount(call.Arg(0)) * sizeof(float);
-        float* out = reinterpret_cast<float*>(call.Mapped(call.Arg(1), length));
-        if (out == nullptr) {
+        const std::size_t length = ValueCountQuery(call.Arg(0)) * sizeof(float);
+        float* out = length != 0
+                         ? reinterpret_cast<float*>(call.Mapped(call.Arg(1), length))
+                         : nullptr;
+        if (length != 0 && out == nullptr) {
             RejectBuffer("glGetFloatv", call.Arg(1), length);
             return;
         }
@@ -518,9 +1259,12 @@ void RegisterGlesFunctions(HleRegistry& registry) {
         if (function == nullptr) {
             return;
         }
-        const std::size_t length = ValueCount(call.Arg(0));
-        unsigned char* out = reinterpret_cast<unsigned char*>(call.Mapped(call.Arg(1), length));
-        if (out == nullptr) {
+        const std::size_t length = ValueCountQuery(call.Arg(0));
+        unsigned char* out =
+            length != 0
+                ? reinterpret_cast<unsigned char*>(call.Mapped(call.Arg(1), length))
+                : nullptr;
+        if (length != 0 && out == nullptr) {
             RejectBuffer("glGetBooleanv", call.Arg(1), length);
             return;
         }
@@ -663,18 +1407,57 @@ void RegisterGlesFunctions(HleRegistry& registry) {
         if (function != nullptr) {
             function(call.Arg(0), static_cast<int>(call.Arg(1)));
         }
+        const int value = static_cast<int>(call.Arg(1));
         const std::lock_guard lock(state->mutex);
-        if (call.Arg(0) == 0x0cf5) {  // GL_UNPACK_ALIGNMENT
-            state->unpack_alignment = static_cast<int>(call.Arg(1));
-        } else if (call.Arg(0) == 0x0d05) {  // GL_PACK_ALIGNMENT
-            state->pack_alignment = static_cast<int>(call.Arg(1));
+        switch (call.Arg(0)) {
+            case 0x0cf5:  // GL_UNPACK_ALIGNMENT
+                state->unpack_alignment = value;
+                break;
+            case 0x0cf2:  // GL_UNPACK_ROW_LENGTH
+                state->unpack_row_length = value;
+                break;
+            case 0x0cf3:  // GL_UNPACK_SKIP_ROWS
+                state->unpack_skip_rows = value;
+                break;
+            case 0x0cf4:  // GL_UNPACK_SKIP_PIXELS
+                state->unpack_skip_pixels = value;
+                break;
+            case 0x806e:  // GL_UNPACK_IMAGE_HEIGHT
+                state->unpack_image_height = value;
+                break;
+            case 0x806d:  // GL_UNPACK_SKIP_IMAGES
+                state->unpack_skip_images = value;
+                break;
+            case 0x0d05:  // GL_PACK_ALIGNMENT
+                state->pack_alignment = value;
+                break;
+            case 0x0d02:  // GL_PACK_ROW_LENGTH
+                state->pack_row_length = value;
+                break;
+            case 0x0d03:  // GL_PACK_SKIP_ROWS
+                state->pack_skip_rows = value;
+                break;
+            case 0x0d04:  // GL_PACK_SKIP_PIXELS
+                state->pack_skip_pixels = value;
+                break;
+            default:
+                break;
         }
     });
-    // ES 2.0 has a single read buffer, so the desktop call that selects it has
-    // nothing to select. Engines still call it before glReadPixels; on a device
-    // the loader exports it from libGLESv2, and here the name has to exist or a
-    // glad-style loader leaves a null entry point that is then called.
-    registry.Add("glReadBuffer", [](HleCall&) {});
+    // ES 2.0 has a single read buffer, so there is nothing to select there and
+    // the call is a no-op. On an ES 3.0 context it is real state: it decides
+    // which attachment glReadPixels and glBlitFramebuffer read from, and an
+    // engine that selects GL_COLOR_ATTACHMENT0 for a readback gets the back
+    // buffer instead when the selection is dropped.
+    registry.Add("glReadBuffer", [](HleCall& call) {
+        if (CurrentContextVersion() < 3) {
+            return;
+        }
+        static const auto function = Gl<void (*)(unsigned int)>("glReadBuffer");
+        if (function != nullptr) {
+            function(call.Arg(0));
+        }
+    });
 
     registry.Add("glSampleCoverage", [](HleCall& call) {
         static const auto function = Gl<void (*)(float, unsigned char)>("glSampleCoverage");
@@ -768,15 +1551,20 @@ void RegisterGlesFunctions(HleRegistry& registry) {
         const unsigned int buffer = call.Arg(1);
         {
             const std::lock_guard lock(state->mutex);
+            state->bindings[target] = buffer;
             if (target == 0x8892) {  // GL_ARRAY_BUFFER
                 state->array_buffer = buffer;
             } else if (target == 0x8893) {  // GL_ELEMENT_ARRAY_BUFFER
                 state->element_buffer = buffer;
+            } else if (target == 0x88ef) {  // GL_PIXEL_UNPACK_BUFFER
+                state->unpack_buffer = buffer;
+            } else if (target == 0x88eb) {  // GL_PIXEL_PACK_BUFFER
+                state->pack_buffer = buffer;
             }
         }
         if (function != nullptr) function(target, buffer);
     });
-    registry.Add("glBufferData", [](HleCall& call) {
+    registry.Add("glBufferData", [&registry, state](HleCall& call) {
         static const auto function =
             Gl<void (*)(unsigned int, std::ptrdiff_t, const void*, unsigned int)>("glBufferData");
         if (function == nullptr) {
@@ -787,13 +1575,25 @@ void RegisterGlesFunctions(HleRegistry& registry) {
             return;
         }
         // `data` is a pointer to the new contents (or null), never an offset.
-        const Buffer data = GuestBuffer(call, call.Arg(2), static_cast<std::size_t>(size));
-        if (!CheckBuffer("glBufferData", call.Arg(2), data, static_cast<std::size_t>(size))) {
+        // Null is a legal size-only allocation and must stay null instead of
+        // being turned into a zero-filled staging block.
+        void* data = nullptr;
+        if (call.Arg(2) != 0) {
+            StagedRead staged(registry, call, call.Arg(2), static_cast<std::size_t>(size));
+            if (!staged.ok()) {
+                RejectBuffer("glBufferData", call.Arg(2), static_cast<std::size_t>(size));
+                return;
+            }
+            data = staged.bytes();
+            function(call.Arg(0), size, data, call.Arg(3));
+            UpdateIndexMax(state, call.Arg(0), static_cast<std::size_t>(size), true,
+                           static_cast<const std::byte*>(data));
             return;
         }
-        function(call.Arg(0), size, data.bytes, call.Arg(3));
+        function(call.Arg(0), size, nullptr, call.Arg(3));
+        UpdateIndexMax(state, call.Arg(0), static_cast<std::size_t>(size), true, nullptr);
     });
-    registry.Add("glBufferSubData", [](HleCall& call) {
+    registry.Add("glBufferSubData", [&registry, state](HleCall& call) {
         static const auto function =
             Gl<void (*)(unsigned int, std::ptrdiff_t, std::ptrdiff_t, const void*)>(
                 "glBufferSubData");
@@ -805,11 +1605,14 @@ void RegisterGlesFunctions(HleRegistry& registry) {
         if (offset < 0 || size < 0) {
             return;
         }
-        const Buffer data = GuestBuffer(call, call.Arg(3), static_cast<std::size_t>(size));
-        if (!CheckBuffer("glBufferSubData", call.Arg(3), data, static_cast<std::size_t>(size))) {
+        StagedRead staged(registry, call, call.Arg(3), static_cast<std::size_t>(size));
+        if (!staged.ok()) {
+            RejectBuffer("glBufferSubData", call.Arg(3), static_cast<std::size_t>(size));
             return;
         }
-        function(call.Arg(0), offset, size, data.bytes);
+        function(call.Arg(0), offset, size, staged.bytes());
+        UpdateIndexMax(state, call.Arg(0), static_cast<std::size_t>(size), false,
+                       static_cast<const std::byte*>(staged.bytes()));
     });
     registry.Add("glGetBufferParameteriv", [](HleCall& call) {
         static const auto function =
@@ -823,6 +1626,104 @@ void RegisterGlesFunctions(HleRegistry& registry) {
             return;
         }
         function(call.Arg(0), call.Arg(1), out);
+    });
+    // glMapBufferRange hands the guest a pointer into the driver's buffer. That
+    // memory is host memory the guest cannot address, so the range is mapped
+    // through a staging cell instead: filled from the driver when the guest asked
+    // for the old contents, uploaded back on unmap. Answering null here lost
+    // everything an engine wrote through the pointer -- dynamic geometry never
+    // reached the GPU while every call counter looked healthy.
+    registry.Add("glMapBufferRange", [&registry, state](HleCall& call) {
+        const unsigned int target = call.Arg(0);
+        const std::int64_t offset = static_cast<std::int32_t>(call.Arg(1));
+        const std::int64_t length = static_cast<std::int32_t>(call.Arg(2));
+        const unsigned int access = call.Arg(3);
+        if (offset < 0 || length <= 0 ||
+            static_cast<std::uint64_t>(offset) + static_cast<std::uint64_t>(length) >
+                0x7fffffffull ||
+            length > static_cast<std::int64_t>(kMaxStagedBytes)) {
+            call.Return(0);
+            return;
+        }
+        const std::uint32_t cell = registry.AllocateData(static_cast<std::uint32_t>(length));
+        if (cell == 0) {
+            call.Return(0);
+            return;
+        }
+        auto* staging = static_cast<std::byte*>(registry.Arena().Ptr(cell));
+        if (staging == nullptr) {
+            registry.ReleaseData(cell);
+            call.Return(0);
+            return;
+        }
+        std::memset(staging, 0, static_cast<std::size_t>(length));
+        if ((access & 0x0001u) != 0) {  // GL_MAP_READ_BIT
+            ReadBackRange(target, static_cast<std::intptr_t>(offset),
+                          static_cast<std::intptr_t>(length), staging);
+        }
+        std::uint32_t replaced = 0;
+        {
+            const std::lock_guard lock(state->mutex);
+            const std::uint32_t owner = TrackedBinding(*state, target);
+            GlesState::Mapping& mapping = state->mappings[owner];
+            replaced = mapping.cell;
+            mapping.cell = cell;
+            mapping.offset = static_cast<std::intptr_t>(offset);
+            mapping.length = static_cast<std::intptr_t>(length);
+            mapping.buffer = owner;
+            mapping.target = target;
+            mapping.writable = (access & 0x0002u) != 0;  // GL_MAP_WRITE_BIT
+        }
+        if (replaced != 0) {
+            registry.ReleaseData(replaced);
+        }
+        call.Return(cell);
+    });
+    registry.Add("glUnmapBuffer", [&registry, state](HleCall& call) {
+        const unsigned int target = call.Arg(0);
+        GlesState::Mapping mapping;
+        unsigned int owner = 0;
+        bool mapped = false;
+        {
+            const std::lock_guard lock(state->mutex);
+            if (FindMapping(*state, target, &mapping, &owner)) {
+                state->mappings.erase(owner);
+                mapped = true;
+            }
+        }
+        if (!mapped || mapping.cell == 0) {
+            call.Return(0);  // the driver answers GL_FALSE for an unmapped target
+            return;
+        }
+        if (mapping.writable) {
+            UploadMappedRange(registry, *state, target, mapping, 0, mapping.length);
+        }
+        registry.ReleaseData(mapping.cell);
+        call.Return(1);  // GL_TRUE
+    });
+    registry.Add("glFlushMappedBufferRange", [&registry, state](HleCall& call) {
+        const unsigned int target = call.Arg(0);
+        const std::intptr_t offset = static_cast<std::int32_t>(call.Arg(1));
+        const std::intptr_t length = static_cast<std::int32_t>(call.Arg(2));
+        if (offset < 0 || length <= 0) {
+            return;
+        }
+        GlesState::Mapping mapping;
+        unsigned int owner = 0;
+        bool mapped = false;
+        {
+            const std::lock_guard lock(state->mutex);
+            mapped = FindMapping(*state, target, &mapping, &owner);
+        }
+        if (!mapped) {
+            return;
+        }
+        // A flushed range has to reach the driver now: an engine that streams
+        // geometry maps once, writes, flushes and draws every frame, and only
+        // unmaps when the buffer is recycled. Waiting for the unmap left the
+        // driver reading the buffer's previous contents, so every dynamic draw
+        // came out of zeroed vertices with nothing in the log to show it.
+        UploadMappedRange(registry, *state, target, mapping, offset, length);
     });
 
     // ---- GL_OES_framebuffer_object (GLES 1.x extension) -------------------
@@ -1058,7 +1959,38 @@ void RegisterGlesFunctions(HleRegistry& registry) {
     });
     registry.Add("glCompileShader", [](HleCall& call) {
         static const auto function = Gl<void (*)(unsigned int)>("glCompileShader");
-        if (function != nullptr) function(call.Arg(0));
+        if (function == nullptr) {
+            return;
+        }
+        function(call.Arg(0));
+        // The verdict is taken here, not when the engine asks: a failed shader
+        // is often deleted before its status is queried, and then the only
+        // trace left is a subsystem that silently turns itself off.
+        static const auto get_shaderiv =
+            Gl<void (*)(unsigned int, unsigned int, int*)>("glGetShaderiv");
+        if (get_shaderiv == nullptr) {
+            return;
+        }
+        int status = 1;
+        get_shaderiv(call.Arg(0), 0x8b81 /* GL_COMPILE_STATUS */, &status);
+        if (status != 0) {
+            return;
+        }
+        static std::atomic<unsigned> reported{0};
+        if (reported.fetch_add(1, std::memory_order_relaxed) >= 8) {
+            return;
+        }
+        int type = 0;
+        get_shaderiv(call.Arg(0), 0x8b7f /* GL_SHADER_TYPE */, &type);
+        char text[1024] = {};
+        int written = 0;
+        static const auto info_log =
+            Gl<void (*)(unsigned int, int, int*, char*)>("glGetShaderInfoLog");
+        if (info_log != nullptr) {
+            info_log(call.Arg(0), static_cast<int>(sizeof(text)), &written, text);
+        }
+        ARMBAT_LOG_WARN("Armbat", "gles: compile failed shader=%u type=0x%x: %s", call.Arg(0), type,
+                        text);
     });
     registry.Add("glReleaseShaderCompiler", [](HleCall&) {
         static const auto function = Gl<void (*)(void)>("glReleaseShaderCompiler");
@@ -1086,6 +2018,53 @@ void RegisterGlesFunctions(HleRegistry& registry) {
         }
         function(count, static_cast<const unsigned int*>(names.bytes), call.Arg(2), binary.bytes,
                  binary_length);
+    });
+    // The program-binary pair is driver work, not a stub. An engine caches the
+    // linked program and reads GL_LINK_STATUS right after loading it, so a
+    // handler that silently returns nothing is indistinguishable from a
+    // shader that failed to compile. The host driver validates the blob the
+    // same way the device does and reports a rejected one through glGetError.
+    registry.Add("glProgramBinary", [](HleCall& call) {
+        static const auto function =
+            Gl<void (*)(unsigned int, unsigned int, const void*, int)>("glProgramBinary");
+        if (function == nullptr) {
+            return;
+        }
+        const int length = static_cast<int>(call.Arg(3));
+        if (length < 0) {
+            return;
+        }
+        const Buffer binary = GuestBuffer(call, call.Arg(2), static_cast<std::size_t>(length));
+        if (!CheckBuffer("glProgramBinary", call.Arg(2), binary,
+                         static_cast<std::size_t>(length))) {
+            return;
+        }
+        function(call.Arg(0), call.Arg(1), binary.bytes, length);
+    });
+    registry.Add("glGetProgramBinary", [](HleCall& call) {
+        static const auto function = Gl<void (*)(unsigned int, int, int*, unsigned int*, void*)>(
+            "glGetProgramBinary");
+        if (function == nullptr) {
+            return;
+        }
+        const int size = static_cast<int>(call.Arg(1));
+        if (size < 0) {
+            return;
+        }
+        int* length = call.Arg(2) != 0
+                          ? reinterpret_cast<int*>(call.Mapped(call.Arg(2), sizeof(int)))
+                          : nullptr;
+        unsigned int* format =
+            call.Arg(3) != 0
+                ? reinterpret_cast<unsigned int*>(call.Mapped(call.Arg(3), sizeof(unsigned int)))
+                : nullptr;
+        const Buffer binary = GuestBuffer(call, call.Arg(4), static_cast<std::size_t>(size));
+        if ((call.Arg(2) != 0 && length == nullptr) || (call.Arg(3) != 0 && format == nullptr) ||
+            !CheckBuffer("glGetProgramBinary", call.Arg(4), binary,
+                         static_cast<std::size_t>(size))) {
+            return;
+        }
+        function(call.Arg(0), size, length, format, binary.bytes);
     });
     registry.Add("glAttachShader", [](HleCall& call) {
         static const auto function =
@@ -1227,7 +2206,8 @@ void RegisterGlesFunctions(HleRegistry& registry) {
         if (info_log != nullptr) {
             info_log(program, static_cast<int>(sizeof(log)), &written, log);
         }
-        ARMBAT_LOG_WARN("Armbat", "gles: program %u failed: %s", program, log);
+        ARMBAT_LOG_WARN("Armbat", "gles: program %u failed: %s caller=%s", program, log,
+                        armbat::DescribeGuestAddress(call.Machine().Reg(14)).c_str());
         unsigned int shaders[8] = {};
         int attached = 0;
         static const auto get_attached =
@@ -1473,29 +2453,93 @@ void RegisterGlesFunctions(HleRegistry& registry) {
         if (function == nullptr) {
             return;
         }
+        const unsigned int index = call.Arg(0);
+        const int size = static_cast<int>(call.Arg(1));
+        const unsigned int type = call.Arg(2);
+        const int stride = static_cast<int>(call.Arg(4));
         std::uint32_t buffer = 0;
         {
             const std::lock_guard lock(state->mutex);
             buffer = state->array_buffer;
         }
+        // The driver dereferences the array only at the draw, so the first
+        // element is checked here and the range the draw reaches is checked by
+        // ValidateDrawArrays.
+        const std::size_t element = AttributeElementSize(type);
+        const std::size_t first =
+            element != 0 && size > 0 ? element * static_cast<std::size_t>(size) : 1;
         bool ok = true;
-        void* pointer =
-            OffsetOrPointer(call, call.Arg(5), buffer, 1, "glVertexAttribPointer", &ok);
+        void* pointer = OffsetOrPointer(call, call.Arg(5), buffer, first,
+                                        "glVertexAttribPointer", &ok);
         if (!ok) {
             return;
         }
-        function(call.Arg(0), static_cast<int>(call.Arg(1)), call.Arg(2),
-                 static_cast<unsigned char>(call.Arg(3)), static_cast<int>(call.Arg(4)), pointer);
+        if (index < state->attribs.size()) {
+            const std::lock_guard lock(state->mutex);
+            GlesState::ClientArray& array = state->attribs[index];
+            array.pointer = call.Arg(5);
+            array.buffer = buffer;
+            array.size = size;
+            array.type = type;
+            array.stride = stride;
+        }
+        function(index, size, type, static_cast<unsigned char>(call.Arg(3)), stride, pointer);
     });
-    registry.Add("glEnableVertexAttribArray", [](HleCall& call) {
+    registry.Add("glVertexAttribIPointer", [state](HleCall& call) {
+        static const auto function =
+            Gl<void (*)(unsigned int, int, unsigned int, int, const void*)>(
+                "glVertexAttribIPointer");
+        if (function == nullptr) {
+            return;
+        }
+        const unsigned int index = call.Arg(0);
+        const int size = static_cast<int>(call.Arg(1));
+        const unsigned int type = call.Arg(2);
+        const int stride = static_cast<int>(call.Arg(3));
+        std::uint32_t buffer = 0;
+        {
+            const std::lock_guard lock(state->mutex);
+            buffer = state->array_buffer;
+        }
+        const std::size_t element = AttributeElementSize(type);
+        const std::size_t first =
+            element != 0 && size > 0 ? element * static_cast<std::size_t>(size) : 1;
+        bool ok = true;
+        void* pointer =
+            OffsetOrPointer(call, call.Arg(4), buffer, first, "glVertexAttribIPointer", &ok);
+        if (!ok) {
+            return;
+        }
+        if (index < state->attribs.size()) {
+            const std::lock_guard lock(state->mutex);
+            GlesState::ClientArray& array = state->attribs[index];
+            array.pointer = call.Arg(4);
+            array.buffer = buffer;
+            array.size = size;
+            array.type = type;
+            array.stride = stride;
+        }
+        function(index, size, type, stride, pointer);
+    });
+    registry.Add("glEnableVertexAttribArray", [state](HleCall& call) {
         static const auto function =
             Gl<void (*)(unsigned int)>("glEnableVertexAttribArray");
         if (function != nullptr) function(call.Arg(0));
+        const unsigned int index = call.Arg(0);
+        if (index < state->attribs.size()) {
+            const std::lock_guard lock(state->mutex);
+            state->attribs[index].enabled = true;
+        }
     });
-    registry.Add("glDisableVertexAttribArray", [](HleCall& call) {
+    registry.Add("glDisableVertexAttribArray", [state](HleCall& call) {
         static const auto function =
             Gl<void (*)(unsigned int)>("glDisableVertexAttribArray");
         if (function != nullptr) function(call.Arg(0));
+        const unsigned int index = call.Arg(0);
+        if (index < state->attribs.size()) {
+            const std::lock_guard lock(state->mutex);
+            state->attribs[index].enabled = false;
+        }
     });
     registry.Add("glVertexAttrib1f", [](HleCall& call) {
         static const auto function = Gl<void (*)(unsigned int, float)>("glVertexAttrib1f");
@@ -1627,7 +2671,7 @@ void RegisterGlesFunctions(HleRegistry& registry) {
         const std::uint32_t cell = call.Arg(2);
         call.CopyOut(cell, &value, sizeof(value));
     });
-    registry.Add("glDrawArrays", [](HleCall& call) {
+    registry.Add("glDrawArrays", [state](HleCall& call) {
         static const auto function =
             Gl<void (*)(unsigned int, int, int)>("glDrawArrays");
         if (function == nullptr) {
@@ -1637,6 +2681,13 @@ void RegisterGlesFunctions(HleRegistry& registry) {
         const int count = static_cast<int>(call.Arg(2));
         if (first < 0 || count < 0) {
             return;
+        }
+        if (count > 0 && HasClientArrays(state)) {
+            const std::uint64_t max_index = static_cast<std::uint64_t>(first) +
+                                            static_cast<std::uint64_t>(count - 1);
+            if (!ValidateDrawArrays(call, state, "glDrawArrays", max_index, true)) {
+                return;
+            }
         }
         function(call.Arg(0), first, count);
     });
@@ -1663,6 +2714,37 @@ void RegisterGlesFunctions(HleRegistry& registry) {
         if (!ok) {
             return;
         }
+        // Client-side attributes are read through the indices, so the largest
+        // index the draw can reach bounds the range they have to cover. With an
+        // element buffer that value comes from the upload-time scan; without
+        // one the guest's own index array is read here.
+        if (count > 0 && HasClientArrays(state)) {
+            bool bounded = false;
+            std::uint64_t max_index = 0;
+            if (buffer != 0) {
+                GlesState::IndexMax bounds;
+                bool known = false;
+                {
+                    const std::lock_guard lock(state->mutex);
+                    const auto found = state->index_max.find(buffer);
+                    if (found != state->index_max.end()) {
+                        bounds = found->second;
+                        known = true;
+                    }
+                }
+                if (known) {
+                    max_index = index_size == 1 ? bounds.bytes
+                                : index_size == 2 ? bounds.shorts
+                                                  : bounds.words;
+                    bounded = true;
+                }
+            } else {
+                bounded = ScanClientIndices(call, call.Arg(3), count, call.Arg(2), &max_index);
+            }
+            if (!ValidateDrawArrays(call, state, "glDrawElements", max_index, bounded)) {
+                return;
+            }
+        }
         function(call.Arg(0), count, call.Arg(2), indices);
     });
 
@@ -1675,16 +2757,50 @@ void RegisterGlesFunctions(HleRegistry& registry) {
     // stays unset in the driver, and the first glDrawElements reads the vertex
     // array through a null pointer and takes the host process down inside the
     // driver.
-    registry.Add("glEnableClientState", [](HleCall& call) {
+    registry.Add("glEnableClientState", [state](HleCall& call) {
         static const auto function = Gl1<void (*)(unsigned int)>("glEnableClientState");
         if (function != nullptr) {
             function(call.Arg(0));
         }
+        const std::lock_guard lock(state->mutex);
+        switch (call.Arg(0)) {
+            case 0x8074:  // GL_VERTEX_ARRAY
+                state->legacy_vertex.enabled = true;
+                break;
+            case 0x8075:  // GL_NORMAL_ARRAY
+                state->legacy_normal.enabled = true;
+                break;
+            case 0x8076:  // GL_COLOR_ARRAY
+                state->legacy_color.enabled = true;
+                break;
+            case 0x8078:  // GL_TEXTURE_COORD_ARRAY
+                state->legacy_texcoord.enabled = true;
+                break;
+            default:
+                break;
+        }
     });
-    registry.Add("glDisableClientState", [](HleCall& call) {
+    registry.Add("glDisableClientState", [state](HleCall& call) {
         static const auto function = Gl1<void (*)(unsigned int)>("glDisableClientState");
         if (function != nullptr) {
             function(call.Arg(0));
+        }
+        const std::lock_guard lock(state->mutex);
+        switch (call.Arg(0)) {
+            case 0x8074:  // GL_VERTEX_ARRAY
+                state->legacy_vertex.enabled = false;
+                break;
+            case 0x8075:  // GL_NORMAL_ARRAY
+                state->legacy_normal.enabled = false;
+                break;
+            case 0x8076:  // GL_COLOR_ARRAY
+                state->legacy_color.enabled = false;
+                break;
+            case 0x8078:  // GL_TEXTURE_COORD_ARRAY
+                state->legacy_texcoord.enabled = false;
+                break;
+            default:
+                break;
         }
     });
     registry.Add("glVertexPointer", [state](HleCall& call) {
@@ -1702,6 +2818,14 @@ void RegisterGlesFunctions(HleRegistry& registry) {
         void* pointer = OffsetOrPointer(call, call.Arg(3), buffer, 1, "glVertexPointer", &ok);
         if (!ok) {
             return;
+        }
+        if (buffer == 0) {
+            const std::lock_guard lock(state->mutex);
+            state->legacy_vertex.pointer = call.Arg(3);
+            state->legacy_vertex.buffer = buffer;
+            state->legacy_vertex.size = static_cast<int>(call.Arg(0));
+            state->legacy_vertex.type = call.Arg(1);
+            state->legacy_vertex.stride = static_cast<int>(call.Arg(2));
         }
         function(static_cast<int>(call.Arg(0)), call.Arg(1), static_cast<int>(call.Arg(2)),
                  pointer);
@@ -1722,6 +2846,14 @@ void RegisterGlesFunctions(HleRegistry& registry) {
         if (!ok) {
             return;
         }
+        if (buffer == 0) {
+            const std::lock_guard lock(state->mutex);
+            state->legacy_color.pointer = call.Arg(3);
+            state->legacy_color.buffer = buffer;
+            state->legacy_color.size = static_cast<int>(call.Arg(0));
+            state->legacy_color.type = call.Arg(1);
+            state->legacy_color.stride = static_cast<int>(call.Arg(2));
+        }
         function(static_cast<int>(call.Arg(0)), call.Arg(1), static_cast<int>(call.Arg(2)),
                  pointer);
     });
@@ -1741,6 +2873,14 @@ void RegisterGlesFunctions(HleRegistry& registry) {
         if (!ok) {
             return;
         }
+        if (buffer == 0) {
+            const std::lock_guard lock(state->mutex);
+            state->legacy_texcoord.pointer = call.Arg(3);
+            state->legacy_texcoord.buffer = buffer;
+            state->legacy_texcoord.size = static_cast<int>(call.Arg(0));
+            state->legacy_texcoord.type = call.Arg(1);
+            state->legacy_texcoord.stride = static_cast<int>(call.Arg(2));
+        }
         function(static_cast<int>(call.Arg(0)), call.Arg(1), static_cast<int>(call.Arg(2)),
                  pointer);
     });
@@ -1759,6 +2899,14 @@ void RegisterGlesFunctions(HleRegistry& registry) {
         void* pointer = OffsetOrPointer(call, call.Arg(2), buffer, 1, "glNormalPointer", &ok);
         if (!ok) {
             return;
+        }
+        if (buffer == 0) {
+            const std::lock_guard lock(state->mutex);
+            state->legacy_normal.pointer = call.Arg(2);
+            state->legacy_normal.buffer = buffer;
+            state->legacy_normal.size = 3;
+            state->legacy_normal.type = call.Arg(0);
+            state->legacy_normal.stride = static_cast<int>(call.Arg(1));
         }
         function(call.Arg(0), static_cast<int>(call.Arg(1)), pointer);
     });
@@ -2470,61 +3618,88 @@ void RegisterGlesFunctions(HleRegistry& registry) {
         static const auto function = Gl<void (*)(unsigned int)>("glActiveTexture");
         if (function != nullptr) function(call.Arg(0));
     });
-    registry.Add("glTexImage2D", [state](HleCall& call) {
+    registry.Add("glTexImage2D", [&registry, state](HleCall& call) {
         static const auto function =
             Gl<void (*)(unsigned int, int, int, int, int, int, unsigned int, unsigned int,
                         const void*)>("glTexImage2D");
         if (function == nullptr) {
             return;
         }
-        int alignment = 4;
+        PixelStore store;
+        std::uint32_t unpack_buffer = 0;
         {
             const std::lock_guard lock(state->mutex);
-            alignment = state->unpack_alignment;
+            store = UnpackStoreLocked(*state);
+            unpack_buffer = state->unpack_buffer;
         }
-        const std::size_t length = ImageSize(call.Arg(3), call.Arg(4), call.Arg(6), call.Arg(7),
-                                             alignment);
-        const Buffer pixels = GuestBuffer(call, call.Arg(8), length != 0 ? length : 1);
-        if (!CheckBuffer("glTexImage2D", call.Arg(8), pixels, length != 0 ? length : 1)) {
+        const std::size_t length =
+            ImageSize(call.Arg(3), call.Arg(4), call.Arg(6), call.Arg(7), store.alignment,
+                      store.row_length, store.skip_rows, store.skip_pixels);
+        const std::size_t checked = length != 0 ? length : 1;
+        void* pixels = nullptr;
+        if (unpack_buffer != 0) {
+            // A bound pixel-unpack buffer turns the argument into an offset; the
+            // bytes are already on the GPU and no guest memory is involved.
+            pixels = reinterpret_cast<void*>(static_cast<std::uintptr_t>(call.Arg(8)));
+        } else {
+            StagedRead staged(registry, call, call.Arg(8), checked);
+            if (!staged.ok()) {
+                RejectBuffer("glTexImage2D", call.Arg(8), checked);
+                return;
+            }
+            pixels = staged.bytes();
+            function(call.Arg(0), static_cast<int>(call.Arg(1)), static_cast<int>(call.Arg(2)),
+                     static_cast<int>(call.Arg(3)), static_cast<int>(call.Arg(4)),
+                     static_cast<int>(call.Arg(5)), call.Arg(6), call.Arg(7), pixels);
             return;
         }
         function(call.Arg(0), static_cast<int>(call.Arg(1)), static_cast<int>(call.Arg(2)),
                  static_cast<int>(call.Arg(3)), static_cast<int>(call.Arg(4)),
-                 static_cast<int>(call.Arg(5)), call.Arg(6), call.Arg(7), pixels.bytes);
+                 static_cast<int>(call.Arg(5)), call.Arg(6), call.Arg(7), pixels);
     });
-    registry.Add("glTexSubImage2D", [state](HleCall& call) {
+    registry.Add("glTexSubImage2D", [&registry, state](HleCall& call) {
         static const auto function =
             Gl<void (*)(unsigned int, int, int, int, int, int, unsigned int, unsigned int,
                         const void*)>("glTexSubImage2D");
         if (function == nullptr) {
             return;
         }
-        int alignment = 4;
+        PixelStore store;
+        std::uint32_t unpack_buffer = 0;
         {
             const std::lock_guard lock(state->mutex);
-            alignment = state->unpack_alignment;
+            store = UnpackStoreLocked(*state);
+            unpack_buffer = state->unpack_buffer;
         }
         // glTexSubImage2D(target, level, xoffset, yoffset, width, height, format,
         // type, pixels): the size of the source image comes from width and
         // height, which sit two slots later than in glTexImage2D.
-        const std::size_t length = ImageSize(call.Arg(4), call.Arg(5), call.Arg(6), call.Arg(7),
-                                             alignment);
-        // The upload is never refused because of that size. Guest memory is the
-        // fastmem view the driver reads directly, so a range that does not fit
-        // the mapped run -- a sub-rectangle of a larger atlas, a buffer the
-        // guest allocated flat -- still holds the pixels the guest meant to
-        // send; dropping the call instead leaves the texture with whatever it
-        // had, which looks like a half-rendered frame.
-        Buffer pixels = GuestBuffer(call, call.Arg(8), length != 0 ? length : 1);
-        if (!pixels.valid) {
-            pixels = GuestBuffer(call, call.Arg(8), 1);
-        }
-        if (!CheckBuffer("glTexSubImage2D", call.Arg(8), pixels, 1)) {
+        const std::size_t length =
+            ImageSize(call.Arg(4), call.Arg(5), call.Arg(6), call.Arg(7), store.alignment,
+                      store.row_length, store.skip_rows, store.skip_pixels);
+        const std::size_t checked = length != 0 ? length : 1;
+        void* pixels = nullptr;
+        if (unpack_buffer != 0) {
+            pixels = reinterpret_cast<void*>(static_cast<std::uintptr_t>(call.Arg(8)));
+        } else {
+            // The upload is still served when the range does not fit one mapped
+            // run: a sub-rectangle of an atlas, or the tail of a buffer the guest
+            // allocated flat, holds the pixels the guest meant to send. The
+            // driver only ever reads the staged copy, never the guest range.
+            StagedRead staged(registry, call, call.Arg(8), checked);
+            if (!staged.ok()) {
+                RejectBuffer("glTexSubImage2D", call.Arg(8), checked);
+                return;
+            }
+            pixels = staged.bytes();
+            function(call.Arg(0), static_cast<int>(call.Arg(1)), static_cast<int>(call.Arg(2)),
+                     static_cast<int>(call.Arg(3)), static_cast<int>(call.Arg(4)),
+                     static_cast<int>(call.Arg(5)), call.Arg(6), call.Arg(7), pixels);
             return;
         }
         function(call.Arg(0), static_cast<int>(call.Arg(1)), static_cast<int>(call.Arg(2)),
                  static_cast<int>(call.Arg(3)), static_cast<int>(call.Arg(4)),
-                 static_cast<int>(call.Arg(5)), call.Arg(6), call.Arg(7), pixels.bytes);
+                 static_cast<int>(call.Arg(5)), call.Arg(6), call.Arg(7), pixels);
     });
     // ---- ES 3.0 texture storage and framebuffer ---------------------------
     // The host driver is ES 3.x and reports that even for the ES 2.0 context the
@@ -2546,86 +3721,114 @@ void RegisterGlesFunctions(HleRegistry& registry) {
                  static_cast<int>(call.Arg(3)), static_cast<int>(call.Arg(4)),
                  static_cast<int>(call.Arg(5)));
     });
-    registry.Add("glTexImage3D", [state](HleCall& call) {
+    registry.Add("glTexImage3D", [&registry, state](HleCall& call) {
         static const auto function =
             Gl<void (*)(unsigned int, int, int, int, int, int, int, unsigned int,
                         unsigned int, const void*)>("glTexImage3D");
         if (function == nullptr) return;
-        int alignment = 4;
+        PixelStore store;
+        std::uint32_t unpack_buffer = 0;
         {
             const std::lock_guard lock(state->mutex);
-            alignment = state->unpack_alignment;
+            store = UnpackStoreLocked(*state);
+            unpack_buffer = state->unpack_buffer;
         }
-        const std::size_t slice = ImageSize(call.Arg(3), call.Arg(4), call.Arg(7),
-                                            call.Arg(8), alignment);
-        const std::size_t length = slice * static_cast<std::size_t>(call.Arg(5));
-        const Buffer pixels = GuestBuffer(call, call.Arg(9), length != 0 ? length : 1);
-        if (!CheckBuffer("glTexImage3D", call.Arg(9), pixels, length != 0 ? length : 1)) {
+        const std::size_t length =
+            ImageSize3D(call.Arg(3), call.Arg(4), call.Arg(5), call.Arg(7), call.Arg(8),
+                        store.alignment, store.row_length, store.skip_rows, store.skip_pixels,
+                        store.image_height, store.skip_images);
+        const std::size_t checked = length != 0 ? length : 1;
+        void* pixels = nullptr;
+        if (unpack_buffer != 0) {
+            pixels = reinterpret_cast<void*>(static_cast<std::uintptr_t>(call.Arg(9)));
+        } else {
+            StagedRead staged(registry, call, call.Arg(9), checked);
+            if (!staged.ok()) {
+                RejectBuffer("glTexImage3D", call.Arg(9), checked);
+                return;
+            }
+            pixels = staged.bytes();
+            function(call.Arg(0), static_cast<int>(call.Arg(1)),
+                     static_cast<int>(call.Arg(2)), static_cast<int>(call.Arg(3)),
+                     static_cast<int>(call.Arg(4)), static_cast<int>(call.Arg(5)),
+                     static_cast<int>(call.Arg(6)), call.Arg(7), call.Arg(8), pixels);
             return;
         }
         function(call.Arg(0), static_cast<int>(call.Arg(1)),
                  static_cast<int>(call.Arg(2)), static_cast<int>(call.Arg(3)),
                  static_cast<int>(call.Arg(4)), static_cast<int>(call.Arg(5)),
-                 static_cast<int>(call.Arg(6)), call.Arg(7), call.Arg(8), pixels.bytes);
+                 static_cast<int>(call.Arg(6)), call.Arg(7), call.Arg(8), pixels);
     });
-    registry.Add("glTexSubImage3D", [state](HleCall& call) {
+    registry.Add("glTexSubImage3D", [&registry, state](HleCall& call) {
         static const auto function =
             Gl<void (*)(unsigned int, int, int, int, int, int, int, int, unsigned int,
                         unsigned int, const void*)>("glTexSubImage3D");
         if (function == nullptr) return;
-        int alignment = 4;
+        PixelStore store;
+        std::uint32_t unpack_buffer = 0;
         {
             const std::lock_guard lock(state->mutex);
-            alignment = state->unpack_alignment;
+            store = UnpackStoreLocked(*state);
+            unpack_buffer = state->unpack_buffer;
         }
-        const std::size_t slice = ImageSize(call.Arg(5), call.Arg(6), call.Arg(8),
-                                            call.Arg(9), alignment);
-        const std::size_t length = slice * static_cast<std::size_t>(call.Arg(7));
-        const Buffer pixels = GuestBuffer(call, call.Arg(10), length != 0 ? length : 1);
-        if (!CheckBuffer("glTexSubImage3D", call.Arg(10), pixels,
-                         length != 0 ? length : 1)) {
+        const std::size_t length =
+            ImageSize3D(call.Arg(5), call.Arg(6), call.Arg(7), call.Arg(8), call.Arg(9),
+                        store.alignment, store.row_length, store.skip_rows, store.skip_pixels,
+                        store.image_height, store.skip_images);
+        const std::size_t checked = length != 0 ? length : 1;
+        void* pixels = nullptr;
+        if (unpack_buffer != 0) {
+            pixels = reinterpret_cast<void*>(static_cast<std::uintptr_t>(call.Arg(10)));
+        } else {
+            StagedRead staged(registry, call, call.Arg(10), checked);
+            if (!staged.ok()) {
+                RejectBuffer("glTexSubImage3D", call.Arg(10), checked);
+                return;
+            }
+            pixels = staged.bytes();
+            function(call.Arg(0), static_cast<int>(call.Arg(1)),
+                     static_cast<int>(call.Arg(2)), static_cast<int>(call.Arg(3)),
+                     static_cast<int>(call.Arg(4)), static_cast<int>(call.Arg(5)),
+                     static_cast<int>(call.Arg(6)), static_cast<int>(call.Arg(7)),
+                     call.Arg(8), call.Arg(9), pixels);
             return;
         }
         function(call.Arg(0), static_cast<int>(call.Arg(1)),
                  static_cast<int>(call.Arg(2)), static_cast<int>(call.Arg(3)),
                  static_cast<int>(call.Arg(4)), static_cast<int>(call.Arg(5)),
                  static_cast<int>(call.Arg(6)), static_cast<int>(call.Arg(7)),
-                 call.Arg(8), call.Arg(9), pixels.bytes);
+                 call.Arg(8), call.Arg(9), pixels);
     });
-    registry.Add("glCompressedTexImage3D", [](HleCall& call) {
+    registry.Add("glCompressedTexImage3D", [&registry, state](HleCall& call) {
         static const auto function =
             Gl<void (*)(unsigned int, int, unsigned int, int, int, int, int, int,
                         const void*)>("glCompressedTexImage3D");
         if (function == nullptr) return;
         const int size = static_cast<int>(call.Arg(7));
         if (size < 0) return;
-        const Buffer data = GuestBuffer(call, call.Arg(8), static_cast<std::size_t>(size));
-        if (!CheckBuffer("glCompressedTexImage3D", call.Arg(8), data,
-                         static_cast<std::size_t>(size))) {
-            return;
-        }
+        const UploadPixels data(registry, call, state, call.Arg(8),
+                                static_cast<std::size_t>(size), "glCompressedTexImage3D");
+        if (!data.ok()) return;
         function(call.Arg(0), static_cast<int>(call.Arg(1)), call.Arg(2),
                  static_cast<int>(call.Arg(3)), static_cast<int>(call.Arg(4)),
                  static_cast<int>(call.Arg(5)), static_cast<int>(call.Arg(6)), size,
-                 data.bytes);
+                 data.bytes());
     });
-    registry.Add("glCompressedTexSubImage3D", [](HleCall& call) {
+    registry.Add("glCompressedTexSubImage3D", [&registry, state](HleCall& call) {
         static const auto function =
             Gl<void (*)(unsigned int, int, int, int, int, int, int, int, unsigned int,
                         int, const void*)>("glCompressedTexSubImage3D");
         if (function == nullptr) return;
         const int size = static_cast<int>(call.Arg(9));
         if (size < 0) return;
-        const Buffer data = GuestBuffer(call, call.Arg(10), static_cast<std::size_t>(size));
-        if (!CheckBuffer("glCompressedTexSubImage3D", call.Arg(10), data,
-                         static_cast<std::size_t>(size))) {
-            return;
-        }
+        const UploadPixels data(registry, call, state, call.Arg(10),
+                                static_cast<std::size_t>(size), "glCompressedTexSubImage3D");
+        if (!data.ok()) return;
         function(call.Arg(0), static_cast<int>(call.Arg(1)),
                  static_cast<int>(call.Arg(2)), static_cast<int>(call.Arg(3)),
                  static_cast<int>(call.Arg(4)), static_cast<int>(call.Arg(5)),
                  static_cast<int>(call.Arg(6)), static_cast<int>(call.Arg(7)),
-                 call.Arg(8), size, data.bytes);
+                 call.Arg(8), size, data.bytes());
     });
     registry.Add("glCopyTexSubImage3D", [](HleCall& call) {
         static const auto function =
@@ -2679,39 +3882,92 @@ void RegisterGlesFunctions(HleRegistry& registry) {
         }
         function(count, static_cast<const unsigned int*>(buffers.bytes));
     });
-    registry.Add("glInvalidateFramebuffer", [](HleCall& call) {
-        static const auto function =
-            Gl<void (*)(unsigned int, int, const unsigned int*)>(
-                "glInvalidateFramebuffer");
-        if (function == nullptr) return;
-        const int count = static_cast<int>(call.Arg(1));
-        if (count < 0) return;
-        const Buffer attachments =
-            GuestBuffer(call, call.Arg(2), static_cast<std::size_t>(count) * sizeof(unsigned));
-        if (!RequireArray("glInvalidateFramebuffer", call.Arg(2), attachments,
-                          static_cast<std::size_t>(count) * sizeof(unsigned), count)) {
-            return;
-        }
-        function(call.Arg(0), count,
-                 static_cast<const unsigned int*>(attachments.bytes));
+    // GL_EXT_discard_framebuffer / ES 3.0 invalidation is only advisory: the driver
+    // is allowed to throw the contents of the listed attachments away. An engine
+    // passes it for a target it will not read again, but the container sits between
+    // the engine and the driver and cannot prove that. Unity 5.3 draws its frame
+    // into its own target, invalidates it, and composites from that very target in
+    // the same frame; forwarding the hint let the driver drop exactly the pixels the
+    // composite samples, and the window presented black while every draw counter
+    // looked healthy. Keeping the contents costs one tile write-back per target and
+    // is always correct.
+    registry.Add("glInvalidateFramebuffer", [](HleCall&) {
+        // Deliberately does nothing; see the comment above.
     });
-    registry.Add("glInvalidateSubFramebuffer", [](HleCall& call) {
-        static const auto function =
-            Gl<void (*)(unsigned int, int, const unsigned int*, int, int, int, int)>(
-                "glInvalidateSubFramebuffer");
-        if (function == nullptr) return;
-        const int count = static_cast<int>(call.Arg(1));
-        if (count < 0) return;
-        const Buffer attachments =
-            GuestBuffer(call, call.Arg(2), static_cast<std::size_t>(count) * sizeof(unsigned));
-        if (!RequireArray("glInvalidateSubFramebuffer", call.Arg(2), attachments,
-                          static_cast<std::size_t>(count) * sizeof(unsigned), count)) {
+    registry.Add("glInvalidateSubFramebuffer", [](HleCall&) {
+        // Same as glInvalidateFramebuffer above: advisory, and unsafe to honour.
+    });
+    // ---- GL sync objects --------------------------------------------------
+    //
+    // A GLsync is a driver pointer that the guest keeps in its own structures and
+    // hands back, so it never sees the pointer itself: the handle table turns it
+    // into an index and every call that takes a sync translates it back. The
+    // calls are rare here (one capability probe at startup), but a fence the
+    // driver was never told about is a fence that never flushes anything.
+    registry.Add("glFenceSync", [](HleCall& call) {
+        static const auto function = Gl<void* (*)(unsigned int, unsigned int)>("glFenceSync");
+        if (function == nullptr) {
+            call.Return(0);
             return;
         }
-        function(call.Arg(0), count,
-                 static_cast<const unsigned int*>(attachments.bytes),
-                 static_cast<int>(call.Arg(3)), static_cast<int>(call.Arg(4)),
-                 static_cast<int>(call.Arg(5)), static_cast<int>(call.Arg(6)));
+        call.Return(armbat::RegisterHostHandle(function(call.Arg(0), call.Arg(1))));
+    });
+    registry.Add("glClientWaitSync", [](HleCall& call) {
+        static const auto function =
+            Gl<unsigned int (*)(void*, unsigned int, std::uint64_t)>("glClientWaitSync");
+        void* sync = armbat::LookupHostHandle(call.Arg(0));
+        if (function == nullptr || sync == nullptr) {
+            call.Return(0x911a);  // GL_ALREADY_SIGNALED: there is no fence to wait for
+            return;
+        }
+        // GLuint64 arrives as an aligned register pair, low word first.
+        const std::uint64_t timeout = static_cast<std::uint64_t>(call.Arg(2)) |
+                                      (static_cast<std::uint64_t>(call.Arg(3)) << 32);
+        call.Return(function(sync, call.Arg(1), timeout));
+    });
+    registry.Add("glWaitSync", [](HleCall& call) {
+        static const auto function =
+            Gl<void (*)(void*, unsigned int, std::uint64_t)>("glWaitSync");
+        void* sync = armbat::LookupHostHandle(call.Arg(0));
+        if (function == nullptr || sync == nullptr) {
+            return;
+        }
+        const std::uint64_t timeout = static_cast<std::uint64_t>(call.Arg(2)) |
+                                      (static_cast<std::uint64_t>(call.Arg(3)) << 32);
+        function(sync, call.Arg(1), timeout);
+    });
+    registry.Add("glDeleteSync", [](HleCall& call) {
+        static const auto function = Gl<void (*)(void*)>("glDeleteSync");
+        void* sync = armbat::LookupHostHandle(call.Arg(0));
+        if (function != nullptr && sync != nullptr) {
+            function(sync);
+        }
+    });
+    registry.Add("glIsSync", [](HleCall& call) {
+        static const auto function = Gl<unsigned char (*)(void*)>("glIsSync");
+        void* sync = armbat::LookupHostHandle(call.Arg(0));
+        call.Return(function != nullptr && sync != nullptr ? function(sync) : 0);
+    });
+    registry.Add("glGetSynciv", [](HleCall& call) {
+        static const auto function =
+            Gl<void (*)(void*, unsigned int, int, int*, int*)>("glGetSynciv");
+        void* sync = armbat::LookupHostHandle(call.Arg(0));
+        if (function == nullptr || sync == nullptr) {
+            return;
+        }
+        const int size = static_cast<int>(call.Arg(2));
+        if (size < 0) {
+            return;
+        }
+        int* length =
+            call.Arg(3) != 0 ? reinterpret_cast<int*>(call.Mapped(call.Arg(3), sizeof(int)))
+                             : nullptr;
+        const std::size_t values_length =
+            sizeof(int) * static_cast<std::size_t>(size != 0 ? size : 1);
+        int* values = call.Arg(4) != 0
+                          ? reinterpret_cast<int*>(call.Mapped(call.Arg(4), values_length))
+                          : nullptr;
+        function(sync, call.Arg(1), size, length, values);
     });
     registry.Add("glGetInternalformativ", [](HleCall& call) {
         static const auto function =
@@ -2765,7 +4021,7 @@ void RegisterGlesFunctions(HleRegistry& registry) {
         function(call.Arg(0), static_cast<int>(call.Arg(1)), FloatArg(call, 2),
                  static_cast<int>(call.Arg(3)));
     });
-    registry.Add("glCompressedTexImage2D", [](HleCall& call) {
+    registry.Add("glCompressedTexImage2D", [&registry, state](HleCall& call) {
         static const auto function =
             Gl<void (*)(unsigned int, int, unsigned int, int, int, int, int, const void*)>(
                 "glCompressedTexImage2D");
@@ -2776,16 +4032,16 @@ void RegisterGlesFunctions(HleRegistry& registry) {
         if (size < 0) {
             return;
         }
-        const Buffer data = GuestBuffer(call, call.Arg(7), static_cast<std::size_t>(size));
-        if (!CheckBuffer("glCompressedTexImage2D", call.Arg(7), data,
-                         static_cast<std::size_t>(size))) {
+        const UploadPixels data(registry, call, state, call.Arg(7),
+                                static_cast<std::size_t>(size), "glCompressedTexImage2D");
+        if (!data.ok()) {
             return;
         }
         function(call.Arg(0), static_cast<int>(call.Arg(1)), call.Arg(2),
                  static_cast<int>(call.Arg(3)), static_cast<int>(call.Arg(4)),
-                 static_cast<int>(call.Arg(5)), size, data.bytes);
+                 static_cast<int>(call.Arg(5)), size, data.bytes());
     });
-    registry.Add("glCompressedTexSubImage2D", [](HleCall& call) {
+    registry.Add("glCompressedTexSubImage2D", [&registry, state](HleCall& call) {
         static const auto function =
             Gl<void (*)(unsigned int, int, int, int, int, int, unsigned int, int, const void*)>(
                 "glCompressedTexSubImage2D");
@@ -2796,14 +4052,14 @@ void RegisterGlesFunctions(HleRegistry& registry) {
         if (size < 0) {
             return;
         }
-        const Buffer data = GuestBuffer(call, call.Arg(8), static_cast<std::size_t>(size));
-        if (!CheckBuffer("glCompressedTexSubImage2D", call.Arg(8), data,
-                         static_cast<std::size_t>(size))) {
+        const UploadPixels data(registry, call, state, call.Arg(8),
+                                static_cast<std::size_t>(size), "glCompressedTexSubImage2D");
+        if (!data.ok()) {
             return;
         }
         function(call.Arg(0), static_cast<int>(call.Arg(1)), static_cast<int>(call.Arg(2)),
                  static_cast<int>(call.Arg(3)), static_cast<int>(call.Arg(4)),
-                 static_cast<int>(call.Arg(5)), call.Arg(6), size, data.bytes);
+                 static_cast<int>(call.Arg(5)), call.Arg(6), size, data.bytes());
     });
     registry.Add("glCopyTexImage2D", [](HleCall& call) {
         static const auto function =
@@ -2995,6 +4251,54 @@ void RegisterGlesFunctions(HleRegistry& registry) {
         }
         function(count, static_cast<const unsigned int*>(names.bytes));
     });
+    // ES 3's object factories all share one shape: a count and a guest array of
+    // GLuint names the driver fills. The names are the only thing that crosses
+    // the boundary, so the handler validates the range and hands the arena
+    // pointer over. Without these the shim exports the entry point, the call
+    // succeeds, and the engine binds object zero because no name was written.
+    {
+        const auto add_name_array = [&registry](const char* gen_name, const char* del_name) {
+            const auto gen = Gl<void (*)(int, unsigned int*)>(gen_name);
+            const auto del = Gl<void (*)(int, const unsigned int*)>(del_name);
+            const std::string gen_id = gen_name;
+            const std::string del_id = del_name;
+            registry.Add(gen_name, [gen, gen_id](HleCall& call) {
+                if (gen == nullptr) {
+                    return;
+                }
+                const int count = static_cast<int>(call.Arg(0));
+                if (count < 0 || count > 65536) {
+                    return;
+                }
+                const std::size_t length = static_cast<std::size_t>(count) * sizeof(unsigned int);
+                const Buffer out = GuestBuffer(call, call.Arg(1), length);
+                if (!RequireArray(gen_id.c_str(), call.Arg(1), out, length, count)) {
+                    return;
+                }
+                gen(count, static_cast<unsigned int*>(out.bytes));
+            });
+            registry.Add(del_name, [del, del_id](HleCall& call) {
+                if (del == nullptr) {
+                    return;
+                }
+                const int count = static_cast<int>(call.Arg(0));
+                if (count < 0 || count > 65536) {
+                    return;
+                }
+                const std::size_t length = static_cast<std::size_t>(count) * sizeof(unsigned int);
+                const Buffer names = GuestBuffer(call, call.Arg(1), length);
+                if (!RequireArray(del_id.c_str(), call.Arg(1), names, length, count)) {
+                    return;
+                }
+                del(count, static_cast<const unsigned int*>(names.bytes));
+            });
+        };
+        add_name_array("glGenVertexArrays", "glDeleteVertexArrays");
+        add_name_array("glGenSamplers", "glDeleteSamplers");
+        add_name_array("glGenQueries", "glDeleteQueries");
+        add_name_array("glGenTransformFeedbacks", "glDeleteTransformFeedbacks");
+        add_name_array("glGenProgramPipelines", "glDeleteProgramPipelines");
+    }
     registry.Add("glBindRenderbuffer", [](HleCall& call) {
         static const auto function =
             Gl<void (*)(unsigned int, unsigned int)>("glBindRenderbuffer");
@@ -3048,20 +4352,34 @@ void RegisterGlesFunctions(HleRegistry& registry) {
         if (function == nullptr) {
             return;
         }
-        int alignment = 4;
+        PixelStore store;
+        std::uint32_t pack_buffer = 0;
         {
             const std::lock_guard lock(state->mutex);
-            alignment = state->pack_alignment;
+            store = PackStoreLocked(*state);
+            pack_buffer = state->pack_buffer;
         }
         const std::size_t length = ImageSize(call.Arg(2), call.Arg(3), call.Arg(4), call.Arg(5),
-                                             alignment);
-        const Buffer pixels = GuestBuffer(call, call.Arg(6), length != 0 ? length : 1);
-        if (!CheckBuffer("glReadPixels", call.Arg(6), pixels, length != 0 ? length : 1)) {
-            return;
+                                             store.alignment, store.row_length, store.skip_rows,
+                                             store.skip_pixels);
+        const std::size_t checked = length != 0 ? length : 1;
+        void* pixels = nullptr;
+        if (pack_buffer != 0) {
+            // A bound pixel-pack buffer turns the argument into an offset; the
+            // driver writes into its own memory and no guest range is involved.
+            pixels = reinterpret_cast<void*>(static_cast<std::uintptr_t>(call.Arg(6)));
+        } else if (call.Arg(6) != 0) {
+            // The driver writes the whole image; a range it cannot write end to
+            // end has to be refused rather than half-filled.
+            pixels = call.Mapped(call.Arg(6), checked);
+            if (pixels == nullptr) {
+                RejectBuffer("glReadPixels", call.Arg(6), checked);
+                return;
+            }
         }
         function(static_cast<int>(call.Arg(0)), static_cast<int>(call.Arg(1)),
                  static_cast<int>(call.Arg(2)), static_cast<int>(call.Arg(3)), call.Arg(4),
-                 call.Arg(5), pixels.bytes);
+                 call.Arg(5), pixels);
     });
     registry.Add("glFlush", [](HleCall&) {
         static const auto function = Gl<void (*)(void)>("glFlush");
