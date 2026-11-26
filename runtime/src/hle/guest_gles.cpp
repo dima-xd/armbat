@@ -67,6 +67,39 @@ Function Gl1(const char* name) {
     return reinterpret_cast<Function>(Gl1Symbol(name));
 }
 
+// Client version of the EGL context that is current on this thread, or 0 when
+// EGL cannot say. The context is usually created by the guest's Java half,
+// which talks to the host EGL directly, so the container never sees that
+// eglCreateContext and cannot remember the version at creation time. A GLES 1.x
+// context has neither shaders nor the ES2 entry points, and telling an engine
+// that it has an ES 3 context sends it down a path the context cannot serve.
+int CurrentContextVersion() {
+    using GetCurrentDisplay = void* (*)(void);
+    using GetCurrentContext = void* (*)(void);
+    using QueryContext = int (*)(void*, void*, int, int*);
+    static void* library = dlopen("libEGL.so", RTLD_NOW | RTLD_LOCAL);
+    if (library == nullptr) {
+        return 0;
+    }
+    static const auto get_display =
+        reinterpret_cast<GetCurrentDisplay>(::dlsym(library, "eglGetCurrentDisplay"));
+    static const auto get_context =
+        reinterpret_cast<GetCurrentContext>(::dlsym(library, "eglGetCurrentContext"));
+    static const auto query_context =
+        reinterpret_cast<QueryContext>(::dlsym(library, "eglQueryContext"));
+    if (get_display == nullptr || get_context == nullptr || query_context == nullptr) {
+        return 0;
+    }
+    void* display = get_display();
+    void* context = get_context();
+    int version = 0;
+    if (display == nullptr || context == nullptr ||
+        query_context(display, context, 0x3098 /* EGL_CONTEXT_CLIENT_VERSION */, &version) == 0) {
+        return 0;
+    }
+    return version;
+}
+
 float FloatArg(HleCall& call, std::size_t index) {
     const std::uint32_t bits = call.Arg(index);
     float value = 0.0f;
@@ -354,7 +387,18 @@ void RegisterGlesFunctions(HleRegistry& registry) {
     // ---- strings and errors ------------------------------------------------
 
     registry.Add("glGetString", [&registry, state](HleCall& call) {
-        static const auto function = Gl<const unsigned char* (*)(unsigned int)>("glGetString");
+        // The query has to come from the library that matches the current
+        // context: on a GLES 1.x context the ES2 wrapper answers for a
+        // different API surface, or not at all.
+        static const auto es2 = Gl<const unsigned char* (*)(unsigned int)>("glGetString");
+        static const auto es1 = Gl1<const unsigned char* (*)(unsigned int)>("glGetString");
+        const int context_version = CurrentContextVersion();
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) {
+            ARMBAT_LOG_INFO("Armbat", "gles: glGetString with context client version %d",
+                            context_version);
+        }
+        const auto function = (context_version == 1 && es1 != nullptr) ? es1 : es2;
         if (function == nullptr) {
             call.Return(0);
             return;
@@ -378,8 +422,20 @@ void RegisterGlesFunctions(HleRegistry& registry) {
             // 2.0 here left those pointers null and the guest jumped to
             // address zero. 3.0 rather than the driver's 3.2 keeps the loader
             // to the core ES 3.0 list this container serves.
-            value = "OpenGL ES 3.0 (Armbat)";
+            //
+            // A GLES 1.x context is the exception: it has no shader path, and
+            // an engine told it has one takes the ES2 route and dereferences
+            // what the context never provided.
+            value = context_version == 1 ? "OpenGL ES-CM 1.1 (Armbat)"
+                                         : "OpenGL ES 3.0 (Armbat)";
         } else if (name == 0x8b8c) {  // GL_SHADING_LANGUAGE_VERSION
+            // Not a valid query on a GLES 1.x context: the driver answers
+            // with an error and a null pointer, and the guest has to see the
+            // same answer instead of a version it cannot use.
+            if (context_version == 1) {
+                call.Return(0);
+                return;
+            }
             value = "OpenGL ES GLSL ES 1.00";
         } else if (name == 0x1f03) {  // GL_EXTENSIONS
             value = FilterExtensions(value);
