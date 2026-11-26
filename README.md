@@ -23,7 +23,7 @@ nothing is patched and nothing is installed.
 |---|---|
 | Stable | [releases/latest](https://github.com/dima-xd/armbat/releases/latest) |
 | Nightly | [releases/tag/nightly](https://github.com/dima-xd/armbat/releases/tag/nightly) |
-| Every build and changelog | [armbat.arcueid.space/en/builds](https://armbat.arcueid.space/en/builds) |
+| Every build and changelog | [armbat.arcueid.space/builds](https://armbat.arcueid.space/builds) |
 
 The app can also switch between the two channels in its settings.
 
@@ -55,7 +55,7 @@ All of these run on a phone with no 32-bit ABI at all.
 ## Compatibility
 
 Games are checked one at a time on real hardware, and the reports are collected on
-the site: [armbat.arcueid.space/en/compatibility](https://armbat.arcueid.space/en/compatibility).
+the site: [armbat.arcueid.space/compatibility](https://armbat.arcueid.space/compatibility).
 If something runs for you and is missing from that list, add a report with the
 [game compatibility template](https://github.com/dima-xd/armbat/issues/new?template=game_compatibility.yml).
 A log from a game that fails is just as useful as one from a game that works.
