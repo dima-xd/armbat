@@ -55,7 +55,7 @@ All of these run on a phone with no 32-bit ABI at all.
 ## Compatibility
 
 Games are checked one at a time on real hardware, and the reports are collected on
-the site: [armbat-web.vercel.app/compatibility](https://armbat-web.vercel.app/compatibility).
+the site: [armbat.netlify.app/en/compatibility](https://armbat.netlify.app/en/compatibility).
 If something runs for you and is missing from that list, add a report with the
 [game compatibility template](https://github.com/dima-xd/armbat/issues/new?template=game_compatibility.yml).
 A log from a game that fails is just as useful as one from a game that works.
