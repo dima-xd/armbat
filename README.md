@@ -1,4 +1,4 @@
-English · [中文](README.zh.md) · [Website](https://armbat.netlify.app/) · [Discord](https://discord.gg/dSpQ7XamWT)
+English · [中文](README.zh.md) · [Website](https://armbat.arcueid.space) · [Discord](https://discord.gg/dSpQ7XamWT)
 
 [![Latest release](https://img.shields.io/github/v/release/dima-xd/armbat?sort=semver&label=release)](https://github.com/dima-xd/armbat/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/dima-xd/armbat/total?label=downloads)](https://github.com/dima-xd/armbat/releases)
@@ -23,7 +23,7 @@ nothing is patched and nothing is installed.
 |---|---|
 | Stable | [releases/latest](https://github.com/dima-xd/armbat/releases/latest) |
 | Nightly | [releases/tag/nightly](https://github.com/dima-xd/armbat/releases/tag/nightly) |
-| Every build and changelog | [armbat.netlify.app](https://armbat.netlify.app/builds) |
+| Every build and changelog | [armbat.arcueid.space/builds](https://armbat.arcueid.space/builds) |
 
 The app can also switch between the two channels in its settings.
 
@@ -55,7 +55,7 @@ All of these run on a phone with no 32-bit ABI at all.
 ## Compatibility
 
 Games are checked one at a time on real hardware, and the reports are collected on
-the site: [armbat.netlify.app/en/compatibility](https://armbat.netlify.app/en/compatibility).
+the site: [armbat.arcueid.space/compatibility](https://armbat.arcueid.space/compatibility).
 If something runs for you and is missing from that list, add a report with the
 [game compatibility template](https://github.com/dima-xd/armbat/issues/new?template=game_compatibility.yml).
 A log from a game that fails is just as useful as one from a game that works.
@@ -280,7 +280,7 @@ and no binary in this repository comes from anywhere else.
 
 ## Community
 
-- Website: [armbat-web.vercel.app](https://armbat.netlify.app/)
+- Website: [armbat.arcueid.space](https://armbat.arcueid.space/)
 - Discord: [discord.gg/dSpQ7XamWT](https://discord.gg/dSpQ7XamWT)
 - Bugs and game reports: [issues](https://github.com/dima-xd/armbat/issues)
 

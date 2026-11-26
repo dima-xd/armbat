@@ -1,4 +1,4 @@
-[English](README.md) · 中文 · [网站](https://armbat-web.vercel.app/) · [Discord](https://discord.gg/dSpQ7XamWT)
+[English](README.md) · 中文 · [网站](https://armbat.arcueid.space/zh/) · [Discord](https://discord.gg/dSpQ7XamWT)
 
 [![最新版本](https://img.shields.io/github/v/release/dima-xd/armbat?sort=semver&label=release)](https://github.com/dima-xd/armbat/releases/latest)
 [![下载量](https://img.shields.io/github/downloads/dima-xd/armbat/total?label=downloads)](https://github.com/dima-xd/armbat/releases)
@@ -21,7 +21,7 @@ Armbat 让 32 位 ARMv7 的 Android 游戏运行在已经不支持它们的手�
 |---|---|
 | 稳定版 | [releases/latest](https://github.com/dima-xd/armbat/releases/latest) |
 | 每日构建 | [releases/tag/nightly](https://github.com/dima-xd/armbat/releases/tag/nightly) |
-| 所有构建与更新日志 | [armbat-web.vercel.app](https://armbat-web.vercel.app/builds) |
+| 所有构建与更新日志 | [armbat.arcueid.space](https://armbat.arcueid.space/zh) |
 
 应用内也可以在设置里切换这两个通道。
 
@@ -49,7 +49,7 @@ Armbat 让 32 位 ARMv7 的 Android 游戏运行在已经不支持它们的手�
 ## 兼容性
 
 游戏是在真机上逐个验证的，报告收集在网站上：
-[armbat.netlify.app/zh/compatibility](https://armbat.netlify.app/zh/compatibility)。
+[armbat.arcueid.space/compatibility](https://armbat.arcueid.space/zh/compatibility)。
 如果你跑通了列表里没有的游戏，可以用
 [游戏兼容性模板](https://github.com/dima-xd/armbat/issues/new?template=game_compatibility.yml)
 提交报告。失败游戏的日志和成功游戏的一样有用。
@@ -239,7 +239,7 @@ AOSP bionic；参见 `NOTICE`。
 
 ## 社区
 
-- 网站：[armbat-web.vercel.app](https://armbat-web.vercel.app/)
+- 网站：[armbat.arcueid.space](https://armbat.arcueid.space/zh/)
 - Discord：[discord.gg/dSpQ7XamWT](https://discord.gg/dSpQ7XamWT)
 - 缺陷与游戏报告：[issues](https://github.com/dima-xd/armbat/issues)
 
