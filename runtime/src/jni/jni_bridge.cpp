@@ -1123,6 +1123,17 @@ struct JniBridge::Impl {
         return refs[handle - 1].object;
     }
 
+    // The bridge never hands out a pointer into Java's own string: every block
+    // is a guest copy, so isCopy is always true. Answering it is not optional --
+    // native code may keep the block (or skip setting up state) only when the
+    // flag says the call copied, and that decision is what the flag is for.
+    void WriteIsCopy(HleCall& call) {
+        if (call.Arg(2) != 0) {
+            const std::uint8_t is_copy = 1;
+            call.CopyOut(call.Arg(2), &is_copy, 1);
+        }
+    }
+
     // What kind of reference a guest handle names. Every handle the bridge hands
     // out is backed by a global reference, so the answer is the kind the guest
     // asked for: a global when it made one itself, a local otherwise.
@@ -1619,6 +1630,7 @@ struct JniBridge::Impl {
                 if (empty != 0) {
                     *reinterpret_cast<char*>(arena.Ptr(empty)) = '\0';
                 }
+                WriteIsCopy(call);
                 call.Return(empty);
                 return;
             }
@@ -1643,6 +1655,7 @@ struct JniBridge::Impl {
                 std::memcpy(arena.Ptr(cell), chars, length);
             }
             env->ReleaseStringUTFChars(static_cast<jstring>(Resolve(call.Arg(1))), chars);
+            WriteIsCopy(call);
             call.Return(cell);
         });
         add(JNI_IDX(ReleaseStringUTFChars), [this](HleCall& call) {
