@@ -49,7 +49,7 @@ Armbat 让 32 位 ARMv7 的 Android 游戏运行在已经不支持它们的手�
 ## 兼容性
 
 游戏是在真机上逐个验证的，报告收集在网站上：
-[armbat-web.vercel.app/compatibility](https://armbat-web.vercel.app/compatibility)。
+[armbat.netlify.app/zh/compatibility](https://armbat.netlify.app/zh/compatibility)。
 如果你跑通了列表里没有的游戏，可以用
 [游戏兼容性模板](https://github.com/dima-xd/armbat/issues/new?template=game_compatibility.yml)
 提交报告。失败游戏的日志和成功游戏的一样有用。
