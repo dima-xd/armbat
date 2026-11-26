@@ -701,6 +701,7 @@ class GuestLauncher(private val host: Activity) {
         }
 
         private var forwarding = false
+        private var touchReported = false
 
         override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
             // This frame is the guest's window: the one place an event enters
@@ -713,6 +714,12 @@ class GuestLauncher(private val host: Activity) {
                     // The letterbox belongs to no window of the guest; a gesture
                     // begun there must not reach it.
                     return false
+                }
+                if (!touchReported) {
+                    // One line per launch: a guest that ignores its touches is
+                    // diagnosed from the mapping, not from a screenshot.
+                    touchReported = true
+                    ArmbatLog.i(TAG, "input: first touch host ${ev.x},${ev.y} guest $x,$y")
                 }
             } else if (!forwarding) {
                 // Only a gesture this frame started belongs to the activity: a
@@ -731,7 +738,16 @@ class GuestLauncher(private val host: Activity) {
                 // only with the event it dispatches back itself. An activity
                 // that took no queue is an ordinary Java window: the event goes
                 // to it and it hands the event to its views.
-                GuestNatives.touch(scaled) || guest.dispatchTouchEvent(scaled)
+                if (GuestNatives.touch(scaled)) {
+                    true
+                } else {
+                    val java = withGuestRawCoordinates(scaled)
+                    try {
+                        guest.dispatchTouchEvent(java)
+                    } finally {
+                        java.recycle()
+                    }
+                }
             } finally {
                 scaled.recycle()
             }
@@ -742,6 +758,44 @@ class GuestLauncher(private val host: Activity) {
             forwarding = ev.actionMasked != MotionEvent.ACTION_UP &&
                 ev.actionMasked != MotionEvent.ACTION_CANCEL
             return handled || forwarding
+        }
+
+        /**
+         * The same event with its raw coordinates in the guest's pixels.
+         *
+         * MotionEvent.transform() moves the points into the guest's space but
+         * deliberately leaves getRawX()/getRawY() in the space of the device's
+         * display. An engine of the 2.x era compares that pair with the screen
+         * size it read from the display and hit-tests with it -- Doodle Jump
+         * reads nothing but the raw pair -- so with the phone's coordinates
+         * every touch landed outside the guest's screen. A rebuilt event has
+         * no raw offset, which is what a full-screen window sees on a device,
+         * and keeps the pointer ids, pressure, flags and history a guest may
+         * read.
+         */
+        private fun withGuestRawCoordinates(ev: MotionEvent): MotionEvent {
+            val count = ev.pointerCount
+            val properties = Array(count) { MotionEvent.PointerProperties() }
+            val current = Array(count) { MotionEvent.PointerCoords() }
+            for (index in 0 until count) {
+                ev.getPointerProperties(index, properties[index])
+                ev.getPointerCoords(index, current[index])
+            }
+            val event = MotionEvent.obtain(
+                ev.downTime, ev.eventTime, ev.action, count, properties, current,
+                ev.metaState, ev.buttonState, ev.xPrecision, ev.yPrecision,
+                ev.deviceId, ev.edgeFlags, ev.source, ev.flags,
+            )
+            if (ev.historySize > 0) {
+                val history = Array(count) { MotionEvent.PointerCoords() }
+                for (position in 0 until ev.historySize) {
+                    for (index in 0 until count) {
+                        ev.getHistoricalPointerCoords(index, position, history[index])
+                    }
+                    event.addBatch(ev.getHistoricalEventTime(position), history, ev.metaState)
+                }
+            }
+            return event
         }
     }
 
