@@ -325,10 +325,15 @@ bool DeliverGuestFault(A32Machine& machine, std::uint32_t address) {
     // that cannot recover, and running a second handler on top of the first one
     // would only bury the first fault.
     static thread_local int depth = 0;
-    // Retrying a fault the handler did not repair is what a device does, but it
-    // has to end: the same pc faulting again and again is a run that would never
-    // report anything.
+    // Linux retries a fault whose handler returned to the faulting instruction,
+    // forever and without a count: a runtime that turns faults into exceptions
+    // does it by design, and a null check inside a loop is ordinary code, not a
+    // broken run. The limit is only a watchdog against a guest that would spin
+    // without ever reporting anything, so it sits far above any loop real code
+    // makes; a change of call site means the guest moved on and starts over.
+    static constexpr int kRetryLimit = 4096;
     static thread_local std::uint32_t retry_pc = 0;
+    static thread_local std::uint32_t retry_lr = 0;
     static thread_local int retries = 0;
 
     if (depth != 0 || !g_ready.load(std::memory_order_acquire) || g_arena == nullptr) {
@@ -414,6 +419,24 @@ bool DeliverGuestFault(A32Machine& machine, std::uint32_t address) {
                         "signal: frame 0x%08x overwritten while the handler ran", frame);
     }
 
+    // The retry count is checked before the context is applied: when the guest
+    // really is stuck, the report has to name the instruction that faulted, not
+    // the pc the handler wanted to resume at.
+    if (retry_pc == interrupted[15] && retry_lr == interrupted[14]) {
+        if (++retries > kRetryLimit) {
+            ARMBAT_LOG_ERROR("Armbat",
+                             "fault: 0x%08x faulted %d times from 0x%08x and every handler "
+                             "returned to it; stopping the run",
+                             retry_pc, retries, retry_lr);
+            ReleaseFrame(frame);
+            return false;
+        }
+    } else {
+        retry_pc = interrupted[15];
+        retry_lr = interrupted[14];
+        retries = 0;
+    }
+
     // A device restores the whole context on rt_sigreturn and resumes at the
     // saved pc, so a handler that repairs r0 (or any register) without moving pc
     // is honoured too. Comparing only pc and cpsr threw such a repair away and
@@ -437,17 +460,6 @@ bool DeliverGuestFault(A32Machine& machine, std::uint32_t address) {
     machine.SetCpsr(cpsr);
     ReleaseFrame(frame);
 
-    // Retrying is what a device does when a handler returns to the faulting
-    // instruction, and it has to end: the same pc faulting again and again is a
-    // run that would never report anything.
-    if (retry_pc == interrupted[15]) {
-        if (++retries > 4) {
-            return false;
-        }
-    } else {
-        retry_pc = interrupted[15];
-        retries = 0;
-    }
     return true;
 }
 
