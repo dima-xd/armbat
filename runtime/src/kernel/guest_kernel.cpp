@@ -251,7 +251,14 @@ enum SyscallNumber : std::uint32_t {
     kSysClockNanosleep = 265,
     kSysStatfs64 = 266,
     kSysFstatfs64 = 267,
-    kSysSchedGetscheduler = 155,
+    // Scheduling. A guest thread is a host thread, so the answers come from the
+    // host scheduler: reporting a success the thread does not have would let a
+    // game believe it raised its own priority.
+    kSysNice = 34,
+    kSysGetPriority = 96,
+    kSysSetPriority = 97,
+    kSysSchedSetparam = 154,
+    kSysSchedGetParam = 155,
     kSysSchedSetscheduler = 156,
     kSysSchedGetPriorityMax = 159,
     kSysSchedGetPriorityMin = 160,
@@ -1986,8 +1993,14 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
                    : -errno;
     }
 
-    case kSysSchedPolicy:
-        return 0;  // SCHED_OTHER, the only policy the container has
+    case kSysSchedPolicy: {
+        // sched_getscheduler. The guest thread is a host thread, so the answer
+        // is what the host actually runs it under, not a constant.
+        const int pid = static_cast<int>(args[0]) != 0 ? static_cast<int>(args[0])
+                                                      : static_cast<int>(::gettid());
+        const int policy = ::sched_getscheduler(pid);
+        return policy < 0 ? -errno : policy;
+    }
     case kSysSchedSetaffinity:
         return 0;
 
@@ -3735,15 +3748,88 @@ std::int32_t GuestKernel::Dispatch(std::uint32_t number, const std::uint32_t* ar
         return 0;
     }
 
-    case kSysSchedGetscheduler:
-    case kSysSchedSetscheduler:
-    case kSysSchedGetPriorityMax:
-    case kSysSchedGetPriorityMin:
-        // The container does not let guest code change its own scheduling: it
-        // shares the host's threads. Answering SCHED_OTHER with a zero-priority
-        // range tells audio and render threads the truth instead of a number
-        // they would try to raise to.
+    // Scheduling. The guest thread is the host thread, so every answer is the
+    // host scheduler's: a game that asks for a real-time policy gets whatever
+    // the platform granted this process, and a game that could not raise its
+    // priority learns that instead of believing a lie. Android itself refuses
+    // these for an app without CAP_SYS_NICE, and so does this path.
+    case kSysSchedSetscheduler: {
+        const int pid = static_cast<int>(args[0]) != 0 ? static_cast<int>(args[0])
+                                                      : static_cast<int>(::gettid());
+        const std::uint32_t policy = args[1];
+        if (!arena_.IsMapped(args[2], sizeof(std::int32_t))) {
+            return -EFAULT;
+        }
+        sched_param param{};
+        std::memcpy(&param.sched_priority, arena_.Ptr(args[2]), sizeof(std::int32_t));
+        if (::sched_setscheduler(pid, static_cast<int>(policy), &param) != 0) {
+            return -errno;
+        }
         return 0;
+    }
+
+    case kSysSchedGetParam: {
+        const int pid = static_cast<int>(args[0]) != 0 ? static_cast<int>(args[0])
+                                                      : static_cast<int>(::gettid());
+        if (!arena_.IsMapped(args[1], sizeof(std::int32_t))) {
+            return -EFAULT;
+        }
+        sched_param param{};
+        if (::sched_getparam(pid, &param) != 0) {
+            return -errno;
+        }
+        std::memcpy(arena_.Ptr(args[1]), &param.sched_priority, sizeof(std::int32_t));
+        return 0;
+    }
+
+    case kSysSchedSetparam: {
+        const int pid = static_cast<int>(args[0]) != 0 ? static_cast<int>(args[0])
+                                                      : static_cast<int>(::gettid());
+        if (!arena_.IsMapped(args[1], sizeof(std::int32_t))) {
+            return -EFAULT;
+        }
+        sched_param param{};
+        std::memcpy(&param.sched_priority, arena_.Ptr(args[1]), sizeof(std::int32_t));
+        if (::sched_setparam(pid, &param) != 0) {
+            return -errno;
+        }
+        return 0;
+    }
+
+    case kSysSchedGetPriorityMax:
+    case kSysSchedGetPriorityMin: {
+        const int policy = static_cast<int>(args[0]);
+        const int priority = number == kSysSchedGetPriorityMax ? ::sched_get_priority_max(policy)
+                                                              : ::sched_get_priority_min(policy);
+        return priority < 0 ? -errno : priority;
+    }
+
+    case kSysSetPriority:
+        if (::setpriority(static_cast<int>(args[0]), static_cast<id_t>(args[1]),
+                          static_cast<int>(args[2])) != 0) {
+            return -errno;
+        }
+        return 0;
+
+    // getpriority returns the nice value biased by 20, and -1 is both an error
+    // and a legal nice value, so errno is cleared first.
+    case kSysGetPriority: {
+        errno = 0;
+        const int nice_value = ::getpriority(static_cast<int>(args[0]), static_cast<id_t>(args[1]));
+        if (nice_value == -1 && errno != 0) {
+            return -errno;
+        }
+        return 20 - nice_value;
+    }
+
+    case kSysNice: {
+        errno = 0;
+        const int nice_value = ::nice(static_cast<int>(args[0]));
+        if (nice_value == -1 && errno != 0) {
+            return -errno;
+        }
+        return nice_value;
+    }
 
     case kSysGetdents64: {
         const int fd = static_cast<int>(args[0]);
