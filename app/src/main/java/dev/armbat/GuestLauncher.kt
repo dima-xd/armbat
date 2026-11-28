@@ -1756,7 +1756,20 @@ class GuestLauncher(private val host: Activity) {
      * can let the platform handle its own children.
      */
     fun finishGuestActivity(activity: Activity): Boolean {
-        val hosted = session?.stack?.firstOrNull { it.activity === activity } ?: return false
+        val hosted = session?.stack?.firstOrNull { it.activity === activity }
+        if (hosted == null) {
+            // A finish from one of the archive's own activities belongs to the
+            // archive even when that activity is already gone — the archive calls
+            // finish() from its own onDestroy, right after the container destroyed
+            // it. Answering false hands the child to the platform, and the
+            // platform finishes this activity, which ends the whole session.
+            val prepared = session?.prepared
+            if (prepared != null && activity.javaClass.classLoader === prepared.loader) {
+                ArmbatLog.i(TAG, "guest finish: ${activity.javaClass.name} already gone")
+                return true
+            }
+            return false
+        }
         if (hosted.finished) {
             return true
         }
