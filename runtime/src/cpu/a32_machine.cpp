@@ -312,12 +312,6 @@ public:
             recent_pcs_[recent_count_ & (kRecentPcs - 1)] = addr;
             ++recent_count_;
         }
-        // Sampling: the JIT fetches code only after a cache flush, and the
-        // watchdog flushes on demand, so this names the block a spinning guest
-        // is in without stopping it.
-        if (TakeGuestSample()) {
-            ARMBAT_LOG_INFO("Armbat", "sample: block pc=0x%08x", addr);
-        }
         if (!arena_.IsMapped(addr, 4)) {
             // A jump to nothing is almost always a call through a pointer the
             // guest never filled in; the frames above still hold the call chain.
