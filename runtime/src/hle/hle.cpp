@@ -22,6 +22,7 @@
 
 #include "armbat/a32_machine.h"
 #include "armbat/guest_arena.h"
+#include "armbat/trace.h"
 #include "hle_format.h"
 
 namespace armbat {
@@ -605,6 +606,17 @@ bool HleRegistry::Dispatch(std::uint32_t svc, A32Machine& machine) {
 }
 
 bool HleRegistry::DispatchIndex(std::uint32_t index, A32Machine& machine) {
+#if defined(ARMBAT_TRACY)
+    // One zone per platform call, named after the import. Graphics entry points
+    // run thousands of times per frame and the call census already covers them
+    // by name, so they are left out: a zone each would bury the timeline.
+    const std::string& hle_name = names_[index];
+    const bool graphics = hle_name.rfind("gl", 0) == 0 || hle_name.rfind("egl", 0) == 0;
+    ARMBAT_ZONE_IF("hle", !graphics);
+    if (!graphics) {
+        ARMBAT_ZONE_RENAME_IF(armbat_zone, hle_name.c_str(), hle_name.size());
+    }
+#endif
     HleCall call(machine, arena_);
     last_index_.store(index, std::memory_order_relaxed);
     for (std::size_t i = 0; i < 4; ++i) {

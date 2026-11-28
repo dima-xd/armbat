@@ -29,6 +29,7 @@
 #include "armbat/guest_signal.h"
 #include "armbat/hle.h"
 #include "armbat/jni_bridge.h"
+#include "armbat/trace.h"
 
 namespace armbat {
 namespace {
@@ -174,7 +175,7 @@ struct LiveGuestThread {
     A32Machine* machine = nullptr;
 };
 
-std::mutex g_live_mutex;
+ARMBAT_LOCKABLE(std::mutex, g_live_mutex);
 std::vector<LiveGuestThread> g_live;
 
 // The lock word lives in guest memory; the host view is the same bytes.

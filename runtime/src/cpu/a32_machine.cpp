@@ -3,6 +3,7 @@
 #include "armbat/guest_modules.h"
 #include "armbat/guest_signal.h"
 #include "armbat/hle.h"
+#include "armbat/trace.h"
 
 #include <algorithm>
 #include <atomic>
@@ -617,11 +618,14 @@ namespace {
 // the lock both sides take -- the flush holds it while it walks the machine, the
 // destructor holds it to mark the machine gone.
 struct MachineLink {
-    std::mutex mutex;
+    // Named for the profiler: this is the lock every guest thread and every
+    // platform callback takes to find its own machine, so if anything serialises
+    // startup, the wait and the holder show up here.
+    ARMBAT_LOCKABLE(std::mutex, mutex);
     A32Machine* machine = nullptr;
 };
 
-std::mutex g_machines_mutex;
+ARMBAT_LOCKABLE(std::mutex, g_machines_mutex);
 std::vector<std::shared_ptr<MachineLink>> g_machines;
 
 }  // namespace
@@ -848,6 +852,22 @@ struct A32Machine::Impl {
     // The JIT's run loop: CacheInvalidation is a normal exit path, not a failure.
     std::uint32_t RunJit(Dynarmic::A32::Jit& target) {
         RunningMachine running(owner, &running_tid);
+        // A thread that shows up in the profiler as "guest-1234" instead of a
+        // number is the difference between a timeline one can read and one that
+        // needs the log next to it. Once per thread, off the hot path.
+        {
+            static thread_local bool named = false;
+            if (!named) {
+                named = true;
+                char label[32];
+                std::snprintf(label, sizeof(label), "guest-%d", static_cast<int>(::gettid()));
+                ARMBAT_THREAD_NAME(label);
+            }
+        }
+        // On the platform timeline this is the thread executing guest code: a gap
+        // between two runs, or a run that never ends, is visible next to
+        // sched_switch without any logging on the hot path.
+        ARMBAT_ZONE("guest.run");
         Callbacks* const source = CallbacksOf(target);
         // SetTickBudget caps what this run may retire. It is measured in this
         // Jit's own ticks, and it has to be applied here: a slice budget set once
@@ -962,8 +982,9 @@ struct A32Machine::Impl {
     Fault fault;
     std::vector<A32Machine::SvcHandler> svc_handlers;
     std::vector<std::unique_ptr<Callbacks>> callback_set;
-    // Serialises growing `jits` against a flush that walks it.
-    std::mutex jits_mutex;
+    // Serialises growing `jits` against a flush that walks it. Named for the
+    // profiler: a flush or a nested-Jit construction that stalls shows its wait.
+    ARMBAT_LOCKABLE(std::mutex, jits_mutex);
     std::vector<std::unique_ptr<Dynarmic::A32::Jit>> jits;
     // Registry handle; the destructor clears `machine` under `link->mutex`.
     std::shared_ptr<MachineLink> link;

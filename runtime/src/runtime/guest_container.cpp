@@ -51,6 +51,7 @@
 #include "guest_unwind.h"
 #include "guest_attach.h"
 #include "armbat/jni_bridge.h"
+#include "armbat/trace.h"
 
 namespace armbat {
 namespace {
@@ -1255,7 +1256,7 @@ struct GuestContainer::Impl {
     // alive for as long as their thread runs, and the entry is dropped when the
     // thread exits so that the JIT code cache of a dead thread is released with
     // it.
-    std::mutex spawned_mutex;
+    ARMBAT_LOCKABLE(std::mutex, spawned_mutex);
     std::vector<std::shared_ptr<A32Machine>> spawned;
     std::atomic<std::uint32_t> next_processor_id{1};
     // Exclusive-monitor slots of threads that have exited. Every guest thread
@@ -1314,7 +1315,7 @@ struct GuestContainer::Impl {
     // would lose it between two calls.
     std::uint32_t contexts_addr = 0;
     int context_count = 0;
-    std::mutex context_mutex;
+    ARMBAT_LOCKABLE(std::mutex, context_mutex);
     // Slots that are free to lend. A platform thread takes one on its first
     // native call and hands it back when it exits: ART keeps a pool of Java
     // threads and drops them as the pool shrinks, and a context that a dead

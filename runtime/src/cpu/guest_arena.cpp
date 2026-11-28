@@ -1,4 +1,5 @@
 ﻿#include "armbat/guest_arena.h"
+#include "armbat/trace.h"
 
 #include <sys/mman.h>
 #include <unistd.h>
@@ -146,6 +147,9 @@ bool GuestArena::Protect(std::uint32_t addr, std::uint64_t len, int prot) {
     if (!Ok() || len == 0) {
         return false;
     }
+    // Not traced: a startup calls this tens of thousands of times at a few
+    // microseconds each, and that many zones drown the trace without saying
+    // anything a total would not.
     const std::uint64_t page = page_size_;
     const std::uint64_t start = addr & ~(page - 1);
     const std::uint64_t end = (static_cast<std::uint64_t>(addr) + len + page - 1) & ~(page - 1);

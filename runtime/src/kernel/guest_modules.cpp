@@ -5,6 +5,7 @@
 #include <mutex>
 
 #include "armbat/symbolizer.h"
+#include "armbat/trace.h"
 
 namespace armbat {
 namespace {
@@ -20,7 +21,7 @@ struct GuestMapping {
     std::string path;
 };
 
-std::mutex g_mutex;
+ARMBAT_LOCKABLE(std::mutex, g_mutex);
 std::vector<GuestMapping> g_mappings;
 
 std::string BaseName(const std::string& path) {
@@ -56,7 +57,7 @@ void RegisterGuestModuleMapping(std::uint32_t base, std::uint32_t length, const 
     if (base == 0 || length == 0 || path.empty() || path == "-") {
         return;
     }
-    std::lock_guard<std::mutex> lock(g_mutex);
+    const std::lock_guard lock(g_mutex);
     g_mappings.push_back(GuestMapping{base, length, path});
 }
 
@@ -65,7 +66,7 @@ void UnregisterGuestMappings(std::uint32_t address, std::uint32_t length) {
         return;
     }
     const std::uint32_t end = address + length;
-    std::lock_guard<std::mutex> lock(g_mutex);
+    const std::lock_guard lock(g_mutex);
     std::vector<GuestMapping> kept;
     for (const GuestMapping& mapping : g_mappings) {
         const std::uint32_t mapping_end = mapping.base + mapping.length;
@@ -84,12 +85,12 @@ void UnregisterGuestMappings(std::uint32_t address, std::uint32_t length) {
 }
 
 std::vector<GuestModule> GuestModules() {
-    std::lock_guard<std::mutex> lock(g_mutex);
+    const std::lock_guard lock(g_mutex);
     return Merged();
 }
 
 bool IsGuestModuleAddress(std::uint32_t address) {
-    std::lock_guard<std::mutex> lock(g_mutex);
+    const std::lock_guard lock(g_mutex);
     // The live mappings, not the merged view: an image whose head was mapped,
     // unmapped and mapped again appears twice, and the merged range would claim
     // the span between the two -- including addresses that belong to other
@@ -111,7 +112,7 @@ bool DescribeGuestAddressInline(std::uint32_t address, char* out, std::size_t si
     if (out == nullptr || size == 0) {
         return false;
     }
-    std::unique_lock<std::mutex> lock(g_mutex, std::try_to_lock);
+    std::unique_lock lock(g_mutex, std::try_to_lock);
     if (!lock.owns_lock()) {
         return false;
     }
@@ -145,7 +146,7 @@ std::string DescribeGuestAddress(std::uint32_t address) {
     std::string path;
     std::uint32_t base = 0;
     {
-        std::lock_guard<std::mutex> lock(g_mutex);
+        const std::lock_guard lock(g_mutex);
         // The mapping that actually covers the address names the image; the
         // offset is taken against the lowest address that image was mapped at,
         // which is what its symbol table is relative to. Describing against the

@@ -36,6 +36,7 @@
 #include "armbat/guest_modules.h"
 #include "armbat/guest_pthread.h"
 #include "armbat/hle.h"
+#include "armbat/trace.h"
 
 namespace armbat {
 namespace {
@@ -557,7 +558,7 @@ struct JniBridge::Impl {
     // Handed out by this thread and not yet written back.
     static inline thread_local std::size_t mirror_pending = 0;
     std::vector<DirectMirror> mirrors;
-    std::mutex mirrors_mutex;
+    ARMBAT_LOCKABLE(std::mutex, mirrors_mutex);
     // Buffers are pinned, so every one of them holds its memory until the world
     // ends: the table is capped rather than grown without limit. A guest that
     // asks for more distinct buffers than this is doing something the mirror
@@ -575,12 +576,12 @@ struct JniBridge::Impl {
     // into the bridge from the same thread, through libraryLoaded and the
     // library's own JNIEnv->RegisterNatives. A plain mutex parks that thread on
     // itself, which is what a Marmalade title did at its first class initializer.
-    std::recursive_mutex mutex;
+    ARMBAT_LOCKABLE(std::recursive_mutex, mutex);
 
     // Guest threads call JNI concurrently: the reference tables are shared, and
     // an unsynchronized push_back here reallocates host memory under another
     // thread's feet (that is how a guest pointer ended up inside the loader).
-    mutable std::recursive_mutex refs_mutex;
+    mutable ARMBAT_LOCKABLE(std::recursive_mutex, refs_mutex);
 
     // java.io.File, resolved once. A guest path entering a File is the one
     // place where the Java half and the native half of an application have to
@@ -3940,6 +3941,12 @@ std::uint64_t JniBridge::Impl::Dispatch(std::uint64_t* frame, std::uint64_t* sta
         return 0;
     }
     NativeMethod& method = natives[id];
+#if defined(ARMBAT_TRACY)
+    // The guest leaves for the platform here: a native that blocks shows up on
+    // the timeline by its own name.
+    ARMBAT_ZONE("jni");
+    ARMBAT_ZONE_RENAME(method.name.c_str(), method.name.size());
+#endif
     if (silencing.load(std::memory_order_relaxed) && AnswersInstead(method)) {
         // The method's caller gets a zero: an int or a boolean answer of "no",
         // and a void one ignores it. Nothing else is done on its behalf -- in

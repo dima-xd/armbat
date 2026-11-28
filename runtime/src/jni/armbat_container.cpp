@@ -21,6 +21,7 @@
 #include "armbat/guest_stdio.h"
 #include "armbat/handles.h"
 #include "armbat/jni_bridge.h"
+#include "armbat/trace.h"
 
 namespace {
 
@@ -227,8 +228,8 @@ Java_dev_armbat_GuestNatives_libraryLoaded(JNIEnv* env, jobject /*self*/, jstrin
     if (container == nullptr) {
         return -1;
     }
-    static std::recursive_mutex mutex;
-    const std::lock_guard<std::recursive_mutex> lock(mutex);
+    static ARMBAT_LOCKABLE(std::recursive_mutex, mutex);
+    const std::lock_guard lock(mutex);
     const std::string name = StringOf(env, library);
     std::uint32_t version = 0;
     if (!container->CallOnLoad(name, &version)) {
@@ -265,8 +266,8 @@ Java_dev_armbat_GuestNatives_loadFromPath(JNIEnv* env, jobject /*self*/, jstring
     if (container == nullptr) {
         return env->NewStringUTF("no guest world");
     }
-    static std::recursive_mutex mutex;
-    const std::lock_guard<std::recursive_mutex> lock(mutex);
+    static ARMBAT_LOCKABLE(std::recursive_mutex, mutex);
+    const std::lock_guard lock(mutex);
     const std::string file = StringOf(env, path);
     std::string reason;
     const armbat::GuestContainer::LoadResult result = container->LoadGuestLibrary(file, &reason);

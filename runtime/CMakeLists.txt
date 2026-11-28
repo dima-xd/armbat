@@ -55,6 +55,27 @@ target_compile_options(armbat_core PRIVATE
     -ffunction-sections -fdata-sections -fvisibility=hidden)
 add_dependencies(armbat_core guest_unwind guest_sysroot)
 
+# The profiler is a build-time switch, not a runtime one: with it off the zones
+# are the identity and the client is not compiled at all, so a release APK has
+# nothing to disable. A Debug build gets it on by default, because that is the
+# build used to look into startup behaviour; TRACY_ON_DEMAND keeps it free of
+# cost until a profiler actually connects.
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    set(_armbat_tracy_default ON)
+else()
+    set(_armbat_tracy_default OFF)
+endif()
+option(ARMBAT_TRACY "Compile the Tracy profiler client into the container"
+       ${_armbat_tracy_default})
+unset(_armbat_tracy_default)
+if(ARMBAT_TRACY)
+    set(_armbat_tracy "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/tracy/public")
+    target_sources(armbat_core PRIVATE "${_armbat_tracy}/TracyClient.cpp")
+    target_include_directories(armbat_core PUBLIC "${_armbat_tracy}")
+    target_compile_definitions(armbat_core PUBLIC
+        ARMBAT_TRACY=1 TRACY_ENABLE TRACY_ON_DEMAND)
+endif()
+
 # The bionic guest runtime is opt-in until it reaches parity with the HLE one.
 option(ARMBAT_GUEST_RUNTIME_BIONIC "Run the guest on the real bionic userland" OFF)
 if(ARMBAT_GUEST_RUNTIME_BIONIC)

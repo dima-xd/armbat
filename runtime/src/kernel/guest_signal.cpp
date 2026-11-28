@@ -19,6 +19,7 @@
 #include "armbat/guest_arena.h"
 #include "armbat/guest_modules.h"
 #include "armbat/guest_pthread.h"
+#include "armbat/trace.h"
 
 namespace armbat {
 namespace {
@@ -321,6 +322,9 @@ void DeliverGuestSignals(A32Machine& machine) {
 }
 
 bool DeliverGuestFault(A32Machine& machine, std::uint32_t address) {
+    // A guest access the arena could not serve: how long the guest's own handler
+    // runs on it is part of the timeline, not an invisible detour.
+    ARMBAT_ZONE("guest.fault");
     // One fault at a time on this thread: a handler that faults again is a guest
     // that cannot recover, and running a second handler on top of the first one
     // would only bury the first fault.

@@ -32,6 +32,7 @@
 #include "armbat/handles.h"
 #include "armbat/hle.h"
 #include "armbat/jni_bridge.h"
+#include "armbat/trace.h"
 
 // The Android platform libraries an ARMv7 native activity imports: assets,
 // configuration, window, looper, input and EGL. The Java side of the platform
@@ -131,7 +132,7 @@ const WindowFunctions& Windows() {
 // one reference of its own -- the one the container took when the window was
 // registered -- so a release can only give back what an acquire took, never the
 // window under a guest that is still drawing on it.
-std::mutex g_window_lock;
+ARMBAT_LOCKABLE(std::mutex, g_window_lock);
 std::unordered_map<std::uint32_t, int> g_window_extra;
 
 // ---- assets ---------------------------------------------------------------
@@ -195,7 +196,9 @@ std::vector<ManagerEntry> g_managers;
 // engine reads resource packs on a pool of its own. The vectors here are shared
 // state, and an unsynchronised push_back reallocating under another thread's
 // read is a use-after-free of the host heap, not a guest error.
-std::mutex g_asset_mutex;
+// Named for the profiler: every asset open takes this, and a pack being inflated
+// while the engine waits for its files is exactly the shape of a startup stall.
+ARMBAT_LOCKABLE(std::mutex, g_asset_mutex);
 
 // A handle that leaves the container is a table slot plus one, tagged with the
 // slot's serial, and never zero: the guest compares what the platform returned
@@ -469,7 +472,7 @@ struct InputSlot {
 };
 
 std::vector<InputSlot> g_input_slots;
-std::mutex g_input_mutex;
+ARMBAT_LOCKABLE(std::mutex, g_input_mutex);
 
 // One wait on this thread's looper. ALOOPER_POLL_CALLBACK means "a source ran,
 // the wait is not over": ALooper_pollAll drains those and only then answers.
@@ -819,7 +822,7 @@ struct BitmapLock {
     jobject bitmap = nullptr;  // strong reference, released on unlock
 };
 
-std::mutex g_bitmap_mutex;
+ARMBAT_LOCKABLE(std::mutex, g_bitmap_mutex);
 std::vector<BitmapLock> g_bitmap_locks;
 
 // Caller holds g_bitmap_mutex. Objects are compared rather than handles: the
@@ -911,11 +914,16 @@ void RegisterAndroidFunctions(HleRegistry& registry) {
         // Outside the table lock: opening a compressed entry inflates it, and the
         // biggest asset in the archive must not stop every other thread's read.
         // The platform reads the archive with pread, so the descriptor's position
-        // is not shared state either.
-        AAsset* const opened =
-            manager != nullptr
-                ? AAssetManager_open(manager, name.c_str(), static_cast<int>(call.Arg(2)))
-                : nullptr;
+        // is not shared state either. The zone makes that read visible on the
+        // timeline: a pack that takes milliseconds names itself.
+        AAsset* opened = nullptr;
+        {
+            ARMBAT_ZONE("asset.open");
+            opened = manager != nullptr
+                         ? AAssetManager_open(manager, name.c_str(),
+                                              static_cast<int>(call.Arg(2)))
+                         : nullptr;
+        }
         if (opened == nullptr) {
             // Distinct names only: the engine probes the same optional files
             // (import locks, saved manifests, upgrade reports) in every pack, so

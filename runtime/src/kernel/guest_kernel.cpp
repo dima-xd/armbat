@@ -55,6 +55,7 @@
 #include "armbat/guest_pthread.h"
 #include "armbat/guest_signal.h"
 #include "armbat/guest_stdio.h"
+#include "armbat/trace.h"
 
 namespace armbat {
 namespace {
@@ -887,6 +888,22 @@ bool GuestKernel::Handle(std::uint32_t svc, A32Machine& machine) {
     machine.NoteSyscall(number);
 
     t_halt_requested = false;
+    // Tracing: the number is the only thing worth naming. Not every number is
+    // traced: a startup makes tens of thousands of clock_gettime calls, and a
+    // buffer that floods stops recording exactly the zones the trace is being
+    // taken for. Only calls that can cost a millisecond are kept.
+#if defined(ARMBAT_TRACY)
+    const bool traced_number = number == 3 || number == 4 || number == 5 || number == 45 ||
+                               number == 54 || number == 91 || number == 120 || number == 125 ||
+                               number == 192 || number == 197 || number == 240 || number == 322;
+    char trace_label[24];
+    const int trace_length =
+        std::snprintf(trace_label, sizeof(trace_label), "syscall %u", number);
+    ARMBAT_ZONE_IF("syscall", traced_number);
+    if (traced_number) {
+        ARMBAT_ZONE_RENAME_IF(armbat_zone, trace_label, static_cast<std::size_t>(trace_length));
+    }
+#endif
     const std::int32_t result = number >= kArmNrBase ? DispatchPrivate(number, args)
                                                      : Dispatch(number, args);
     machine.SetReg(0, static_cast<std::uint32_t>(result));
