@@ -854,6 +854,16 @@ class GuestLauncher(private val host: Activity) {
         /** The archive called finish(); the result still has to be handed back. */
         var finished = false
         var destroyed = false
+
+        /**
+         * The result the archive had set when it called finish().
+         *
+         * The platform records the result at that moment, so a setResult() from
+         * onDestroy never reaches the caller: it only matters here because the
+         * activity is destroyed before the result is delivered.
+         */
+        var resultCode = Activity.RESULT_CANCELED
+        var resultData: Intent? = null
     }
 
     /** One request the archive made about its own activities. */
@@ -1754,6 +1764,8 @@ class GuestLauncher(private val host: Activity) {
         // Activity.isFinishing reads this field, and the platform would have set
         // it: an archive that checks it after finish() has to see the truth.
         optional(hosted.activity, "mFinished", true)
+        hosted.resultCode = resultCode(hosted.activity)
+        hosted.resultData = resultData(hosted.activity)
         request(Action.Finish(hosted))
         return true
     }
@@ -1825,8 +1837,10 @@ class GuestLauncher(private val host: Activity) {
         if (requestCode < 0) {
             return
         }
-        val code = resultCode(finished.activity)
-        val data = resultData(finished.activity)
+        // The activity is destroyed by the time the result is delivered, so the
+        // result recorded when it called finish() is the one to hand back.
+        val code = finished.resultCode
+        val data = finished.resultData
         runCatching {
             val method = Activity::class.java.getDeclaredMethod(
                 "onActivityResult",
